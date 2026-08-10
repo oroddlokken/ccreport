@@ -107,6 +107,7 @@ from ccreport.pricing import (
     compute_project_rolling_costs,
     compute_session_cost,
     model_family,
+    pace_days,
     rolling_cost_keys,
     window_start_epoch,
 )
@@ -1210,15 +1211,6 @@ def _usage_reset_clock(reset_iso: str, now_epoch: float) -> str:
     return datetime.fromtimestamp(epoch).strftime("%H:%M")  # noqa: DTZ006
 
 
-def _pace_days() -> int:
-    """Return the pace window in days from CLAUDE_CODE_PACE_DAYS env var (default 7)."""
-    try:
-        d = int(os.environ.get("CLAUDE_CODE_PACE_DAYS", "7"))
-        return d if 1 <= d <= 7 else 7
-    except ValueError:
-        return 7
-
-
 def _weekly_pace(
     w_pct_s: str, reset_iso: str, now: float, *, countdown: bool = True,
 ) -> str:
@@ -1242,7 +1234,7 @@ def _weekly_pace(
         actual = int(w_pct_s)
     except ValueError:
         return ""
-    pace = _pace_days()
+    pace = pace_days()
     elapsed_s = now - week_start
     elapsed_frac = elapsed_s / WEEK_WINDOW_S
     if elapsed_frac <= 0 or elapsed_frac > 1:

@@ -18,3 +18,4 @@ seeded_*
 *.db-shm
 *.db-wal
 export/
+.claude-cache/

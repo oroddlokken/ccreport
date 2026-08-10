@@ -8,29 +8,19 @@ Both work off the JSONL session logs Claude Code already writes under
 Anthropic usage endpoint for quota percentages, and to Norges Bank for the
 daily USD→NOK rate.
 
-## ccreport
+## ccu
 
-![ccreport](assets/ccreport.png)
-
-```bash
-ccreport                       # every report, last 30 days
-ccreport daily --since 20260201
-ccreport monthly
-ccreport project --limit 10
-ccreport session --breakdown
-ccreport limits -w session     # rate-limit window history
-```
-
-Costs are priced per record from a pricing table in `src/ccreport/pricing.py`,
-deduplicated by the log's own `message.id`/`requestId`, and grouped into
-projects by git remote, then repo-root path, then directory name. A rename the
-rules cannot see is a manual rule:
+The quota dashboard, the same numbers Claude Code's `/usage` screen shows:
 
 ```bash
-ccreport overrides                     # list the rules
-ccreport merge ren.no ren-platform     # group one name into another
-ccreport unmerge ren.no
+ccu             # session, week, per-model and Extra quotas
+ccu --force     # bypass the 10-minute cache
+ccu --json      # the raw API body, unrendered
 ```
+
+The week gets a pace line comparing usage against elapsed time.
+`CLAUDE_CODE_PACE_DAYS=5` says the quota is meant to be gone by Friday, and
+both this and the status line's pace segment answer to it.
 
 ## Status line
 
@@ -55,6 +45,30 @@ docstring of `src/ccreport/statusline.py`.
 The render is on the critical path of every frame, so it imports nothing
 outside the stdlib and reaches the database only when it must. Refreshing the
 usage row happens in a detached subprocess that outlives the render.
+
+## ccreport
+
+![ccreport](assets/ccreport.png)
+
+```bash
+ccreport                       # every report, last 30 days
+ccreport daily --since 20260201
+ccreport monthly
+ccreport project --limit 10
+ccreport session --breakdown
+ccreport limits -w session     # rate-limit window history
+```
+
+Costs are priced per record from a pricing table in `src/ccreport/pricing.py`,
+deduplicated by the log's own `message.id`/`requestId`, and grouped into
+projects by git remote, then repo-root path, then directory name. A rename the
+rules cannot see is a manual rule:
+
+```bash
+ccreport overrides                     # list the rules
+ccreport merge ren.no ren-platform     # group one name into another
+ccreport unmerge ren.no
+```
 
 ## Install
 

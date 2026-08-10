@@ -8,6 +8,8 @@ Two tools over one SQLite cache at `~/.cache/ccreport/cache.db`:
   prices them, and reports by day, month, project, session and account.
 - `src/ccreport/statusline.py` — the status line Claude Code runs on every
   render. Reads the same cache and spawns `usage_api.py` detached to refresh it.
+- `src/ccreport/ccu.py` — the quota dashboard. Runs `usage_api` as a subprocess
+  and draws bars, reset countdowns and a weekly pace line from what it printed.
 
 `pricing.py`, `cache_db.py`, `exchange.py`, `project_identity.py` and
 `usage_api.py` are shared by both. `bin/` holds the wrappers that Claude Code's
@@ -48,9 +50,10 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   one means editing that list plus `_COST_WINDOW_TOGGLES` in `statusline.py`;
   every other key list is derived. `tests/test_window_keys.py` fails if
   something drifts
-- `pricing.window_start_epoch()` derives every session/week window start, and
-  `pricing.project_key()` every cwd→projects-dir name. Do not re-derive either
-  inline
+- `pricing.window_start_epoch()` derives every session/week window start,
+  `pricing.pace_days()` reads `CLAUDE_CODE_PACE_DAYS` for both the status line's
+  pace segment and `ccu`'s pace line, and `pricing.project_key()` derives every
+  cwd→projects-dir name. Do not re-derive any of the three inline
 - Which project a record belongs to is `project_identity.py` plus
   `pricing.project_scope()` — `ccreport merge` rules apply to reports and status
   line alike. `ccreport._script_hash()` covers `project_identity.py`, so changing

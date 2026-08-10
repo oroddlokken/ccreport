@@ -11,6 +11,7 @@ When changing any pricing, tiering, or cost logic here, update CLAUDE.md to matc
 from __future__ import annotations
 
 import json
+import os  # already loaded via pathlib below, so naming it costs the render nothing
 import sys
 from bisect import bisect_right
 from collections.abc import Iterator, Mapping, Sequence
@@ -1407,6 +1408,22 @@ def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
         f"{name}_project_cost": round(totals.get(name, 0.0), 4)
         for name in ROLLING_COST_NAMES
     }
+
+
+def pace_days() -> int:
+    """The pace window in days from CLAUDE_CODE_PACE_DAYS, default 7.
+
+    Lives here rather than in either reader because the status line's pace
+    segment and `ccu`'s pace line answer to the same variable, and a user who
+    sets it to 5 is entitled to have both of them mean it. Out-of-range and
+    unparseable both fall back to 7 — a pace of 0 would divide by zero and a
+    pace above 7 is slower than the window it measures.
+    """
+    try:
+        d = int(os.environ.get("CLAUDE_CODE_PACE_DAYS", "7"))
+    except ValueError:
+        return 7
+    return d if 1 <= d <= 7 else 7
 
 
 def window_start_epoch(

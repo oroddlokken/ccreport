@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# PATH entry for the usage dashboard. Was ccu.zsh, which drew the bars in zsh
+# and read the JSON through jq; it is ccreport.ccu now and needs neither.
+
+# ${var%/*} leaves a slashless path untouched, where dirname would answer "."
+BIN="${BASH_SOURCE[0]%/*}"
+[[ "$BIN" == "${BASH_SOURCE[0]}" ]] && BIN="."
+REPO="$BIN/.."
+SRC="$REPO/src"
+
+# Imported rather than run as a script, so CPython caches the bytecode; argv[1]
+# carries the directory to import from and is popped straight back off.
+BOOT='import sys; sys.path.insert(0, sys.argv.pop(1)); sys.argv[0] = "ccu"; from ccreport import ccu; sys.exit(ccu.main())'
+
+# ccu and the usage_api it spawns import nothing outside the stdlib, so any
+# interpreter runs them and the project venv is only a preference.
+PY="$REPO/.venv/bin/python"
+[[ -x "$PY" ]] || PY="$(command -v python3)"
+if [[ ! -x "$PY" ]]; then
+  echo "ccu: no python3 on PATH and no venv at $REPO/.venv" >&2
+  exit 1
+fi
+
+exec "$PY" -c "$BOOT" "$SRC" "$@"

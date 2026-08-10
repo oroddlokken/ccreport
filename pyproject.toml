@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 ccreport = "ccreport.ccreport:main"
+ccu = "ccreport.ccu:main"
 
 [build-system]
 requires = ["hatchling"]
