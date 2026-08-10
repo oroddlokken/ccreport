@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# PATH entry for ccreport. A wrapper rather than a symlink at the module, so
+# the interpreter and the bytecode can both be cached.
+
+# ${var%/*} leaves a slashless path untouched, where dirname would answer "."
+BIN="${BASH_SOURCE[0]%/*}"
+[[ "$BIN" == "${BASH_SOURCE[0]}" ]] && BIN="."
+REPO="$BIN/.."
+SRC="$REPO/src"
+
+# CPython writes and reads __pycache__ only for modules it imports, never for
+# the file named on its command line: run as a script, all 109 KB is tokenized
+# and compiled again on every invocation. Importing it caches the bytecode and
+# leaves only this one-line -c string to compile. argv[1] carries the directory
+# to import from and is popped straight back off, so the module sees the argv a
+# script invocation gave it. argv[0] is then the name argparse prints in its
+# usage line — "ccreport" rather than the "-c" a bare -c invocation reports.
+#
+# src/ goes on the front of sys.path even though `uv sync` installs the package
+# editable: that way a checkout answers with its own source whatever else is
+# installed, and the wrapper works before the first sync has run.
+BOOT='import sys; sys.path.insert(0, sys.argv.pop(1)); sys.argv[0] = "ccreport"; from ccreport import ccreport; ccreport.main()'
+
+# The project venv, not `uv run`: the resolver costs ~40 ms on every invocation
+# and answers with this same interpreter. ccreport needs orjson and rich, so
+# unlike the status line it cannot fall back to a bare python3 — a machine
+# without the venv gets one built here, once.
+PY="$REPO/.venv/bin/python"
+if [[ ! -x "$PY" ]]; then
+  uv sync --project "$REPO" >/dev/null 2>&1
+fi
+if [[ ! -x "$PY" ]]; then
+  echo "ccreport: no interpreter at $PY — run 'uv sync' in $REPO" >&2
+  exit 1
+fi
+
+exec "$PY" -c "$BOOT" "$SRC" "$@"

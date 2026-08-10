@@ -6,24 +6,17 @@ default:
 var:
     @just --evaluate
 
-
-
-
-# run formatters
+# apply ruff's autofixes — no `ruff format`, the wrapping here is hand-chosen
 fmt:
-    uv run ruff format src tests
-    uv run ruff check --fix --unsafe-fixes src tests
-
+    uv run ruff check --fix --unsafe-fixes src tests tools
 
 # run all formatters
 fmt-all:
     just fmt
 
-
 # lint the code
 lint:
-    uv run ruff format --check --diff src tests
-    uv run ruff check src tests
+    uv run ruff check src tests tools
 
 # lint using pyright
 lint-pyright:
@@ -37,6 +30,14 @@ lint-all:
 # find dead code with vulture
 vulture:
     uv run vulture src tests vulture_whitelist.py
+
+# render every banner and colored token the status line can emit
+banners:
+    uv run python tools/banner_demo.py
+
+# measure what a status line render costs in wall time and energy
+bench:
+    uv run python tools/benchmark_statusline_energy.py
 
 # run tests
 test:

@@ -1,37 +1,104 @@
-# Usage
+# ccreport
 
-## Installation with uv for development
+Token usage and cost reporting for Claude Code, and the status line that reads
+the same cache.
 
-Make sure uv are installed, and then run the following commands:
+Both work off the JSONL session logs Claude Code already writes under
+`~/.claude/projects/`. Nothing is sent anywhere; the one network call is to the
+Anthropic usage endpoint for quota percentages, and to Norges Bank for the
+daily USD→NOK rate.
+
+## ccreport
+
+![ccreport](assets/ccreport.png)
+
 ```bash
-uv sync --group dev
+ccreport                       # every report, last 30 days
+ccreport daily --since 20260201
+ccreport monthly
+ccreport project --limit 10
+ccreport session --breakdown
+ccreport limits -w session     # rate-limit window history
 ```
 
-## Managing dependencies
-To add a new dependency, use:
+Costs are priced per record from a pricing table in `src/ccreport/pricing.py`,
+deduplicated by the log's own `message.id`/`requestId`, and grouped into
+projects by git remote, then repo-root path, then directory name. A rename the
+rules cannot see is a manual rule:
+
 ```bash
-uv add <package-name>
+ccreport overrides                     # list the rules
+ccreport merge ren.no ren-platform     # group one name into another
+ccreport unmerge ren.no
 ```
 
-To add a development dependency, use:
-```bash
-uv add --group dev <package-name>
+## Status line
+
+![status line](assets/statusline.png)
+
+Model, context fill, session and weekly quota, cost windows, git state. Point
+Claude Code's `settings.json` at the wrapper:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "bash /path/to/ccreport/bin/statusline-command_x.sh"
+  }
+}
 ```
 
-To update dependencies:
+Segments are toggled with `CLAUDE_STATUSLINE_*` environment variables, which
+that wrapper is the place to set. The full list, with defaults, is the module
+docstring of `src/ccreport/statusline.py`.
+
+The render is on the critical path of every frame, so it imports nothing
+outside the stdlib and reaches the database only when it must. Refreshing the
+usage row happens in a detached subprocess that outlives the render.
+
+## Install
+
 ```bash
-uv sync --upgrade
+git clone <this repo> && cd ccreport
+uv sync
 ```
 
-All dependencies are managed in `pyproject.toml`.
+Then put `bin/` on `PATH`, or install the CLI on its own:
 
-## Formatting / linting
-Run `just fmt` to format the code.
-Run `just lint` to lint the code.
-Run `just lint-all` to run all linters including pyright and sql.
+```bash
+uv tool install .
+```
 
-## Testing
-Run `just test` to run tests.
-Run `just test-changed` to run only tests affected by code changes.
-Run `just test-all` to run all tests with coverage.
+`bin/ccreport` and `bin/statusline-command_x.sh` run the modules out of the
+checkout rather than an installed copy, so an edit takes effect on the next
+invocation.
 
+## Where the data lives
+
+| Path | What |
+|---|---|
+| `~/.cache/ccreport/cache.db` | Parsed records, costs, usage row, rate-limit samples |
+| `~/.local/share/ccreport/snapshots/` | One daily copy of the above, 14 kept |
+| `~/.config/ccreport/ccreport.toml` | Optional `repo_roots` for project grouping |
+
+Snapshots sit outside `~/.cache` so a cache-cleanup sweep cannot take the live
+database and every backup of it at once.
+
+These three used to live under `macsetup/claude` names. `ccreport migrate` moves
+them, and any command does it for itself on the first run that finds the old
+layout:
+
+```bash
+ccreport migrate --dry-run
+ccreport migrate
+```
+
+## Development
+
+`just --list` prints every recipe. `just test` runs the suite, `just lint-all`
+runs ruff and pyright, `just fmt` applies ruff's autofixes.
+
+`just fmt` deliberately does not run `ruff format`. See `AGENTS.md`.
+
+Detailed calculations, cache schema and the reasoning behind the cost windows:
+`docs/calculation-reference.md`.
