@@ -1,0 +1,171 @@
+[project]
+name = "ccreport"
+version = "0.1.0"
+description = "ccreport"
+requires-python = ">=3.13"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ccreport"]
+
+# PEP 735 dependency groups — NOT [project.optional-dependencies]
+[dependency-groups]
+dev = [
+    "ruff>=0.16.2",
+    "vulture>=2.16",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "pytest-cov==7.1.0",
+    "pytest-xdist[psutil]==3.8.0",
+    "pytest-timeout>=2.4.0",
+    "pytest-testmon>=2.2.0",
+    "watchdog>=6.0.0",
+]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+  "A",     # flake8-builtins
+  "ARG",   # flake8-unused-arguments
+  "ASYNC", # flake8-async
+  "B",     # bugbear
+  "BLE",   # flake8-blind-except
+  "C4",    # flake8-comprehensions
+  "C90",   # McCabe complexity
+  "COM",   # flake8-commas
+  "D",     # pydocstyle
+  "DTZ",   # flake8-datetimez
+  "E",     # pycodestyle error
+  "EM",    # flake8-errmsg
+  "ERA",   # flake8-eradicate
+  "EXE",   # flake8-executable
+  "F",     # Pyflakes
+  "FA",    # flake8-future-annotations
+  "FBT",   # flake8-boolean-trap
+  "FLY",   # flynt
+  "FURB",  # refurb
+  "G",     # flake8-logging-format
+  "I",     # isort (ruff handles import sorting natively)
+  "ICN",   # flake8-import-conventions
+  "INP",   # flake8-no-pep420
+  "ISC",   # flake8-implicit-str-concat
+  "LOG",   # flake8-logging
+  "N",     # pep8-naming
+  "PERF",  # Perflint
+  "PIE",   # flake8-pie
+  "PL",    # Pylint (PLC, PLE, PLR, PLW)
+  "PT",    # flake8-pytest-style
+  "PTH",   # flake8-use-pathlib
+  "PYI",   # flake8-pyi
+  "Q",     # flake8-quotes
+  "RET",   # flake8-return
+  "RSE",   # flake8-raise
+  "RUF",   # Ruff-specific
+  "S",     # flake8-bandit (security)
+  "SIM",   # flake8-simplify
+  "SLF",   # flake8-self
+  "SLOT",  # flake8-slots
+  "T10",   # flake8-debugger
+  "T20",   # flake8-print
+  "TC",    # flake8-type-checking
+  "TID",   # flake8-tidy-imports
+  "TRY",   # tryceratops
+  "UP",    # pyupgrade
+  "W",     # pycodestyle warning
+  "YTT",   # flake8-2020
+]
+ignore = [
+  "COM812",  # trailing commas — conflicts with ruff formatter
+  "RUF100",  # unused blanket noqa directive
+  "EXE001",  # shebang present but file not executable
+  "D105",    # missing docstring in magic method
+  "D107",    # missing docstring in __init__
+  "D203",    # blank line before class docstring (conflicts with D211)
+  "D212",    # multi-line summary first line (conflicts with D213)
+  "D213",    # multi-line summary second line
+  "D413",    # missing blank line after last section
+  "D416",    # section name should end with colon
+  "PLR0913", # too many arguments — not always avoidable
+  "PLR0917", # too many positional args — fights APIs that mirror a stdlib
+             # signature (DateTimeUTC.__new__ must accept datetime's positionals)
+  "PLR2004", # magic value comparison — too noisy for most projects
+  "C901",    # McCabe complexity — too rigid for real-world code
+  "G004",    # logging f-string — f-strings are fine in logging
+  "FBT001",  # boolean positional arg in function definition
+  "FBT002",  # boolean default positional arg
+  "FBT003",  # boolean positional value in function call
+  "T201",    # print found — CLI tools and scripts use print
+  "S608",    # SQL injection — false positive for parameterized queries
+  "PLR0911", # too many return statements
+  "PLR0915", # too many statements
+]
+
+[tool.ruff.lint.per-file-ignores]
+# D103: missing docstring in public function — test functions are self-documenting.
+# INP001: implicit namespace package — the tests dir intentionally has no __init__.py.
+# S101: use of assert — asserts are the point of a test.
+# S105: hardcoded password — test fixtures use throwaway credentials.
+"tests/**" = ["D103", "INP001", "S101", "S105"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "strict"
+stubPath = "./typings"
+reportMissingTypeStubs = "none"  # many third-party packages lack type stubs
+reportPrivateUsage = "none"  # config classes use _prefix by design
+reportUnusedFunction = "none"  # flask routes/CLI commands are decorator-registered
+deprecateTypingAliases = true
+reportUnreachable = true
+
+[tool.vulture]
+ignore_decorators = ["@app.route", "@bp.route", "@cli.command"]
+
+[tool.djlint]
+ignore = "H031,J004"
+profile = "jinja"
+blank_line_after_tag = "load,extends,include"
+blank_line_before_tag = "load,extends,include"
+max_blank_lines = 1
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "def __repr__",
+    "def __str__",
+    "if __name__ == .__main__.",
+    "def delete_test_databases\\(",
+    "def _random_password\\(",
+    "def get_user_by_id_or_raise\\(",
+    "pragma: no cover",
+]
+omit = [
+    "src/ccreport/web/flask_server.py",
+    "src/ccreport/web/wsgi.py",
+    "robots.txt",
+]
+
+[tool.py-project-template]
+commit = "d042c03cf3a980d7c59e220f8dff40b58a429c23"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
+addopts = [
+    "--dist=worksteal",
+    "-p", "no:pastebin",
+    "-p", "no:nose",
+    "-p", "no:doctest",
+]
