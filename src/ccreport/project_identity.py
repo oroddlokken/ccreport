@@ -21,7 +21,7 @@ from pathlib import Path
 
 # Repos live directly beneath repo-root container dirs. A session's project
 # is the segment just under the deepest matching root, so subdirectories and
-# git worktrees collapse into their repo (e.g. ~/git/ren.no/web -> ren.no)
+# git worktrees collapse into their repo (e.g. ~/git/company/web -> company)
 # and a repo opened from two places stays one. ~/git is always a repo root;
 # per-machine layouts (~/dev and friends) are added via the config file,
 # which can only ever add roots, never remove the baseline.

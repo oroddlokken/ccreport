@@ -1,30 +1,14 @@
 # ccreport
 
-Token usage and cost reporting for Claude Code, and the status line that reads
-the same cache.
+Token usage and cost reporting for Claude Code, a quota dashboard, and the
+status line: three commands over one cache.
 
-Both work off the JSONL session logs Claude Code already writes under
-`~/.claude/projects/`. Nothing is sent anywhere; the one network call is to the
-Anthropic usage endpoint for quota percentages, and to Norges Bank for the
-daily USD→NOK rate.
-
-## ccu
-
-The quota dashboard, the same numbers Claude Code's `/usage` screen shows:
-
-```bash
-ccu             # session, week, per-model and Extra quotas
-ccu --force     # bypass the 10-minute cache
-ccu --json      # the raw API body, unrendered
-```
-
-The week gets a pace line comparing usage against elapsed time.
-`CLAUDE_CODE_PACE_DAYS=5` says the quota is meant to be gone by Friday, and
-both this and the status line's pace segment answer to it.
+`ccreport` and the status line work off the JSONL session logs Claude Code
+already writes under `~/.claude/projects/` (or `~/.config/claude/projects/`).
 
 ## Status line
 
-![status line](assets/statusline.png)
+![status line under a Claude Code session, showing model, context, quota and cost windows](assets/statusline.png)
 
 Model, context fill, session and weekly quota, cost windows, git state. Point
 Claude Code's `settings.json` at the wrapper:
@@ -38,42 +22,58 @@ Claude Code's `settings.json` at the wrapper:
 }
 ```
 
-Segments are toggled with `CLAUDE_STATUSLINE_*` environment variables, which
-that wrapper is the place to set. The full list, with defaults, is the module
-docstring of `src/ccreport/statusline.py`.
+Segments are toggled with `CLAUDE_STATUSLINE_*` environment variables; set them
+in that wrapper. The full list, with defaults, is the module docstring of
+`src/ccreport/statusline.py`.
 
-The render is on the critical path of every frame, so it imports nothing
-outside the stdlib and reaches the database only when it must. Refreshing the
-usage row happens in a detached subprocess that outlives the render.
+The status line imports nothing outside the stdlib, so any `python3` runs it;
+it works before `uv sync` has. Quota percentages are refreshed by a detached
+process, so a fresh reading lands on a later render.
 
 ## ccreport
 
-![ccreport](assets/ccreport.png)
+![ccreport's daily, monthly and project tables in a terminal](assets/ccreport.png)
 
 ```bash
-ccreport                       # every report, last 30 days
-ccreport daily --since 20260201
+ccreport                                    # every report, all history
+ccreport daily --since 20260201 --breakdown
 ccreport monthly
 ccreport project --limit 10
-ccreport session --breakdown
-ccreport limits -w session     # rate-limit window history
+ccreport session --limit 10
+ccreport limits -w session                  # rate-limit window history
 ```
 
 Costs are priced per record from a pricing table in `src/ccreport/pricing.py`,
 deduplicated by the log's own `message.id`/`requestId`, and grouped into
 projects by git remote, then repo-root path, then directory name. A rename the
-rules cannot see is a manual rule:
+rules cannot see needs a manual rule:
 
 ```bash
-ccreport overrides                     # list the rules
-ccreport merge ren.no ren-platform     # group one name into another
-ccreport unmerge ren.no
+ccreport overrides
+ccreport merge company company-platform  # company's records report as company-platform
+ccreport unmerge company
 ```
+
+## ccu
+
+The quota dashboard, the same numbers as Claude Code's `/usage` screen, from
+the same endpoint, cached for up to ten minutes:
+
+```bash
+ccu             # session, week, per-model and Extra quotas
+ccu --force     # bypass the 10-minute cache
+ccu --json      # the raw API body, unrendered; always a live fetch, never cached
+```
+
+The week gets a pace line comparing usage against elapsed time.
+`CLAUDE_CODE_PACE_DAYS` sets the day the quota is meant to be gone by, counting
+from whichever weekday the window starts on. It defaults to 7, and both this
+and the status line's pace segment answer to it.
 
 ## Install
 
 ```bash
-git clone <this repo> && cd ccreport
+git clone git@github.com:oroddlokken/ccreport.git && cd ccreport
 uv sync
 ```
 
@@ -83,9 +83,8 @@ Then put `bin/` on `PATH`, or install the CLI on its own:
 uv tool install .
 ```
 
-`bin/ccreport` and `bin/statusline-command_x.sh` run the modules out of the
-checkout rather than an installed copy, so an edit takes effect on the next
-invocation.
+Every wrapper in `bin/` runs the modules out of the checkout rather than an
+installed copy, so an edit takes effect on the next invocation.
 
 ## Where the data lives
 
@@ -95,12 +94,10 @@ invocation.
 | `~/.local/share/ccreport/snapshots/` | One daily copy of the above, 14 kept |
 | `~/.config/ccreport/ccreport.toml` | Optional `repo_roots` for project grouping |
 
-Snapshots sit outside `~/.cache` so a cache-cleanup sweep cannot take the live
-database and every backup of it at once.
+Snapshots survive a `~/.cache` wipe.
 
-These three used to live under `macsetup/claude` names. `ccreport migrate` moves
-them, and any command does it for itself on the first run that finds the old
-layout:
+These three used to live under `macsetup/claude` names. Any command migrates
+them for itself on the first run that finds the old cache:
 
 ```bash
 ccreport migrate --dry-run
@@ -110,9 +107,8 @@ ccreport migrate
 ## Development
 
 `just --list` prints every recipe. `just test` runs the suite, `just lint-all`
-runs ruff and pyright, `just fmt` applies ruff's autofixes.
-
-`just fmt` deliberately does not run `ruff format`. See `AGENTS.md`.
+runs ruff and pyright, `just fmt` applies ruff's autofixes but deliberately not
+`ruff format`; see `AGENTS.md` for why.
 
 Detailed calculations, cache schema and the reasoning behind the cost windows:
 `docs/calculation-reference.md`.
