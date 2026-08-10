@@ -261,7 +261,7 @@ class TestLoadAllRecordsFiltersOrphans:
 
 
 class TestDateFiltersReachSql:
-    """A one-day report must not build the whole corpus first (macsetup-6a2f)."""
+    """A one-day report must not build the whole corpus first."""
 
     SINCE = dt.datetime(2026, 6, 1, tzinfo=UTC)
 
@@ -329,7 +329,7 @@ class TestDateFiltersReachSql:
 
 
 class TestRollupRebuildReusesItsCallersWork:
-    """The rebuild used to stat and re-parse the whole corpus twice (macsetup-4sx0)."""
+    """The rebuild used to stat and re-parse the whole corpus twice."""
 
     @pytest.fixture
     def corpus(self, loader):
@@ -408,7 +408,7 @@ def test_the_script_hash_is_memoized():
 
 
 class TestSaveBatching:
-    """A full re-parse commits per batch, not per file (macsetup-92y0)."""
+    """A full re-parse commits per batch, not per file."""
 
     def _commits(self, conn):
         seen: list[str] = []
@@ -1554,7 +1554,7 @@ class TestReportDefersTheDailySnapshot:
 
     get_connection reads the deferral once, when it opens the singleton
     connection, so setting it anywhere below the top of main() would be
-    setting it after the copy (macsetup-2huo).
+    setting it after the copy.
     """
 
     @pytest.fixture
@@ -1589,11 +1589,10 @@ class TestReportDefersTheDailySnapshot:
 
 # --- Rollups: precomputed aggregates for the days past the cutoff ---
 #
-# (macsetup-4rte) The corpus below is built so that everything a rollup row
-# collapses is present on both sides of the cutoff: two sessions that span it,
-# a duplicated message on each side, three accounts, four models, an override
-# rule, orphaned records whose file is gone, and records with and without a
-# logged costUSD.
+# The corpus below is built so that everything a rollup row collapses is present
+# on both sides of the cutoff: two sessions that span it, a duplicated message
+# on each side, three accounts, four models, an override rule, orphaned records
+# whose file is gone, and records with and without a logged costUSD.
 
 
 def _entry(
@@ -2065,7 +2064,7 @@ class TestRecordOsloDate:
         assert asked == [{dt.date(2026, 1, 1)}]
 
 
-# --- Rate limit utilization history (macsetup-3u9n) ---
+# --- Rate limit utilization history ---
 
 
 def _local_epoch(iso: str) -> float:
@@ -2520,7 +2519,9 @@ class TestCmdLimits:
         assert [(e["samples"], e["peak_used_pct"]) for e in entries] == [(1, 90.0)]
 
     SENTINEL = 9_999_999_999.0
-    """The placeholder resets_at Claude Code sent on stdin; four rows carry it."""
+    """The placeholder resets_at Claude Code sent on stdin; rows written before
+    the lookahead check carry it.
+    """
 
     def _seed_sentinel(self):
         cache_db.record_rate_limit_snapshots(

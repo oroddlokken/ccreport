@@ -4,14 +4,13 @@
 
 1. [Pricing Tables](#1-pricing-tables)
 2. [Per-Message Cost Calculation](#2-per-message-cost-calculation)
-3. [Usage Percentage Parsing (usage_api.py)](#3-usage-percentage-parsing)
+3. [Usage API Fetch (usage_api.py)](#3-usage-api-fetch)
 4. [Cost Aggregation Windows (pricing.py)](#4-cost-aggregation-windows)
-5. [Caching Strategy & Cache Formats](#5-caching-strategy--cache-formats)
+5. [Caching Strategy — Unified SQLite Database](#5-caching-strategy--unified-sqlite-database)
 6. [Deduplication](#6-deduplication)
 7. [Shared Pricing Module & Maintenance](#7-shared-pricing-module--maintenance)
 8. [Display & Formatting](#8-display--formatting)
 9. [Account Attribution](#9-account-attribution)
-10. [Skills](#10-skills)
 
 ---
 
@@ -52,20 +51,12 @@ most recent entry whose `effective` date is <= the message timestamp.
 2. Exact match against period's models dict
 3. Substring match: if `key in resolved` or `resolved in key`
 
-### Current Prices (as of LAST_CHECKED = 2026-02-22)
+### Current Prices
 
-| Model | Input | Output | Cache Create | Cache Read |
-|-------|-------|--------|-------------|------------|
-| claude-opus-4-6 | $5/M | $25/M | $6.25/M | $0.50/M |
-| claude-opus-4-6 (>200K) | $10/M | $37.50/M | $12.50/M | $1/M |
-| claude-sonnet-4-6 | $3/M | $15/M | $3.75/M | $0.30/M |
-| claude-sonnet-4-6 (>200K) | $6/M | $22.50/M | $7.50/M | $0.60/M |
-| claude-sonnet-4-20250514 | $3/M | $15/M | $3.75/M | $0.30/M |
-| claude-sonnet-4-5-20250929 | $3/M | $15/M | $3.75/M | $0.30/M |
-| claude-opus-4-5-20251101 | $5/M | $25/M | $6.25/M | $0.50/M |
-| claude-haiku-4-5-20251001 | $1/M | $5/M | $1.25/M | $0.10/M |
-
-($/M = dollars per million tokens)
+`pricing.PRICING_HISTORY` is the rates, and it is the only copy — a model's rate
+is per-period and resolved against the record's own timestamp, so no single
+table states it. `pricing.LAST_CHECKED` dates the last verification against the
+source (§7).
 
 ---
 
@@ -133,70 +124,70 @@ present, that pre-calculated value is used instead of computing from tokens.
 
 ---
 
-## 3. Usage Percentage Parsing
+## 3. Usage API Fetch
 
-`usage_api.py` scrapes the Claude CLI `/usage` command by spawning it in a
-PTY and parsing the rendered text output.
+`usage_api.py` GETs the OAuth usage endpoint with the token Claude Code already
+holds and maps the response onto the `usage` row (§5.2).
 
-### PTY Execution
+### Token Sources
 
-1. Find `claude` binary (PATH -> common locations -> nvm -> npx fallback)
-2. Ensure `~/.cache/ccreport/` is trusted in `~/.claude.json`
-3. Open a PTY pair, spawn `claude --session-id <random-uuid> /usage`
-4. Poll aggressively: drain PTY every 100ms, attempt parse every 500ms
-5. Exit early once both `session_percent` and `week_percent` are found
-6. Hard deadline: 15 seconds
-7. Send `/exit\n`, terminate process, close PTY
+`get_usage_token()`, in order:
 
-### ANSI Stripping
+1. macOS Keychain, service `Claude Code-credentials` (`CREDENTIALS_SERVICE`),
+   via `security find-generic-password`
+2. On a miss, `security dump-keychain` for services prefixed with that name,
+   newest `mdat` first, capped at `MAX_KEYCHAIN_CANDIDATES` (5) — each candidate
+   costs its own serial `KEYCHAIN_TIMEOUT` while the fetch lock is held
+3. `~/.claude/.credentials.json`
 
-Before parsing, raw PTY output is cleaned:
-- Cursor positioning (`CSI row;col H`) -> newline
-- Cursor forward (`CSI n C`) -> N spaces
-- Cursor up/down/back -> newline
-- All other CSI sequences (colors, clearing) -> empty
-- OSC sequences -> empty
-- Collapse triple+ newlines to double
+Both sources hold the same JSON, and `_parse_token` takes
+`claudeAiOauth.accessToken` out of it. Steps 1-2 run on darwin only.
 
-### Section Boundaries
-
-The parser identifies four sections by anchor regex:
-
-| Section | Anchor Pattern |
-|---------|---------------|
-| session | `session` (case-insensitive) |
-| week | `week\s*\(all` (case-insensitive) |
-| sonnet | `week\s*\(Sonnet` (case-insensitive) |
-| extra | `Extra\s+usage` (case-insensitive) |
-
-Sections are bounded: each section ends where the next one starts.
-Regexes are constrained to their section to prevent cross-section leakage.
-
-### Percentage Extraction
-
-For each section, the pattern `(\d+)%\s*used` extracts the usage percent.
-
-### Reset Time Parsing
-
-Two strategies, tried in order:
-
-**Time-only** (e.g. "Resets 10pm", PTY-mangled "Rese s 10 m"):
+### Request
 
 ```
-Pattern: Rese[\w\s]*?(\d+(?::\d+)?)\s*([ap]?\s*m)
+GET https://api.anthropic.com/api/oauth/usage      (USAGE_API_URL)
+Authorization: Bearer <token>
+anthropic-beta: oauth-2025-04-20
 ```
 
-- Collapses whitespace in am/pm (PTY mangles "am" -> "a m")
-- Converts to 24h, constructs datetime for today; if past, adds 1 day
+`USAGE_API_TIMEOUT` (5 s) bounds each attempt and `request_usage_body` makes
+`1 + USAGE_API_RETRIES` (3) of them. A status in `_RETRYABLE_STATUS` (429, 500,
+502, 503, 504) sleeps `USAGE_API_RETRY_DELAY` (1 s) and retries; any other
+`HTTPError` raises on the spot. A `Retry-After` header raises that sleep to at
+most `USAGE_API_MAX_RETRY_DELAY` (5 s) — the server picks the delay, we cap it.
+401 and 403 skip the fetch-failure backoff: the token is wrong, and a re-login
+works immediately rather than after a wait.
 
-**Date+time** (e.g. "Resets Mar 1", "Resets Feb 25 at 8pm"):
+`FETCH_LOCK_MAX_HOLD_S` is those constants plus the keychain ones as an
+expression, never a literal. A TTL under the real worst case lets the next spawn
+call a working holder abandoned and fire a second fetch at an endpoint that, in
+the case which got the holder there, is already answering 429.
 
-```
-Pattern: Rese[\w\s]*?\s+([A-Za-z]+\s+\d+)(?:,?\s*(\d{4}))?\s*(?:at\s+)?(?:(\d+(?::\d+)?)\s*([ap]?\s*m))?
-```
+### Response Mapping
 
-- Group 1: month+day, Group 2: optional year, Group 3: optional time, Group 4: optional am/pm
-- If no year given and the resulting date is in the past, rolls to next year
+`fetch_usage_api()` reads only these; percentages are `int()` truncations of the
+API's float.
+
+| Response location | Fields |
+|-------------------|--------|
+| `five_hour` | `session_percent` ← `utilization`, `session_reset` ← `resets_at` |
+| `seven_day` | `week_percent`, `week_reset` |
+| `seven_day_sonnet` | `sonnet_percent`, `sonnet_reset` |
+| `limits[]`, first entry with `kind == "weekly_scoped"` and a `scope.model.display_name` | `scoped_percent` ← `percent`, `scoped_model` ← that display name, `scoped_reset` |
+| `extra_usage` | `extra_percent` ← `utilization`, `extra_spent` ← `used_credits`, `extra_limit` ← `monthly_limit` |
+
+Extra usage's two amounts arrive in cents and are divided by 100. Reset times
+arrive as `resets_at` on each quota — nothing derives them from a clock.
+
+### Omitted Quotas Are Nulls
+
+`write_usage_cache` leaves any column the write dict does not name alone, which
+is what keeps a failed cost computation from nulling the cost columns. Quotas
+need the opposite, so `main()` writes the twelve `_API_QUOTA_FIELDS` as explicit
+nulls and lets the response overwrite the ones it carried. The API drops a quota
+that no longer applies — no Sonnet cap on this plan, a scoped limit that lapsed —
+and without the nulls the last reading would outlive the quota it described.
 
 ### Fields Produced
 
@@ -218,14 +209,18 @@ Pattern: Rese[\w\s]*?\s+([A-Za-z]+\s+\d+)(?:,?\s*(\d{4}))?\s*(?:at\s+)?(?:(\d+(?
 }
 ```
 
-All fields are optional — only present if successfully parsed.
+All fields are optional — present only when the response carried them.
+`extra_reset` is the exception: it is a `usage` column `ccu` renders, and
+nothing in `fetch_usage_api` ever sets it.
 
 ---
 
 ## 4. Cost Aggregation Windows
 
-`pricing.py` `compute_costs()` produces ten cost buckets by scanning
-all JSONL files under `~/.claude/projects/` and `~/.config/claude/projects/`.
+`pricing.py` `compute_costs()` produces one cost bucket per window listed below
+by scanning all JSONL files under `~/.claude/projects/` and
+`~/.config/claude/projects/`. The set is derived from `pricing.ROLLING_WINDOWS`,
+so adding a window adds buckets.
 
 ### Window Derivation
 
@@ -279,8 +274,7 @@ the statusline's per-window env toggles fall behind.
 
 **Project identification**: `pricing.project_scope()` answers "is this record
 the cwd's?" for every cost computation, and both tests it returns come from
-`project_identity.py` so the reports and the statusline group identically
-(macsetup-2qrp):
+`project_identity.py` so the reports and the statusline group identically:
 
 - **By path** — `cwd.replace("/", "-")` → JSONL file paths starting with
   `projects_dir / project_key /`. The trailing separator is what keeps a
@@ -300,7 +294,7 @@ table read per computation.
 `now - N` (local time). These and `session_window_cost` are always computed
 fresh (not cached per-file) since the window shifts continuously.
 **Cached per-file**: `week_cost`, `month_cost`, `all_time_cost`, and
-`session_cost` are stored in the cost cache (see §5.2).
+`session_cost` are stored in the cost cache (see §5.3).
 **Per-model week split**: `week_model_costs` is the week bucket alone, split by
 model family — the bucket a `weekly_scoped` quota is spent against, so the
 scoped statusline segment can price its own window. `pricing.model_family()`
@@ -348,7 +342,8 @@ For each `"type": "assistant"` record in a JSONL file:
 
 ## 5. Caching Strategy — Unified SQLite Database
 
-All caching lives in a single SQLite database managed by `claude/cache_db.py`:
+All caching lives in a single SQLite database managed by
+`src/ccreport/cache_db.py`:
 
 - **File**: `~/.cache/ccreport/cache.db`
 - **Mode**: WAL (concurrent readers, single writer)
@@ -356,17 +351,23 @@ All caching lives in a single SQLite database managed by `claude/cache_db.py`:
 
 ### 5.1 Tables
 
+Sixteen of them, and this table is the inventory of `cache_db._SCHEMA_SQL` — a
+new `CREATE TABLE` there gets a row here.
+
 | Table | Purpose | Consumers |
 |-------|---------|-----------|
-| `meta` | Global metadata (week/month keys, ccreport version/hash/salt, migration flags) | all |
-| `usage` | Singleton row with PTY-fetched usage data + computed costs | usage_api.py, statusline.py |
+| `meta` | Global metadata (week/month keys, ccreport version/hash/salt, rollup and orphan fingerprints, migration flags) | all |
+| `usage` | Singleton row with fetched usage data + computed costs | usage_api.py, statusline.py |
 | `file_costs` | Per-JSONL-file cost totals for compute_costs() | pricing.py |
 | `dedup_keys` | Dedup keys of in-window files, linked to file_costs | pricing.py |
 | `cache_stats` | Per-session token accumulation | statusline.py |
 | `session_costs` | Per-session JSONL cost cache | pricing.py |
 | `ccreport_files` | Per-file mtime/size tracking for ccreport | ccreport.py |
 | `ccreport_records` | Parsed assistant message records | ccreport.py |
+| `ccreport_rollups` | Per-day aggregates of the post-dedup record stream, keyed `(day, oslo_date, sid, project, model, account)`; what a bare `ccreport` serves for days past `ROLLUP_WINDOW_DAYS`. Valid only against `meta.ccreport_rollup_fp`, and derivable from `ccreport_records` | ccreport.py |
+| `ccreport_orphan_costs` | All-time cost of records whose JSONL is gone, pre-summed per `(dir_prefix, project, cwd, repo)`. Orphans are most of `ccreport_records` and none can ever change, but `all_time` has no window to bound the walk. Override rules are resolved at read time, so a `ccreport merge` re-groups with no rebuild. Valid only against `meta.ccreport_orphan_fp` | pricing.py |
 | `project_overrides` | Manual project-grouping rules (`name` / `remote` / `cwd_prefix` → target), applied by every reader | ccreport.py (write), project_identity.py (read) |
+| `project_scopes` | The resolved `(name, prefixes)` scope per cwd (§5.6). No fingerprint of its own — every writer of its two inputs clears it in the same transaction | pricing.py |
 | `extra_usage_snapshots` | `(ts, spent)` history of Extra usage spend, pruned at 31 days | usage_api.py (write), statusline.py (read) |
 | `exchange_rates` | Norges Bank USD→NOK daily spot rates, keyed by Oslo date | exchange.py |
 | `account_events` | Append-on-change log of the signed-in Claude account and its tiers (§9) | statusline.py (write), ccreport.py (read) |
@@ -376,18 +377,15 @@ All caching lives in a single SQLite database managed by `claude/cache_db.py`:
 not in code, so they are never committed.
 
 `ccreport_records` is the only table that grows without bound — orphan
-preservation (§5.6) means rows outlive the JSONL they came from. Order of
-magnitude on a machine with ~6 months of history: ~89K rows across ~1,560 files
-and 90 distinct days (measured 2026-08-07). The `NokCtx._rate_memo` docstring in
-`ccreport.py` says "half a million records", which overstates this machine by
-~5x — treat it as a ceiling for the memo's rationale, not a row count.
+preservation (§5.6) means rows outlive the JSONL they came from. Tens of
+thousands of rows after months of daily use.
 
 ### 5.2 Usage Data
 
 - **Table**: `usage` (singleton row, `id = 1`)
 - **Max age**: 600 seconds, checked via `last_updated` column
 - **Early invalidation**: if `session_reset` or `week_reset` time has passed
-- **Written after**: each fresh PTY fetch via `write_usage_cache()`, which
+- **Written after**: each fresh API fetch via `write_usage_cache()`, which
   updates only the keys the write dict carries — a column the caller omits keeps
   its stored value, so a failed cost computation cannot null the cost columns
 - **Read by**: `read_usage_stale()` — the single SELECT of the row. Freshness is
@@ -413,12 +411,11 @@ and 90 distinct days (measured 2026-08-07). The `NokCtx._rate_memo` docstring in
   threshold, passed in as `dedup_cutoff_ns`); older files' keys are never written and are
   deleted on the next save. Accepted risk: `all_time` is unbounded, so a message id
   shared between a fresh file and one that has aged out counts twice there
-  (macsetup-1jvz)
 - **Bulk save**: `bulk_save_file_costs()` writes the whole dataset in one transaction, but
   only rewrites rows named in its `changed` set — the paths `compute_costs()` actually
   re-scanned. Everything else keeps its row, and so keeps its `dedup_keys` children, which
-  a DELETE would have cascaded away (macsetup-5vsf). Paths absent from the dataset are
-  deleted; deletes are chunked to stay under the bound-parameter limit
+  a DELETE would have cascaded away. Paths absent from the dataset are deleted;
+  deletes are chunked to stay under the bound-parameter limit
 
 **Cache hit logic**:
 
@@ -444,14 +441,27 @@ else:
 
 - **Table**: `session_costs`
 - **Key**: `session_id`
-- **Columns**: `fingerprint` (change detector), `cost`
-- **Fingerprint**: md5 over the sorted `(path, mtime_ns, size)` tuples of every
-  JSONL file in the session (`pricing.compute_session_cost`). Declared `INTEGER`
-  in `_SCHEMA_SQL` but holds the hex digest — SQLite's dynamic typing lets the
-  TEXT value through unconverted.
-- **Invalidation**: re-parsed when any file's mtime or size changes, or when a
-  file joins or leaves the session. An edit that leaves the total byte count
-  unchanged does invalidate — the mtime moves.
+- **Columns**: `fingerprint` (opaque state blob), `cost`
+- **State blob**: `_SessionCostState`, JSON, written by
+  `pricing._encode_session_state`: a version (`_SESSION_STATE_VERSION`), a
+  `_FileCursor(mtime_ns, size, offset, tail)` per session file, and the session's
+  dedup keys as 8-byte digests (`_DigestKeys` — the set is only ever compared for
+  equality, so it is stored at its smallest). The cost stays in its own column;
+  one home keeps the two from disagreeing. Declared `INTEGER` in `_SCHEMA_SQL`
+  but holds TEXT — SQLite's dynamic typing lets it through unconverted
+- **Growth is resumed, not re-parsed**: `_resume_session_cost` skips a file whose
+  `(mtime_ns, size)` still match and otherwise re-digests the `_TAIL_BYTES` (256)
+  before `offset` — proof the log was appended to rather than rewritten — then
+  counts from `offset` on. Fingerprinting whole files made every render of a live
+  session re-parse it from line 1, quadratic in the session's own length
+- **Full reparse** (`_reparse_session_cost`) when the stored total cannot be
+  extended: a counted file gone or truncated, a tail digest that no longer
+  matches, or a blob this build cannot read. `_decode_session_state` returns None
+  for a truncated blob, a future version, and the pre-incremental md5
+  fingerprint, which is read-only legacy — a migration costs exactly one render
+- A file that has appeared since the write is only added, so it needs none of
+  that. Only whole lines advance `offset`; a writer caught mid-append leaves a
+  partial last line and the next render sees it complete
 
 ### 5.6 Report Cache
 
@@ -459,10 +469,9 @@ else:
 - **Invalidation**: `check_ccreport_valid()` compares three `meta` keys —
   `ccreport_version`, `ccreport_script_hash`, and `ccreport_schema_salt` (the
   `cache_db.CACHE_SCHEMA_SALT` constant, bumped by hand when a schema or
-  serialization change alters the format of stored records, macsetup-2tt1).
+  serialization change alters the format of stored records).
   `init_ccreport_meta()` writes all three. Any mismatch resets mtime/size to
   force re-parse and NULLs costs for recompute, but preserves orphaned records
-  (macsetup-qn0k)
 - **Per-file change detection**: `mtime_ns` + `size` in `ccreport_files`
 - **Records**: stored as individual rows in `ccreport_records` (indexed on `file_path` and `ts`)
 - **Orphan preservation**: when JSONL files are purged from disk (e.g. Claude Code auto-cleanup),
@@ -471,13 +480,12 @@ else:
   this run — preserving historic usage data beyond the ~1 month JSONL retention window
 - **Writes are batched**: freshly parsed files accumulate and flush through
   `save_ccreport_files()` every `_SAVE_BATCH` files, one write transaction per batch
-  (macsetup-92y0)
 - **The statusline reads it too**: `compute_project_rolling_costs` sums a live
   file from `load_ccreport_records_under` when
   `load_ccreport_file_meta_under` says the fingerprint still matches the file
   on disk, and re-parses the JSONL when it does not — 90 MB re-parsed per
-  render was ~93% of it (macsetup-rn21). Only per-record facts come from the
-  cache; the windows are still derived from `now` on every call. A live file's
+  render was ~93% of it. Only per-record facts come from the cache; the windows
+  are still derived from `now` on every call. A live file's
   cost is recomputed from its cached tokens rather than read from the stored
   `cost`, so the two paths agree on a record whose `costUSD` disagrees with
   `calc_cost`; the orphan pass keeps the stored cost, which for a purged file
@@ -486,21 +494,20 @@ else:
 - **The resolved scope is cached per cwd**: `project_scopes(cwd, name,
   prefixes)` holds what `pricing.project_scope` worked out, so a render with
   merge rules in play skips `load_ccreport_file_identities` — a GROUP BY over
-  every cached record, 0.020s of an 0.085s call (macsetup-6cov). The row
-  carries no fingerprint of its own: it is a pure function of
-  `project_overrides` and those identities, and every writer of either
+  every cached record, 0.020s of an 0.085s call. The row carries no fingerprint
+  of its own: it is a pure function of `project_overrides` and those
+  identities, and every writer of either
   (`add_project_override`, `delete_project_override`, `invalidate_ccreport`)
   empties the table in the same transaction — except `save_ccreport_files`,
   which empties it only when the batch changes some file's
-  (repo, cwd, project) identity (macsetup-ov32); a record write by any other
-  route must clear scopes itself. Reads are
-  salt-gated like every other ccreport reader, so a stale row format degrades
-  a cached scope exactly as it degrades a freshly derived one — to the
-  unmerged scope. A row is also ignored when it no longer covers the cwd's own
-  project directories, which is what lets a projects dir that appeared since
-  the write show up without waiting for an invalidation. This is the one thing
-  a render does write, best-effort: a failing write costs the next render a
-  re-derivation and nothing else
+  (repo, cwd, project) identity; a record write by any other route must clear
+  scopes itself. Reads are salt-gated like every other ccreport reader, so a
+  stale row format degrades a cached scope exactly as it degrades a freshly
+  derived one — to the unmerged scope. A row is also ignored when it no longer
+  covers the cwd's own project directories, which is what lets a projects dir
+  that appeared since the write show up without waiting for an invalidation.
+  This is the one thing a render does write, best-effort: a failing write costs
+  the next render a re-derivation and nothing else
 
 ---
 
@@ -520,8 +527,8 @@ dedup_key = "{message.id}:{requestId}"
 ### Fallback Identity
 
 A log missing either field leaves the key NULL, and those records used to be
-waved through — a row stored twice then counted twice in every reader
-(macsetup-2wgm). `pricing.dedup_identity()` supplies a stand-in key:
+waved through — a row stored twice then counted twice in every reader.
+`pricing.dedup_identity()` supplies a stand-in key:
 
 ```
 (message.id, sessionId, timestamp, model, all four token counts)
@@ -545,7 +552,7 @@ timestamp alone are not enough to delete a row on.
 All pricing data and cost computation lives in a single shared module:
 
 ```
-claude/pricing.py
+src/ccreport/pricing.py
 ```
 
 `usage_api.py`, `statusline.py`, and `ccreport.py` all import
@@ -718,7 +725,7 @@ The 33k is `AUTOCOMPACT_BUFFER`, an estimate — Claude Code publishes no
 auto-compact threshold in the statusline payload or its docs. It is applied flat,
 so a 1M window reads as 967k. Verify against `/context` before trusting it.
 
-**Cumulative cache hit rate** (uses cache-stats file from §5.3):
+**Cumulative cache hit rate** (from the `cache_stats` table, §5.4):
 
 ```
 total_in = cum_fresh + cum_cache_create + cum_cache_read
@@ -837,11 +844,7 @@ Count distinct .project values in last 100 lines of ~/.claude/history.jsonl
 where timestamp >= cutoff_ms AND project != current cwd
 ```
 
-**Line separator:** When `CLAUDE_STATUSLINE_WRAP=1`, the three output
-sections (top info, session, usage) are separated by newlines. When `0`
-(default), they are joined with spaces on a single line.
-
-### 8.2 Terminal Dashboard (ccu.zsh)
+### 8.2 Terminal Dashboard (ccu.py)
 
 Calls `usage_api.py [--force]`, renders progress bars + countdowns.
 
@@ -860,8 +863,8 @@ dedicated top-level key.
 
 **Progress bar:**
 ```
-width = 50, filled = pct * 50 / 100
-Display: {filled * '#' in green}{(50-filled) * '#' in dark gray}
+filled = int(pct) * BAR_WIDTH // 100, clamped to [0, BAR_WIDTH]
+Display: {filled * '█' in green}{(BAR_WIDTH - filled) * '░' in dark gray}
 ```
 
 **Countdown:**
@@ -880,16 +883,21 @@ else:               "Resets in {countdown} at {time} on {month day} ({tz})"
 
 Time format: 12-hour with am/pm, minutes omitted if :00.
 
-**Weekly pace** (shown below weekly bar):
+**Weekly pace** (`ccu.pace_line`, shown below weekly bar):
 ```
-week_start  = reset_epoch - 7 * 86400
-elapsed_s   = now - week_start
-expected    = elapsed_s * 100 / (7 * 86400)
-delta       = actual - expected
-Display: "{el_d}d {el_h}h into 7-day window — {expected}% expected, {sign}{delta}% {label}"
-Labels: >+15 "ahead" (red), >+5 "ahead" (yellow), ±5 "on pace" (green),
-        <-5 "behind" (cyan), <-15 "behind" (dim)
+week_start  = window_start_epoch(reset_iso, WEEK_WINDOW_S, now)   (§4)
+elapsed_s   = now - week_start          blank unless 0 < elapsed_s <= WEEK_WINDOW_S
+expected    = min(elapsed_s * 100 // (pace_days() * 86400), 100)
+delta       = int(actual) - expected
+Display: "{el_d}d {el_h}h into 7-day window (pace: {pace}d) — {expected}% expected, {sign}{delta}%"
+Colours: >+15 red, >+5 yellow, >-5 green, >-15 cyan, else dim
 ```
+
+The window is always the seven days it actually runs; only `expected` divides by
+`pricing.pace_days()`, which reads `CLAUDE_CODE_PACE_DAYS` (README) and falls
+back to 7 for anything outside 1-7. A pace of 5 means the quota is meant to be
+gone by Friday, so the bar usage is measured against rises faster than the
+clock. The status line's pace segment reads the same function.
 
 **Last fetched:**
 ```
@@ -1047,19 +1055,9 @@ session, then appends the account table — but only when
 is not `unknown`**. The predicate reads the records `main()` already loaded and
 filtered, so the check costs no extra query.
 
-The reasoning, and it is the same reasoning in both directions:
-
-- Two or more real accounts — the split carries information no other table has
-- One real account — every row restates the TOTAL the other four already printed
-- One real account beside `unknown` — one account's costs drawn twice, which is
-  the pair §9.5 exists to merge, so `unknown` never counts towards the two
-- No records, or nothing but `unknown` — less than that again
-
-Worth expecting: adopting (§9.5) can *hide* the table. Before adopting, a
-machine with one login and pre-capture history has one real label and `unknown`,
-which is already below the bar; after adopting it has one real label and
-nothing else. Either way one account, either way hidden — the table returns when
-a second account actually appears. That is intended, not a regression.
+Below two, the split says only what the other tables' TOTAL rows already said,
+and `unknown` beside one real account is that account's costs drawn twice — the
+pair §9.5 exists to merge, which is why it never counts towards the two.
 
 `ccreport account` is unconditional. It is where someone goes to see the split
 the default run declined to volunteer, `unknown` included.
@@ -1137,10 +1135,11 @@ report on real data:
   keep their drift forever. The instance reports the bucket, the samples keep the
   float they were stored with
 - **Placeholder reset times.** Claude Code sends `resets_at = 9999999999` on
-  stdin where it has no real one; four rows carry it. `_rl_sample` now refuses
-  anything more than `cache_db.RL_MAX_LOOKAHEAD_S` (8 days — one day of slack
-  over the longest real window) past the reading, and `cmd_limits` drops the
-  stored ones after the date/window filters, printing a one-line count to stderr.
+  stdin where it has no real one; rows written before the lookahead check carry
+  it. `_rl_sample` now refuses anything more than `cache_db.RL_MAX_LOOKAHEAD_S`
+  (8 days — one day of slack over the longest real window) past the reading,
+  and `cmd_limits` drops the stored ones after the date/window filters,
+  printing a one-line count to stderr.
   Silently dropping them would leave a report nobody could reconcile against the
   row count in the table
 
@@ -1167,13 +1166,8 @@ free". So does every window when no corpus loaded at all.
 Below each table, one caption line per **open** window (`resets_at` in the
 future): where it stands, the reading it was first seen at, the rate, the
 projected fill at reset, and what the points left are worth at that window's own
-$/pp. A projection is per-window, so a column of it would be one number over a
-stack of dashes; it also needs the words, because the reading it starts from is
-where capture began and not where the window did. It extrapolates from the
-**last sample**, not from now — both ends are then readings, and a machine that
-has not rendered in six hours does not get those hours counted twice, once as
-idle time inside the rate and once as time still to burn. Uncapped: over 100%
-says the limit arrives before the reset does.
+$/pp — `_open_note` has why a caption rather than a column. The arithmetic and
+its uncapped, extrapolate-from-the-last-sample rule are `WindowInstance.projected_pct`.
 
 A blank tier is an event that predates the tier columns (or no event at all):
 absent, not a change. `--since` / `--until` select samples, not instances, so a
@@ -1184,21 +1178,12 @@ prints the same structures with raw floats and epochs and no local-time
 formatting.
 
 More columns than a terminal has room for, so `_fit_columns` drops Tier, then
-Account, then Samples until the table fits. Rich's own answer is to shave every
-column by a character, which ellipsizes all of them and loses the table instead
-of one column of it.
+Account, then Samples until the table fits.
 
-**Retention: nothing prunes this table** (macsetup-3u9n decided it). The write
-gate holds one instance to ~100 rows, the report's questions are about all of
-history — how often a window ever filled — and a window that filled a year ago
-is unreconstructible once dropped: the live percentages were the only source.
-
----
-
-## 10. Skills
-
-Skills live in `claude/skills/`. See `claude/skills/README.md` for the full
-inventory split by origin (ours vs installed packs).
-
-When adding or removing skills, update `claude/skills/README.md` to keep the
-listing accurate.
+**Retention: nothing prunes this table**, decided together with the reader it
+feeds. The write gate holds one instance to ~100 rows, the report's questions are
+about all of history — how often a window ever filled — and a window that filled
+a year ago is unreconstructible once dropped: the live percentages were the only
+source. The ~100 assumes normalized reset times; against the raw floats one
+scoped week reached 80 rows in a day, each a window of its own as far as the gate
+could tell.

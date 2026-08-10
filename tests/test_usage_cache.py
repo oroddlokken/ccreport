@@ -39,7 +39,7 @@ def blocking_writer():
 
 
 class TestDbTimeout:
-    """The wait is configurable so a render can refuse to wait (macsetup-6dp1)."""
+    """The wait is configurable so a render can refuse to wait."""
 
     @pytest.mark.parametrize(
         ("raw", "expected"),
@@ -115,7 +115,7 @@ class TestWriteUsageCachePartial:
     """A write dict names what it knows; the rest of the row is not its business."""
 
     def test_absent_cost_keys_keep_their_values(self):
-        """compute_costs failing must not blank the cost segments (macsetup-29bl)."""
+        """compute_costs failing must not blank the cost segments."""
         cache_db.write_usage_cache(
             {
                 "session_percent": 10,

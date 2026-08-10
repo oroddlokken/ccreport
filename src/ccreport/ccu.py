@@ -335,13 +335,8 @@ def render(data: dict[str, Any], now: float, zone: str) -> list[str]:
     return lines
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-
 def _parse_args(argv: list[str]) -> tuple[bool, bool]:
-    """Returns (force, json_only). Exits 2 on anything else, as the zsh did."""
+    """Returns (force, json_only). Exits 2 on anything else."""
     force = json_only = False
     for arg in argv:
         if arg in ("--force", "-f"):

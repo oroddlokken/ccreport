@@ -26,10 +26,10 @@ def _iso_offset(seconds: float) -> str:
 
 @pytest.fixture(autouse=True)
 def _clean_statusline_env(monkeypatch):
-    """Every render helper reads the real environment, and this user's profile
-    exports several of these — CLAUDE_CODE_PACE_DAYS=5 alone moves every pace
-    figure off the default the tests assert (macsetup-133f). Tests state what
-    they need; nothing is inherited from the shell running pytest.
+    """Every render helper reads the real environment, and a developer's profile
+    may export several of these — CLAUDE_CODE_PACE_DAYS alone moves every pace
+    figure off the default the tests assert. Tests state what they need; nothing
+    is inherited from the shell running pytest.
     """
     for name in [k for k in os.environ if k.startswith("CLAUDE_STATUSLINE_")]:
         monkeypatch.delenv(name, raising=False)
@@ -217,7 +217,7 @@ class TestKill:
 class TestFetchDcat:
     """Counts are read from dogcat's append log, not from the dogcat library.
 
-    Verified against `dcat list --expand` across all 23 .dogcats repos in ~/git.
+    Verified against `dcat list --expand`.
     """
 
     @pytest.fixture(autouse=True)
@@ -293,7 +293,7 @@ class TestScopedCountdown:
     """The scoped quota resets with the weekly one, so only W carries the clock.
 
     Both segments run the same pace helper, so a shared reset used to print the
-    countdown twice on one line (macsetup-4raz).
+    countdown twice on one line.
     """
 
     @pytest.fixture
@@ -394,7 +394,7 @@ class TestMergeCostData:
     """The cold-start recompute must get the window bounds from stdin.
 
     Without them compute_costs has no session window and omits its total, so
-    the S segment renders bare on the first call of a session (macsetup-4uja).
+    the S segment renders bare on the first call of a session.
     """
 
     @pytest.fixture
@@ -443,7 +443,7 @@ class TestMergeCostData:
 
 
 class TestProjectCostRescanIsGated:
-    """compute_project_rolling_costs is an unbounded rescan (macsetup-oyz3).
+    """compute_project_rolling_costs is an unbounded rescan.
 
     Every *_project_cost key it produces is also written by compute_costs and
     cached in the cost summary, so running it over numbers that were merged one
@@ -482,7 +482,7 @@ class TestProjectCostRescanIsGated:
 class TestGitDiffstatIsGatedOnItsToggle:
     """`git diff --shortstat HEAD` refreshes the index and diffs every tracked
     path — the costliest of the four spawns, and _render_git drops its result
-    unless GIT_DIFFSTAT is on (macsetup-5wg1).
+    unless GIT_DIFFSTAT is on.
     """
 
     @pytest.fixture
@@ -524,7 +524,7 @@ class TestGitDiffstatIsGatedOnItsToggle:
 
 
 class TestRenderGitIndicators:
-    """Six any() passes over the porcelain list became one (macsetup-pym4).
+    """Six any() passes over the porcelain list became one.
 
     The flags are what changed, not the alphabet, so these pin the mapping from
     status code to indicator and the order they are concatenated in.
@@ -608,7 +608,7 @@ class _FakeProc:
 
 class TestDspVerdictIsMemoized:
     """The ancestor claude's argv is fixed at launch, so the ps walk is a
-    once-per-session question, not a once-per-slow-render one (macsetup-5dna).
+    once-per-session question, not a once-per-slow-render one.
     """
 
     @pytest.fixture(autouse=True)
@@ -699,7 +699,7 @@ class TestSpawnUsageRefreshWindowBounds:
     Right after a rollover the API can answer without resets_at, which writes
     session_reset as an explicit null; compute_costs then omits
     session_window_cost and the previous window's total survives every
-    subsequent refresh (macsetup-x2aq).
+    subsequent refresh.
     """
 
     NATIVE = {
@@ -856,7 +856,7 @@ class TestRenderDefersTheDailySnapshot:
 
 
 class TestFetchUsageReadsTheRowOnce:
-    """Three reads of the singleton row per render is three too many (macsetup-2xfb)."""
+    """Three reads of the singleton row per render is three too many."""
 
     @pytest.fixture
     def traced(self, monkeypatch):
@@ -1039,10 +1039,10 @@ class TestCaptureAccount:
         assert self._log() == []
 
     def test_an_unchanged_file_is_not_reparsed(self, config):
-        """~/.claude.json is ~258 KB for one key, so an (mtime, size) that has
-        not moved skips the parse: no rewrite, no possible account switch
-        (macsetup-zrsx). Rewritten here at the same size with the mtime pinned,
-        which is exactly the state the gate is allowed to ignore.
+        """An (mtime, size) that has not moved skips the parse of ~/.claude.json:
+        no rewrite, no possible account switch. Rewritten here at the same size
+        with the mtime pinned, which is exactly the state the gate is allowed to
+        ignore.
         """
         import json
 
@@ -1391,7 +1391,7 @@ class TestFastCache:
         assert ts == self.NOW
 
     def test_the_slow_only_badges_survive_the_roundtrip(self):
-        """Both are rendered strings now, resolved on the slow path (macsetup-5t4g)."""
+        """Both are rendered strings now, resolved on the slow path."""
         sl._save_fetched(self.SID, self.CWD, self.NOW, self._fetched())
         got, _ = present(sl._load_fetched(self.SID, self.CWD, self.NOW + 1))
         assert (got.sandbox, got.sessions) == ("sbx", "+2sess")

@@ -118,6 +118,15 @@ def _resolve_remote(cwd: str) -> str | None:
     return result
 
 # --- File-level cache ---
+# BUMP THIS when the dicts _serialize_records writes change shape:
+# _deserialize_records subscripts their keys, so a stored row in the old shape
+# is a KeyError, not a degraded read. check_ccreport_valid passes only when this
+# number, _script_hash() and cache_db.CACHE_SCHEMA_SALT all match what was stored
+# beside the rows; any one differing clears the cache and re-parses the corpus.
+# Not folded into that hash even though it covers this file: the hash moves on
+# every edit here, this comment included, so it can say only "something changed",
+# never "the stored format did". This is the deliberate knob on ccreport's side
+# of the contract, as the salt is on cache_db's.
 CACHE_VERSION = 2
 
 # Freshly parsed files buffered before one write transaction. Small enough
@@ -448,8 +457,8 @@ class NokCtx:
     _rate_memo: dict[date, tuple[float | None, bool]] = field(
         default_factory=dict, repr=False, compare=False,
     )
-    """Oslo date → get_rate result. Half a million records span a few hundred
-    days, and get_rate walks back over weekends and holidays on every miss."""
+    """Oslo date → get_rate result. A corpus of any size spans only a few hundred
+    Oslo dates, and get_rate walks back over weekends and holidays on every miss."""
 
     @property
     def enabled(self) -> bool:
@@ -489,7 +498,6 @@ def record_cost_nok(rec: UsageRecord, cost_usd: float, nok: NokCtx) -> tuple[flo
 
 
 def _accum_nok(bucket: "AggBucket", rec: UsageRecord, cost_usd: float, nok: NokCtx) -> None:
-    """Accumulate NOK cost into a bucket, setting estimated flag if needed."""
     amount, estimated = record_cost_nok(rec, cost_usd, nok)
     if amount is not None:
         bucket.cost_nok += amount
@@ -550,16 +558,13 @@ def load_rates_for_records(
 
 def project_display_name(project_dir: str) -> str:
     """Convert directory name like '-Users-ove-git-foo' to 'foo'."""
-    # Strip leading dash and split
     parts = project_dir.strip("-").split("-")
-    # Return last meaningful segment
     if parts:
         return parts[-1]
     return project_dir
 
 
 def discover_jsonl_files() -> list[Path]:
-    """Find all JSONL session logs across known Claude config directories."""
     files = []
     for d in _PROJECT_ROOTS:
         if d.is_dir():
@@ -610,7 +615,7 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
 
     A read error propagates rather than yielding the lines read so far: the
     caller writes whatever comes back over the file's complete cache entry,
-    so a truncated return is silent, permanent data loss (macsetup-2zvx).
+    so a truncated return is silent, permanent data loss.
     """
     records = []
     cwd_from_records: str | None = None
@@ -637,8 +642,7 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
 
             # `or` rather than a get() default: a key present with JSON null
             # returns None, which lands in a NOT NULL column and takes down the
-            # whole file's insert on every run until the JSONL changes
-            # (macsetup-1gsc).
+            # whole file's insert on every run until the JSONL changes.
             tokens = TokenCounts(
                 input=usage.get("input_tokens") or 0,
                 output=usage.get("output_tokens") or 0,
@@ -818,6 +822,10 @@ def load_all_records(
     default, and only ever on for a whole-corpus report — every caller that
     needs record-level detail (a filter, --json, adopt) gets the full stream
     without having to know rollups exist.
+
+    Raises ValueError when *use_rollups* arrives with any of *since*, *until*,
+    *project_filter* or *account_filter*: a rollup row is one day of one session
+    and has aggregated away what those four select on.
     """
     files = discover_jsonl_files()
     live_paths = {str(p) for p in files}
@@ -846,10 +854,10 @@ def _load_full(
     """Every record the cache and the live files hold, filtered and deduped.
 
     *refreshed* is the (fresh, unreadable) pair from a _refresh_changed_files
-    the caller already ran. The rollup rebuild path has just statted all ~2000
-    files and re-parsed the changed ones, and doing that a second time was the
-    bulk of what a rebuild cost (macsetup-4sx0). *accounts* is the same deal for
-    the change log the rollup fingerprint already read.
+    the caller already ran. The rollup rebuild path has just statted every
+    session log and re-parsed the changed ones, and doing that a second time was
+    the bulk of what a rebuild cost. *accounts* is the same deal for the change
+    log the rollup fingerprint already read.
     """
     filters = _keep_filters(
         since, until, project_filter, account_filter, accounts=accounts,
@@ -1164,7 +1172,6 @@ def fmt_nok(c: float, estimated: bool = False) -> str:
 
 
 def fmt_pct(cost: float, total: float) -> str:
-    """Format cost as percentage of total."""
     if total <= 0:
         return ""
     pct = cost / total * 100
@@ -1174,7 +1181,6 @@ def fmt_pct(cost: float, total: float) -> str:
 
 
 def cost_style(c: float) -> str:
-    """Return a color style based on cost magnitude."""
     if c >= 50:
         return "bold red"
     if c >= 10:
@@ -1185,7 +1191,6 @@ def cost_style(c: float) -> str:
 
 
 def short_model(model: str) -> str:
-    """Shorten model name for display."""
     m = model.replace("claude-", "")
     # Strip -YYYYMMDD date suffix
     if len(m) > 9 and m[-9] == "-" and m[-8:].isdigit():
@@ -1297,7 +1302,6 @@ def _make_report_table(
 
 
 def _add_token_columns(table: Table, *, compact: bool = False, narrow: bool = False, nok: NokCtx) -> None:
-    """Add the standard token + cost columns to a table."""
     cost_label = "USD" if nok.enabled else "Cost"
     if narrow:
         table.add_column(cost_label, justify="right", no_wrap=True)
@@ -1333,7 +1337,6 @@ def _token_row(
     b: "AggBucket", total_cost: float = 0.0, *,
     compact: bool = False, narrow: bool = False, nok: NokCtx,
 ) -> list:
-    """Build the token/cost cells for a bucket."""
     cost_text = Text(fmt_cost(b.cost), style=cost_style(b.cost))
     if narrow:
         cells = [cost_text]
@@ -1424,7 +1427,6 @@ def _add_summary_rows(
 
 
 def report_daily(records: list[UsageRecord], breakdown: bool = False, *, nok: NokCtx) -> None:
-    """Print daily usage report."""
     narrow = _is_narrow()
 
     buckets = _bucket_by(records, UsageRecord.day_key, nok)
@@ -1463,7 +1465,6 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False, *, nok: No
 
 
 def report_monthly(records: list[UsageRecord], *, nok: NokCtx) -> None:
-    """Print monthly usage report."""
     narrow = _is_narrow()
     buckets = _bucket_by(records, UsageRecord.month_key, nok)
 
@@ -1531,7 +1532,6 @@ def report_monthly(records: list[UsageRecord], *, nok: NokCtx) -> None:
 
 
 def report_project(records: list[UsageRecord], limit: int | None = 20, *, nok: NokCtx) -> None:
-    """Print per-project usage report."""
     narrow = _is_narrow()
     buckets = _bucket_by(records, lambda r: r.project, nok)
 
@@ -1623,7 +1623,6 @@ def _accounts_worth_showing(records: list[UsageRecord]) -> bool:
 
 
 def report_session(records: list[UsageRecord], limit: int | None = 20, *, nok: NokCtx) -> None:
-    """Print per-session usage report."""
     narrow = _is_narrow()
     buckets = _bucket_by(records, lambda r: r.session_id, nok)
     session_meta: dict[str, dict] = {}
@@ -1783,10 +1782,10 @@ def report_json(records: list[UsageRecord], *, nok: NokCtx) -> None:
     Emitted one record at a time. Collecting the entries into a list and
     handing that to json.dumps held a 12-key dict per record alongside the
     UsageRecord it came from, and then the whole serialized document as a
-    single string alongside both — three copies of a corpus in six figures
-    of rows, on the one code path that never gets to use the rollups
-    (macsetup-pym4). Byte-for-byte what dumps(list, indent=2) produced:
-    the array's own newlines here, each entry's body shifted in under it.
+    single string alongside both — three copies of the whole corpus, on the
+    one code path that never gets to use the rollups.
+    Byte-for-byte what dumps(list, indent=2) produced: the array's own newlines
+    here, each entry's body shifted in under it.
     """
     out = sys.stdout
     out.write("[")
@@ -1827,7 +1826,7 @@ def _warn_unreachable_history(kind: str, value: str, target: str) -> None:
 
 
 def cmd_migrate(args) -> None:
-    """Move the cache, snapshots and config off their macsetup-era paths.
+    """Move the cache, snapshots and config off their legacy macsetup paths.
 
     Every command does this for itself the first time it opens a DB that isn't
     there yet, so this exists to make the move explicit and to say what it did.
@@ -1921,6 +1920,9 @@ def cmd_adopt(args) -> None:
     event at or before each record: an event older than every record is the one
     every otherwise-unattributed record lands on. Nothing is rewritten, no
     record cache is invalidated, and undoing it is a single DELETE.
+
+    Exits 1 when the capture log is empty — there is no identity to adopt under.
+    Every other outcome, refusal and abort included, returns.
     """
     if args.remove:
         if clear_adopted_account():
@@ -1979,7 +1981,7 @@ def cmd_adopt(args) -> None:
 # the order this report prints them. Also the --window choices.
 #
 # A window the table has never heard of is still reported, under its raw name
-# and after these — the writer's list of windows lives in statusline_command.py,
+# and after these — the writer's list of windows lives in statusline._rl_samples,
 # and a report over permanent history is the wrong place to lose a row or raise
 # over one because the two lists drifted.
 LIMIT_WINDOWS = ("session", "week", "sonnet", "scoped")
@@ -2295,10 +2297,10 @@ def _load_instance_spend(
 def _implausible_reset(sample: dict) -> bool:
     """Whether *sample*'s reset time is too far out to be a window.
 
-    The writer refuses these now (statusline_command._rl_sample), but this table
-    is permanent history and four rows carrying Claude Code's 9999999999
-    placeholder are already in it. Reported as-is they are one window per
-    placeholder, resetting in 2286, with a fill time in decades.
+    The writer refuses these now (statusline._rl_sample), but this table is
+    permanent history and rows written before that check carry Claude Code's
+    9999999999 placeholder. Reported as-is they are one window per placeholder,
+    resetting in 2286, with a fill time in decades.
     """
     return sample["resets_at"] - sample["ts"] > RL_MAX_LOOKAHEAD_S
 
@@ -2410,9 +2412,8 @@ def _open_note(inst: WindowInstance, spend: WindowSpend, now: float) -> str | No
     """The caption line for a window that has not reset yet, or None.
 
     A projection belongs to one row, so a column of it would be one number and
-    a stack of dashes. It also needs saying in words: the reading it starts
-    from, the rate it applies, and — when the first sample was not 0 — that
-    both are measured over what was observed and not over the window's life.
+    a stack of dashes. In words it can open with the reading it starts from,
+    which is where capture began and not where the window did.
     """
     if not inst.is_open(now):
         return None
@@ -2549,6 +2550,9 @@ def cmd_limits(args) -> None:
     --since/--until select samples, not instances, so a window straddling the
     boundary reports the peak and fill time of the part inside the range, and
     the spend of that part.
+
+    Exits 1 with a note on stderr when no samples have been recorded at all and
+    when the filters leave none.
     """
     since = parse_date(args.since) if args.since else None
     until = parse_date(args.until) if args.until else None
@@ -2603,8 +2607,8 @@ def main() -> None:
     # Before anything opens the DB: every path below it touches cache_db, and
     # get_connection reads this once, when it opens the singleton connection.
     # An interactive report is a bad place to spend the once-a-day 72 MB copy;
-    # the statusline's detached refresh takes it instead (macsetup-3xzh). An
-    # explicit setting from the environment wins.
+    # the statusline's detached refresh takes it instead. An explicit setting
+    # from the environment wins.
     os.environ.setdefault("CLAUDE_CACHE_SNAPSHOT_DEFER", "1")
     parser = argparse.ArgumentParser(
         description="Analyze Claude Code token usage and costs from local JSONL logs.",
@@ -2760,7 +2764,6 @@ def main() -> None:
     elif command == "account":
         report_account(records, nok=nok)
     else:
-        # No subcommand: show daily + monthly summary
         report_daily(records, breakdown=args.models, nok=nok)
         report_monthly(records, nok=nok)
         report_project(records, nok=nok)

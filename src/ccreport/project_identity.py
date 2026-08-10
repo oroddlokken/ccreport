@@ -1,10 +1,10 @@
 """Which project a usage record belongs to — one definition, for every reader.
 
-Three answers used to coexist (macsetup-2qrp): a path prefix under the
-projects dir, a cwd's basename, and ccreport's override table. Only the third
-knew about `ccreport merge`, so a merge regrouped the reports and left the
-statusline's per-project cost windows split. Everything that needs a project
-name now resolves it here, and pricing.py layers the directory scoping on top.
+Three answers used to coexist: a path prefix under the projects dir, a cwd's
+basename, and ccreport's override table. Only the third knew about `ccreport
+merge`, so a merge regrouped the reports and left the statusline's per-project
+cost windows split. Everything that needs a project name now resolves it here,
+and pricing.py layers the directory scoping on top.
 
 cache_db is imported inside the function rather than at module level: cache_db
 imports pricing and pricing imports this module, so a top-level import would
@@ -49,8 +49,7 @@ def repo_roots() -> tuple[str, ...]:
 
     Read on first use rather than at import, and only once: pricing imports this
     module on every statusline render, including the fast renders that name no
-    project at all, and this was a file open and a TOML parse in each of them
-    (macsetup-3jqw).
+    project at all, and this was a file open and a TOML parse in each of them.
     """
     import tomllib
 
@@ -131,12 +130,12 @@ def build_override_fn() -> Resolver | None:
     A record with neither repo nor cwd is history whose source JSONL was purged
     before those columns existed, and no backfill can bring them back. Matching
     remote and cwd_prefix rules on them alone would silently skip precisely the
-    rows that cannot be re-parsed, splitting a project in two (macsetup-623j).
-    So for those records only, a remote or cwd_prefix rule also matches the
-    project name its own source would have produced — the remote's repo
-    basename, or the cwd's repo/basename. The match sits at the rule's own
-    position in the order, so an orphan lands wherever the live records of the
-    same project land, and live records are unaffected either way.
+    rows that cannot be re-parsed, splitting a project in two. So for those
+    records only, a remote or cwd_prefix rule also matches the project name its
+    own source would have produced — the remote's repo basename, or the cwd's
+    repo/basename. The match sits at the rule's own position in the order, so an
+    orphan lands wherever the live records of the same project land, and live
+    records are unaffected either way.
 
     Still out of reach: an orphan whose cwd was a subdirectory of a cwd_prefix
     outside every repo root, since it was named after the subdirectory. A

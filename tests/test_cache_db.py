@@ -115,7 +115,7 @@ class _FailingCommit:
     """A connection whose COMMIT ends the transaction and then fails.
 
     Reproduces the case that made an unconditional ROLLBACK in the handler
-    raise "cannot rollback" over the real error (macsetup-39g2).
+    raise "cannot rollback" over the real error.
     """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
@@ -517,7 +517,7 @@ class TestFetchBlockedGate:
     on has to read as blocked here. A leader holding the costs lock across a
     multi-second compute_costs was invisible to this gate, so every slow render
     in that window spawned a detached interpreter that acquired nothing and
-    exited (macsetup-1huq).
+    exited.
     """
 
     def test_a_held_costs_lock_blocks(self, db):
@@ -554,7 +554,7 @@ class TestFetchBlockedGate:
 
         Judged by the costs lock's 30 s this reads as abandoned, and the render
         spawns a second fetch that try_acquire_fetch_lock then refuses — the
-        duplicate this gate exists to prevent (macsetup-3dl3).
+        duplicate this gate exists to prevent.
         """
         _hold_lock(db, "fetch", age=cache_db._LOCK_STALE_TIMEOUT + 10)
         assert cache_db.is_fetch_blocked() is True
@@ -748,9 +748,8 @@ class TestCostEntrySchemaGate:
 class TestDedupKeyPruning:
     """Keys stop being stored once no bounded window can still count the file.
 
-    The table gains a row per assistant message and nothing ever removed one
-    (macsetup-1jvz). Costs from an aged-out file survive in file_costs; only
-    its dedup keys go.
+    The table gains a row per assistant message and nothing ever removed one.
+    Costs from an aged-out file survive in file_costs; only its dedup keys go.
     """
 
     WEEK = "2026-08-03T00"
@@ -884,10 +883,11 @@ class TestCcreportRows:
     def test_the_record_dict_matches_the_column_tuple(self, db):
         """_group_by_file indexes the row by position; this is what names it.
 
-        Building one dict literal instead of walking _CCR_COLS by name is the
-        whole point of macsetup-qa61 — every cached read passes ~98k rows
-        through it — so nothing at runtime ties those indices back to the
-        tuple. A column added to _CCR_COLS and not to the literal lands here.
+        Every cached read passes the whole corpus through _group_by_file, and
+        walking _CCR_COLS by name cost a slice, a zipped dict, a comprehension
+        and a list per row, so the record dict is one literal indexed straight
+        off the row. Nothing at runtime ties those indices back to the tuple:
+        a column added to _CCR_COLS and not to the literal lands here.
         """
         row = ("/p/a.jsonl", *range(len(_CCR_COLS)))
         record = cache_db._group_by_file([row])["/p/a.jsonl"][0]
@@ -904,9 +904,9 @@ class TestCcreportRows:
 class TestScopedCcreportLoaders:
     """The scoped loaders must equal a full load filtered in Python.
 
-    That equality is the whole safety argument for macsetup-45iv: the
-    statusline used to read all ~89K rows per render and throw away everything
-    outside one project.
+    That equality is the whole safety argument for scoping the read in SQL at
+    all: the statusline used to load every row in ccreport_records per render
+    and throw away everything outside one project.
     """
 
     PROJ = "/p/-tmp-proj/"
@@ -1192,7 +1192,7 @@ class TestInvalidateCcreport:
         """A render gives up on the write lock in 0.25 s, the refresh in 10 s.
 
         One transaction across the whole ~98k-row UPDATE is what they used to
-        wait behind (macsetup-48xh).
+        wait behind.
         """
         commits = _count_commits(db)
         invalidate_ccreport(many_files)
@@ -1233,7 +1233,7 @@ class TestInvalidateCcreport:
 
 
 class TestCcreportRollups:
-    """Per-day aggregates for the days past ccreport's cutoff (macsetup-4rte).
+    """Per-day aggregates for the days past ccreport's cutoff.
 
     The rows are derived data — every one is rebuildable from
     ccreport_records — so what these guard is not the rows but the pairing
@@ -1472,7 +1472,7 @@ class TestProjectScopeCache:
 
 
 class TestProjectScopeSurvivesAnOrdinarySave:
-    """A save that moves no identity must leave the scopes alone (macsetup-ov32).
+    """A save that moves no identity must leave the scopes alone.
 
     Truncating the table on every batch made an ordinary ccreport run cost every
     open session a full scope derivation — a quarter of a render — on its next
@@ -1632,7 +1632,10 @@ class TestFlatPricingVariantsMigration:
         assert self._costs(migrated)["bracketed"] == 7.0
 
 
-# The index and dedup_keys shapes as they stood before macsetup-45iv/3le2/4rpc.
+# The index and dedup_keys shapes as they stood before idx_ccr_file_ts and
+# idx_ccr_sid replaced the single-column idx_ccr_file and idx_ccr_ts, and before
+# file_path took the lead of the dedup_keys primary key and left idx_dedup_file
+# with nothing to serve.
 _OLD_INDEX_SHAPE_SQL = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE file_costs (
@@ -1738,7 +1741,7 @@ class TestDedupKeysRebuildWithOrphans:
     rows whose file_costs parent is gone. Copying those into the new table under
     foreign_keys ON raised IntegrityError before the migration's own
     foreign_key_check could report it, and every ccreport run died in
-    get_connection (macsetup-1g9w).
+    get_connection.
     """
 
     @pytest.fixture
@@ -1793,7 +1796,7 @@ class TestPurgeCostSummaries:
 
     Migrations 1, 2 and 2b deleted 'cost_summary'/'cost_summary_time' and
     cleared nothing at all, because the only caller of write_cost_summary
-    always passes a cwd (macsetup-3a7f).
+    always passes a cwd.
     """
 
     def test_it_removes_the_project_scoped_keys(self, db):
@@ -1994,8 +1997,7 @@ class TestDailySnapshot:
     """A full copy of the DB is nothing a statusline render should be doing.
 
     The daily one is deferred out of the render and into its detached refresh
-    subprocess; the one taken before a migration is not deferrable at all
-    (macsetup-3xzh).
+    subprocess; the one taken before a migration is not deferrable at all.
     """
 
     @pytest.fixture
@@ -2071,7 +2073,7 @@ class TestDailySnapshot:
 
         Every statusline render writes cache.db, and each write restarts the
         copy from page 1 — with no cap the detached refresh that owns the daily
-        snapshot can sit there for the rest of the run (macsetup-66ic).
+        snapshot can sit there for the rest of the run.
         """
         stepped = _SteppedBackup([100, 90] * 8)
         assert cache_db._maybe_snapshot(cast("sqlite3.Connection", stepped)) == (None, False)
@@ -2570,7 +2572,7 @@ class TestRateLimitSnapshots:
 
 
 # ---------------------------------------------------------------------------
-# Reads bounded to what the caller asked for (macsetup-3rm3)
+# Reads bounded to what the caller asked for
 # ---------------------------------------------------------------------------
 
 

@@ -161,7 +161,7 @@ class TestWindowBoundFlags:
 
     The rollover case they exist for: a five_hour response without resets_at
     nulls the column, compute_costs then omits session_window_cost rather than
-    zeroing it, and the row keeps the previous window's total (macsetup-x2aq).
+    zeroing it, and the row keeps the previous window's total.
     """
 
     NATIVE = "2026-08-09T19:20:00"
@@ -365,7 +365,7 @@ class TestFetchLockHoldBudget:
         there would invert the layering and cost the render path a pricing
         import. So the two are kept in step here instead — a TTL below the hold
         lets the next spawn call a live fetch abandoned and start a second one
-        against the endpoint that is already answering 429 (macsetup-3dl3).
+        against the endpoint that is already answering 429.
         """
         from ccreport import cache_db
 

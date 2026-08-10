@@ -1,4 +1,4 @@
-"""Claude Code status line — Python implementation for performance.
+"""Claude Code status line.
 
 Receives JSON via stdin, outputs a formatted status line to stdout.
 
@@ -16,6 +16,8 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
   CLAUDE_STATUSLINE_RED                     — recolor entire status line red, any model (default 0)
   CLAUDE_STATUSLINE_HAIKU_RED               — recolor entire status line red when on Haiku
   CLAUDE_STATUSLINE_TIMESTAMP               — HH:MM invocation timestamp
+    CLAUDE_STATUSLINE_TIMESTAMP_EPOCH       — render that HH:MM from this epoch
+                                              instead of the wall clock
   CLAUDE_STATUSLINE_SESSION_ID              — short session UUID
   CLAUDE_STATUSLINE_HOSTNAME                — green hostname (default 0)
   CLAUDE_STATUSLINE_DIR                     — blue project directory
@@ -44,7 +46,7 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
   CLAUDE_STATUSLINE_BATTERY                 — battery % / state / time remaining (pmset) (default 0)
   CLAUDE_STATUSLINE_SESSIONS                — active sessions in last 15 min (default 0)
   CLAUDE_STATUSLINE_USAGE                   — Claude usage (session/week % with countdowns)
-    CLAUDE_STATUSLINE_WEEKLY_PACE            — weekly pace indicator (D3/7: On Pace)
+    CLAUDE_STATUSLINE_WEEKLY_PACE           — weekly pace indicator (3d14h/7d(3d10h) +21%)
     CLAUDE_STATUSLINE_SONNET                — Sonnet usage %
     CLAUDE_STATUSLINE_SONNET_THRESHOLD      — hide Sonnet below this % (default 25)
     CLAUDE_STATUSLINE_SCOPED                — per-model weekly limit (label from the model)
@@ -64,7 +66,7 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
       CLAUDE_STATUSLINE_7D_COST            — rolling 7-day cost
       CLAUDE_STATUSLINE_30D_COST           — rolling 30-day cost
       CLAUDE_STATUSLINE_AT_COST            — all-time cost (when > 30D)
-  CLAUDE_STATUSLINE_USAGE_JSON              — pre-provided usage JSON (skips get_claude_usage.py)
+  CLAUDE_STATUSLINE_USAGE_JSON              — pre-provided usage JSON (skips usage_api.py)
 
 Other environment variables:
   CLAUDE_CODE_PACE_DAYS                     — pace window in days (1-7, default 7)
@@ -112,16 +114,23 @@ from ccreport.pricing import (
     window_start_epoch,
 )
 
-# --- Config ---
-
 # Thresholds and layout constants
 BATT_WARN_PCT = 40         # % — yellow warning when discharging
 BATT_CRIT_PCT = 20         # % — red alert when discharging
 STALE_THRESHOLD_S = 3600   # seconds before usage data is considered too old
 STALE_GRACE_S = 1800       # age the stale marker waits for when S/W have no native source
+# The 10-minute usage TTL, and the one place it is named. usage_api.CACHE_MAX_AGE
+# and the two `max_age: int = 600` defaults in cache_db (read_usage_cache,
+# read_cost_summary) are the same 600 s, spelled out rather than imported because
+# cache_db must not import the render path. Change one, change all four.
 USAGE_FETCH_INTERVAL_S = 600    # normal cadence when the API is actually needed
 USAGE_HEARTBEAT_S = 3600   # ceiling on API staleness when nothing needs it now
 NEAR_THRESHOLD_MARGIN = 10  # % below a display threshold that still warrants fetching
+# Also the costs-only refresh cadence: _fetch_usage spawns --costs-only on its
+# `cost_summary is None` branch, so this — not USAGE_FETCH_INTERVAL_S — sets how
+# often a detached subprocess rescans the whole JSONL corpus. The 300 s gap
+# between the two is deliberate — aligning them to 600 for consistency runs that
+# rescan half again as often.
 COST_SUMMARY_MAX_AGE = 900  # seconds the cached compute_costs() result stays usable
 FAST_TTL_S = 15            # seconds a render may reuse the previous render's fetch results
 EXTRA_ACCRUAL_PCT = 90     # session % from which extra credits could start accruing
@@ -254,7 +263,6 @@ def _model_banner(model: str, effort: str = "") -> str:
 
 
 def _parse_iso_epoch(iso: str) -> float | None:
-    """Parse ISO 8601 timestamp to epoch seconds."""
     if not iso:
         return None
     try:
@@ -267,7 +275,6 @@ def _parse_iso_epoch(iso: str) -> float | None:
 
 
 def _start_git(cwd: str) -> dict[str, subprocess.Popen[bytes]]:
-    """Start git commands as non-blocking subprocesses."""
     import subprocess
 
     procs: dict[str, subprocess.Popen[bytes]] = {}
@@ -310,7 +317,6 @@ _EMPTY_GIT = GitInfo("", "", "", "", 0, 0)
 def _collect_git(
     procs: dict[str, subprocess.Popen[bytes]],
 ) -> GitInfo:
-    """Collect git results into a GitInfo NamedTuple."""
     import subprocess
 
     if not procs:
@@ -351,7 +357,6 @@ def _collect_git(
 
 
 def _start_battery() -> subprocess.Popen[bytes] | None:
-    """Start pmset battery query as a non-blocking subprocess."""
     import subprocess
 
     if not _on("BATTERY", default=False):
@@ -652,8 +657,8 @@ def _spawn_usage_refresh(
     cached row's session_reset can be null right after a rollover — an API
     response that omits resets_at writes the column as an explicit null — and
     compute_costs omits session_window_cost when it has no bound, so a refresh
-    told only the cached value re-persists the previous window's total
-    (macsetup-x2aq). A native reset that has already passed is harmless:
+    told only the cached value re-persists the previous window's total.
+    A native reset that has already passed is harmless:
     window_start_epoch reads it as the start of the current window.
     """
     import subprocess
@@ -687,11 +692,12 @@ def _spawn_usage_refresh(
 def _fetch_usage(
     session_id: str, cwd: str, native_rl: dict, cost_summary: dict | None,
 ) -> dict:
-    """Get usage data: env var → cache bypass → detached get_claude_usage.py.
+    """Usage data: the env var, else the cached row — stale behind a detached refresh.
 
-    The refresh subprocess is detached (start_new_session=True) so it survives
-    the parent being killed by the statusline framework (e.g. tmux interval).
-    Stale cached data is returned for this render; fresh data appears next call.
+    A fresh row is returned as is; a stale one is returned all the same, after
+    spawning `-m ccreport.usage_api` to refresh it for the next render. That
+    subprocess is detached (start_new_session=True) so it survives the parent
+    being killed by the statusline framework (e.g. tmux interval).
 
     When the API cannot affect the render the spawn becomes --costs-only, which
     skips the network entirely but keeps the cost windows current.
@@ -832,22 +838,17 @@ CLAUDE_CONFIG_JSON = Path.home() / ".claude.json"
 def _capture_account(memo: dict | None = None) -> None:
     """Note the signed-in account when it differs from the last one recorded.
 
-    The render is the capture point because it is the only thing that runs
-    often enough to catch a mid-session /login: nothing else reads this file,
-    and the session JSONL never names an account, so a switch that goes
-    unrecorded here is a switch ccreport can never attribute. cache_db only
-    writes on an actual change, so the usual render pays a read and a SELECT.
+    The render is the only capture point: nothing else reads this file, and the
+    session JSONL never names an account, so a mid-session /login that goes
+    unrecorded here is one ccreport can never attribute. cache_db writes only on
+    an actual change, so the usual render pays a read and a SELECT.
 
-    ~/.claude.json is a quarter of a megabyte and holds one key this cares
-    about, so *memo* carries the (mtime_ns, size) the last parse saw and an
-    unchanged stamp skips the parse: an account cannot have switched in a file
-    that was not rewritten. The cadence is unchanged, so a /login is still
-    caught within FAST_TTL_S. Pass no memo to force the parse.
+    ~/.claude.json is large — hundreds of kilobytes — and holds one key this
+    cares about, so *memo* carries the (mtime_ns, size) the last parse saw and
+    an unchanged stamp skips the parse. Pass no memo to force it.
 
-    Best-effort throughout, like every other bookkeeping write in the render: a
-    config that is missing, unreadable, half-written or carrying no
-    oauthAccount, and a database held by another writer, all cost the change
-    log one sample rather than costing the user their status line.
+    Best-effort: any failure costs the change log one sample, never the status
+    line. docs/calculation-reference.md section 9.1 enumerates them.
     """
     try:
         stamp = None
@@ -1249,7 +1250,6 @@ def _weekly_pace(
         elapsed_str = f"{el_d}d{el_h}h"
     else:
         elapsed_str = f"{el_d}d"
-    # Remaining time until reset
     remain_s = int(reset_epoch - now)
     if remain_s > 0 and countdown:
         cd = _usage_countdown(reset_iso, now)
@@ -1368,7 +1368,6 @@ def _render_sessions(cwd: str, now: float) -> str:
 
 
 def _extra_deltas(current_spent: float, usage: dict, now: float) -> dict[str, float | None]:
-    """Compute extra usage deltas for session window (5h) and week (7d)."""
     from ccreport import cache_db
 
     return cache_db.compute_extra_window_deltas(
@@ -1379,7 +1378,6 @@ def _extra_deltas(current_spent: float, usage: dict, now: float) -> dict[str, fl
 
 
 def _ustr(d: dict, key: str) -> str:
-    """Safely extract a string value from a usage dict."""
     return str(d.get(key, "") or "")
 
 
@@ -1750,7 +1748,7 @@ def _render_session(
     return " ".join(parts)
 
 
-# --- Main ---
+# --- Cost merge, stdin parsing, layout, the per-render fetch cache, main ---
 
 
 def _merge_cost_data(
@@ -2174,7 +2172,7 @@ def _fetch_all(
         # In-process: usage cache + .dogcats log (no subprocess)
         usage_data = _fetch_usage(inp.session_id, inp.cwd, native_rl, cost_summary)
         # Strip project-scoped costs from usage cache — they belong to
-        # whichever project last wrote the singleton row (macsetup-1zeq)
+        # whichever project last wrote the singleton row, not to this one
         if usage_data:
             for k in list(usage_data):
                 if "project_cost" in k:
@@ -2259,7 +2257,7 @@ def main() -> None:
     os.environ.setdefault("CLAUDE_CACHE_DB_TIMEOUT", RENDER_DB_TIMEOUT_S)
     # A render is the likeliest process to be first through the door after UTC
     # midnight, and the daily snapshot is a full copy of the DB. _refresh_env
-    # drops this, so the detached refresh takes it instead (macsetup-3xzh).
+    # drops this, so the detached refresh takes the copy instead.
     os.environ.setdefault("CLAUDE_CACHE_SNAPSHOT_DEFER", "1")
     now_epoch = time.time()
     test_null = "-t0" in sys.argv  # pre-first-API-call / post-compact null state

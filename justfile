@@ -10,7 +10,7 @@ var:
 fmt:
     uv run ruff check --fix --unsafe-fixes src tests tools
 
-# run all formatters
+# all of formatting is `just fmt` — `ruff format` stays out on purpose
 fmt-all:
     just fmt
 

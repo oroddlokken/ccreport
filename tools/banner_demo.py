@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Render real examples of every banner / colored token used by statusline_command.py.
+"""Render real examples of every banner / colored token src/ccreport/statusline.py uses.
 
 Run this whenever you tweak banner colors to eyeball every variant in one shot.
-Self-contained: ANSI codes are hardcoded to mirror statusline_command.py — keep
-the two in sync when colors change.
+Self-contained: ANSI codes are hardcoded to mirror statusline.py — keep the two
+in sync when colors change.
 """
 import re
 
@@ -40,7 +40,7 @@ print()
 print("Combined examples (line 1 of wide layout):")
 DOT = f"{SUBDUED} · {RST}"
 TOP = (
-    f"{SUBDUED}01:14{RST} \033[0;34mmacsetup/claude{RST} "
+    f"{SUBDUED}01:14{RST} \033[0;34mccreport/src{RST} "
     f"\033[0;33mmain{RST}"
 )
 
@@ -62,6 +62,6 @@ print(
 haiku = f"\033[1;97;48;5;196m HAIKU 4.5 {RST}"
 red = "\033[1;91m"
 print(
-    f"  {red}01:14 macsetup/claude main[+2-1] · {RST}{haiku}"
+    f"  {red}01:14 ccreport/src main[+2-1] · {RST}{haiku}"
     f"{red} CH:98% 12k/167k:7%{RST}   (HAIKU_RED=1 collapses inner colors)"
 )

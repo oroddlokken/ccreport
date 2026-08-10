@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.12"
 # ///
-"""Reproducible energy-impact benchmark for statusline_command.py.
+"""Reproducible energy-impact benchmark for src/ccreport/statusline.py.
 
 Three phases:
   1. Per-invocation cost — wall time, CPU seconds, peak RSS (process tree
@@ -14,7 +14,7 @@ Three phases:
      rates, expressed as % of battery.
 
 Run on an otherwise quiescent machine; the idle baseline is ambient.
-The detached get_claude_usage.py fetch (start_new_session) escapes the
+The detached ccreport.usage_api fetch (start_new_session) escapes the
 process tree and is NOT counted in phase 1 — its cost is occasional
 (10 min cache TTL) and network-bound.
 
@@ -126,11 +126,9 @@ def main() -> int:
     log("warmup render ...")
     measure_child([str(STATUSLINE), "-t"])
 
-    # --- Phase 1: per-invocation cost ---
     log(f"phase 1: per-invocation cost (median of {args.runs}) ...")
     full = median_of([str(STATUSLINE), "-t"], args.runs)
 
-    # --- Phase 2: direct power measurement ---
     idle = load = None
     renders_done = 0
     load_duration = 0.0
@@ -153,7 +151,6 @@ def main() -> int:
             loop.wait()
         renders_done = int(load_duration / full["wall_s"])
 
-    # --- Phase 3: derived energy ---
     cpu_s = full["cpu_s"]
     j_low, j_high = cpu_s * CORE_W_LOW, cpu_s * CORE_W_HIGH
     measured = None

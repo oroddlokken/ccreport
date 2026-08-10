@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Seam Claude Code's settings.json points at. Segment defaults live in
+# Wrapper Claude Code's settings.json points at. Segment defaults live in
 # src/ccreport/statusline.py; per-machine CLAUDE_STATUSLINE_* overrides go here.
 
 export CLAUDE_STATUSLINE_SCOPED_THRESHOLD="${CLAUDE_STATUSLINE_SCOPED_THRESHOLD:-0}"
@@ -19,7 +19,7 @@ REPO="$BIN/.."
 SRC="$REPO/src"
 
 # CPython writes and reads __pycache__ only for modules it imports, never for
-# the file named on its command line: run as a script, the whole 92 KB is
+# the file named on its command line: run as a script, the whole module is
 # tokenized and compiled again on every render, before main() even reaches the
 # fast-path check. Importing it instead caches the bytecode and leaves only
 # this one-line -c string to compile. It pops the directory back off argv so
@@ -46,10 +46,8 @@ fi
 # it a comma) gives integer microseconds; under an older bash it expands
 # empty and the segment shows the in-process time alone.
 #
-# Timing costs the render a forked subshell, a pipe, a parent that stays
-# resident and a whole-output command substitution — so the default is the
-# plain exec below, and the price is paid only by someone who asked to see the
-# figure. `!= 0` matches the render's own _on().
+# Timing costs a subshell and a command substitution, so it is off by default.
+# `!= 0` matches the render's own _on().
 if [[ "$CLAUDE_STATUSLINE_RENDER_TIME" == 0 || -z "$EPOCHREALTIME" ]]; then
   exec "$PY" -c "$BOOT" "$SRC" "$@"
 fi

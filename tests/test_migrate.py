@@ -1,4 +1,4 @@
-"""Relocating the cache, snapshots and config off their macsetup-era paths.
+"""Relocating the cache, snapshots and config off their legacy macsetup paths.
 
 The move happens once per machine and moves data no re-parse can rebuild, so
 what is pinned here is the shape of it: sidecars travel with the DB, a

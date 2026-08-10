@@ -31,10 +31,6 @@ from ccreport.pricing import (
     window_start_epoch,
 )
 
-# ---------------------------------------------------------------------------
-# _parse_effective
-# ---------------------------------------------------------------------------
-
 
 class TestParseEffective:
     def test_date_only(self):
@@ -48,11 +44,6 @@ class TestParseEffective:
     def test_returns_utc(self):
         dt = _parse_effective("2025-06-15")
         assert dt.tzinfo == UTC
-
-
-# ---------------------------------------------------------------------------
-# find_pricing
-# ---------------------------------------------------------------------------
 
 
 class TestFindPricing:
@@ -101,11 +92,6 @@ class TestFindPricing:
         assert prices is not None
 
 
-# ---------------------------------------------------------------------------
-# tiered_cost
-# ---------------------------------------------------------------------------
-
-
 class TestTieredCost:
     def test_below_threshold_no_tier(self):
         cost = tiered_cost(100_000, 3e-06, 6e-06)
@@ -135,11 +121,6 @@ class TestTieredCost:
 
     def test_one_token(self):
         assert tiered_cost(1, 5e-06, 10e-06) == pytest.approx(5e-06)
-
-
-# ---------------------------------------------------------------------------
-# calc_cost
-# ---------------------------------------------------------------------------
 
 
 class TestCalcCost:
@@ -223,11 +204,6 @@ class TestCalcCost:
         assert cost == pytest.approx(250_000 * 5e-06)
 
 
-# ---------------------------------------------------------------------------
-# window_start_epoch
-# ---------------------------------------------------------------------------
-
-
 class TestWindowStartEpoch:
     NOW = 1_700_000_000.0
 
@@ -258,11 +234,6 @@ class TestWindowStartEpoch:
     def test_window_lengths(self):
         assert SESSION_WINDOW_S == 5 * 3600
         assert WEEK_WINDOW_S == 7 * 86400
-
-
-# ---------------------------------------------------------------------------
-# _parse_window_starts
-# ---------------------------------------------------------------------------
 
 
 class TestParseWindowStarts:
@@ -307,11 +278,6 @@ class TestParseWindowStarts:
     def test_invalid_week_reset_falls_back_to_monday(self):
         _, week_start = _parse_window_starts(None, "garbage")
         assert week_start.weekday() == 0
-
-
-# ---------------------------------------------------------------------------
-# _rolling_thresholds / _bucket_rolling_cost
-# ---------------------------------------------------------------------------
 
 
 class TestRollingHelpers:
@@ -367,11 +333,6 @@ class TestRollingHelpers:
         assert proj.get("six_hour") is None
 
 
-# ---------------------------------------------------------------------------
-# _rec_cost
-# ---------------------------------------------------------------------------
-
-
 class TestRecCost:
     def test_returns_stored_cost_if_present(self):
         rec = {"cost": 1.23, "t": [100, 200, 300, 400], "model": "x"}
@@ -405,11 +366,6 @@ class TestRecCost:
     def test_missing_ts_still_computes(self):
         rec = {"cost": None, "t": [1000, 0, 0, 0], "model": "claude-sonnet-4-20250514"}
         assert _rec_cost(rec) > 0
-
-
-# ---------------------------------------------------------------------------
-# Data integrity
-# ---------------------------------------------------------------------------
 
 
 class TestPricingDataIntegrity:
@@ -452,11 +408,6 @@ class TestPricingDataIntegrity:
 
     def test_tier_threshold_is_200k(self):
         assert TIER_THRESHOLD == 200_000
-
-
-# ---------------------------------------------------------------------------
-# extract_assistant_fields
-# ---------------------------------------------------------------------------
 
 
 class TestExtractAssistantFields:
@@ -515,11 +466,6 @@ class TestExtractAssistantFields:
         result = extract_assistant_fields(rec)
         assert result is not None
         assert result[5].tzinfo is not None
-
-
-# ---------------------------------------------------------------------------
-# _try_cached_file
-# ---------------------------------------------------------------------------
 
 
 class TestTryCachedFile:
@@ -728,11 +674,6 @@ class TestTryCachedFile:
         assert rolling.get("six_hour", 0.0) == 0.0
 
 
-# ---------------------------------------------------------------------------
-# _scan_jsonl_file
-# ---------------------------------------------------------------------------
-
-
 class TestScanJsonlFile:
     """Tests for the JSONL scanning helper extracted from compute_costs."""
 
@@ -780,7 +721,7 @@ class TestComputeCostsSessionWindowKey:
     """session_window_cost must be absent, not 0.0, without a reset time.
 
     Callers merge the result over existing data, so a placeholder zero would
-    overwrite a real total computed by a caller that had the reset (macsetup-4uja).
+    overwrite a real total computed by a caller that had the reset.
     """
 
     @pytest.fixture
@@ -826,7 +767,7 @@ class TestComputeCostsSessionWindowKey:
 
 
 class TestComputeCostsSavesOnlyChangedFiles:
-    """One appended line must not rewrite the whole cost cache (macsetup-5vsf)."""
+    """One appended line must not rewrite the whole cost cache."""
 
     @pytest.fixture
     def projects(self, monkeypatch, tmp_path):
@@ -922,7 +863,7 @@ class TestComputeCostsSavesOnlyChangedFiles:
 
 
 # ---------------------------------------------------------------------------
-# Per-render reads scoped to one project (macsetup-45iv)
+# Per-render reads scoped to one project
 # ---------------------------------------------------------------------------
 
 
@@ -1094,7 +1035,7 @@ class TestPerRenderScoping:
 
 
 # ---------------------------------------------------------------------------
-# One definition of which project a record belongs to (macsetup-2qrp)
+# One definition of which project a record belongs to
 # ---------------------------------------------------------------------------
 
 
@@ -1120,9 +1061,9 @@ class TestPathInProject:
 class TestMergedProjectsShareTheirCostWindows:
     """`ccreport merge` has to mean one project for the statusline too.
 
-    Before macsetup-2qrp a merge regrouped the reports and left the per-project
-    cost windows split, because pricing matched on a path prefix and a cwd
-    basename and knew nothing about the override table.
+    A merge used to regroup the reports and leave the per-project cost windows
+    split, because pricing matched on a path prefix and a cwd basename and knew
+    nothing about the override table.
     """
 
     CWD = "/tmp/proj"
@@ -1289,9 +1230,9 @@ class TestTheResolvedScopeIsCachedPerCwd:
     """Resolving a merged scope reads every cached file's identity.
 
     That GROUP BY was 0.020s of an 0.085s statusline call, repeated on every
-    render for an answer that only moves when a rule or a record does
-    (macsetup-6cov). These tests pin both halves: the second render skips the
-    scan, and a change to either input still reaches it.
+    render for an answer that only moves when a rule or a record does. These
+    tests pin both halves: the second render skips the scan, and a change to
+    either input still reaches it.
     """
 
     CWD = "/tmp/proj"
@@ -1445,7 +1386,7 @@ class TestTheResolvedScopeIsCachedPerCwd:
 
 
 # ---------------------------------------------------------------------------
-# dk-NULL records still have to dedupe (macsetup-2wgm)
+# dk-NULL records still have to dedupe
 # ---------------------------------------------------------------------------
 
 
@@ -1560,7 +1501,7 @@ class TestFallbackDedupIdentity:
 
 
 # ---------------------------------------------------------------------------
-# A render prices an unchanged live file from the cache (macsetup-rn21)
+# A render prices an unchanged live file from the cache
 # ---------------------------------------------------------------------------
 
 
@@ -1995,7 +1936,7 @@ class TestWeekCostByModel:
 
 
 # ---------------------------------------------------------------------------
-# The bisected pricing-period index (macsetup-16c7)
+# The bisected pricing-period index
 # ---------------------------------------------------------------------------
 
 
@@ -2097,7 +2038,7 @@ class TestPricingPeriodIndex:
 
 
 # ---------------------------------------------------------------------------
-# Incremental session cost (macsetup-31g6)
+# Incremental session cost
 # ---------------------------------------------------------------------------
 
 
@@ -2281,7 +2222,7 @@ class TestIncrementalSessionCost:
 
 
 # ---------------------------------------------------------------------------
-# Slow-path-only imports and lazy module state (macsetup-3jqw)
+# Slow-path-only imports and lazy module state
 # ---------------------------------------------------------------------------
 
 
@@ -2333,7 +2274,7 @@ class TestDeferredImports:
 
 
 # ---------------------------------------------------------------------------
-# Cost computation bounded to a window, all_time excepted (macsetup-3rm3)
+# Cost computation bounded to a window, all_time excepted
 # ---------------------------------------------------------------------------
 
 # Priced since 2025-01-01, so a record 200 days old still has a price to

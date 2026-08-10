@@ -36,14 +36,20 @@ from ccreport.cache_db import (
 )
 from ccreport.pricing import compute_costs
 
-CACHE_MAX_AGE = 600  # 10 minutes
+# 10 minutes: how old a usage row may be before main() refetches rather than
+# reprint it. statusline.USAGE_FETCH_INTERVAL_S is the authority for that
+# interval; this and the max_age=600 defaults of cache_db.read_usage_cache and
+# read_cost_summary spell the same number and must move with it. Drop the
+# statusline's interval below this one and every render past it spawns a fetch
+# that this module answers straight from the cache it wanted refreshed.
+CACHE_MAX_AGE = 600
 
 # Every field fetch_usage_api can produce. write_usage_cache leaves columns the
 # write dict does not mention alone, which is what keeps a failed cost
-# computation from nulling the cost columns (macsetup-29bl) — but for these an
-# omission is a statement: the API drops a quota that no longer applies (no
-# Sonnet cap on this plan, a scoped limit that lapsed), and without an explicit
-# null the old reading would outlive the quota it described.
+# computation from nulling the cost columns — but for these an omission is a
+# statement: the API drops a quota that no longer applies (no Sonnet cap on this
+# plan, a scoped limit that lapsed), and without an explicit null the old reading
+# would outlive the quota it described.
 _API_QUOTA_FIELDS = (
     "session_percent", "session_reset", "week_percent", "week_reset",
     "sonnet_percent", "sonnet_reset",
@@ -63,7 +69,6 @@ USAGE_API_RETRY_DELAY = 1.0  # seconds between retries
 USAGE_API_MAX_RETRY_DELAY = 5.0  # ceiling on a Retry-After the server asks for
 CREDENTIALS_SERVICE = "Claude Code-credentials"
 
-# HTTP status codes worth retrying
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 KEYCHAIN_TIMEOUT = 5  # seconds per `security` lookup
@@ -74,7 +79,7 @@ KEYCHAIN_DUMP_TIMEOUT = 10  # seconds for the one `security dump-keychain`
 # logged in repeatedly accumulates entries without bound — uncapped, a keychain
 # that answers slowly turns the tail of that list into minutes of serial waiting
 # under the fetch lock. Five covers switching between a handful of accounts;
-# past that the credentials file is the likelier answer anyway (macsetup-3dl3).
+# past that the credentials file is the likelier answer anyway.
 MAX_KEYCHAIN_CANDIDATES = 5
 
 # Longest get_usage_token() + fetch_usage_api() can legitimately run, which is
@@ -135,13 +140,13 @@ def _list_keychain_candidates() -> list[str]:
     except (subprocess.TimeoutExpired, OSError):
         return []
 
-    # Decode with replacement to handle non-UTF8 output (macsetup-60yx)
+    # Decode with replacement to handle non-UTF8 output
     output = raw.stdout.decode("utf-8", errors="replace")
 
     import re
     services: list[tuple[str, str | None]] = []
     # Split on individual keychain item boundaries instead of keychain file
-    # boundaries, so multiple entries within one keychain are found (macsetup-1ypj)
+    # boundaries, so multiple entries within one keychain are found
     items = re.split(r"(?=class:)", output)
     for item in items:
         svc_m = re.search(r'"svce"<blob>="([^"]+)"', item)
@@ -150,12 +155,10 @@ def _list_keychain_candidates() -> list[str]:
         svc = svc_m.group(1)
         if not svc.startswith(CREDENTIALS_SERVICE) or svc == CREDENTIALS_SERVICE:
             continue
-        # Extract modification date for sorting
         mdat_m = re.search(r'"mdat"<timedate>=(?:0x[0-9A-Fa-f]+\s+)?"([^"]+)"', item)
         mdat = mdat_m.group(1).replace("\\000", "").strip() if mdat_m else None
         services.append((svc, mdat))
 
-    # Sort by modification date descending (newest first)
     services.sort(key=lambda x: x[1] or "", reverse=True)
     return [svc for svc, _ in services[:MAX_KEYCHAIN_CANDIDATES]]
 
@@ -240,9 +243,16 @@ def request_usage_body(token: str) -> dict[str, Any]:
 
 
 def fetch_usage_api(token: str) -> dict[str, Any]:
-    """Fetch usage data from the Anthropic API.
+    """Fetch usage data from the Anthropic API, mapped to our column names.
 
-    Returns dict with session_percent, week_percent, etc. mapped to our format.
+    The keys are a subset of _API_QUOTA_FIELDS — a full response produces all of
+    them, and a quota the response leaves out is simply absent from the dict
+    rather than present as None. main() is what turns that absence into the
+    explicit null the cache needs.
+
+    request_usage_body's errors come out of here untouched: HTTPError once the
+    status is not in _RETRYABLE_STATUS or the retries are spent, URLError and
+    OSError once they are spent.
     """
     body = request_usage_body(token)
 
@@ -284,7 +294,6 @@ def fetch_usage_api(token: str) -> dict[str, Any]:
             data["scoped_reset"] = lim["resets_at"]
         break
 
-    # extra_usage
     extra = body.get("extra_usage", {})
     if extra.get("utilization") is not None:
         data["extra_percent"] = int(extra["utilization"])
@@ -295,11 +304,6 @@ def fetch_usage_api(token: str) -> dict[str, Any]:
         data["extra_limit"] = extra["monthly_limit"] / 100
 
     return data
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 
 def _enrich_and_emit(
@@ -391,6 +395,9 @@ def _parse_cli_args() -> tuple[bool, int, str | None, str | None, bool]:
     """Parse CLI arguments. Returns (force, wait_timeout, session_id, cwd, raw)."""
     force = "--force" in sys.argv
     raw = "--raw" in sys.argv
+    # 30s is generous, which is what a CLI invocation the user is watching wants:
+    # waiting out a slow leader beats printing an error. The statusline passes
+    # --wait-timeout 4 instead, because a render that waits prints nothing.
     wait_timeout = 30
     wt = _arg_value("--wait-timeout")
     if wt:
@@ -426,7 +433,7 @@ def _wait_for_leader(
             _enrich_and_emit(cached, session_id, cwd)
             sys.exit(0)
         delay = min(delay * 2, LEADER_POLL_MAX_DELAY)
-    # Leader failed — emit stale data if available (macsetup-348k)
+    # Leader failed — emit stale data if available
     stale = read_usage_stale()
     if stale:
         stale["_stale"] = True
@@ -484,7 +491,7 @@ def main() -> None:
             # native stdin bounds, standing in when this response omitted a
             # window — without any bound compute_costs returns no
             # session_window_cost and the previous window's total survives
-            # in the row (macsetup-x2aq).
+            # in the row.
             costs = compute_costs(
                 session_id=session_id_arg, cwd=cwd_arg,
                 session_reset_iso=data.get("session_reset") or _arg_value("--session-reset"),

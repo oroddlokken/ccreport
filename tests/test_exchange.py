@@ -197,7 +197,7 @@ def test_a_rejected_date_is_re_requested_next_run(fake_api):
 
 
 # ---------------------------------------------------------------------------
-# Gap handling: the series is business-day only (macsetup-50u0)
+# Gap handling: the series is business-day only
 # ---------------------------------------------------------------------------
 
 
@@ -228,7 +228,7 @@ def test_a_holiday_is_negative_cached_and_not_re_requested(spy_api):
 def test_a_settled_corpus_stops_asking_the_api(spy_api):
     """The regression: weekend and holiday gaps kept every run refetching.
 
-    _find_missing_range counted every date with no row as missing, and no
+    _fetch_span counted every date with no row as missing, and no
     weekend ever gets one, so the span ran from the corpus's oldest Saturday to
     today on every single invocation.
     """

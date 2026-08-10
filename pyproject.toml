@@ -39,11 +39,11 @@ dev = [
 ]
 
 [tool.ruff]
-# 110 rather than the 88 most of these rules assume: 215 lines here run over 88
-# and 32 over 100, nearly all of them aligned SQL, rich column definitions, or
-# rows of the statusline's env-var table. Rewrapping them costs more than it
-# buys. `just fmt` deliberately does not run `ruff format` for the same reason —
-# the wrapping in this tree is hand-chosen.
+# 110 rather than the 88 most of these rules assume: the long lines here are
+# aligned SQL, rich column definitions and rows of the statusline's env-var
+# table, which read as tables until something rewraps them into prose. `just
+# fmt` deliberately does not run `ruff format` for the same reason — the
+# wrapping in this tree is hand-chosen.
 line-length = 110
 target-version = "py313"
 
@@ -103,7 +103,7 @@ select = [
 # those markers from outliving the finding.
 ignore = [
   # Conflicts inside pydocstyle, or churn from formatting we do not run.
-  "COM812",  # trailing commas — 200+ sites and no formatter to add them
+  "COM812",  # trailing commas — no formatter here to add them
   "D203",    # blank line before class docstring (conflicts with D211)
   "D212",    # multi-line summary first line (conflicts with D213)
   "D213",    # multi-line summary second line
@@ -188,7 +188,8 @@ venvPath = "."
 venv = ".venv"
 # standard, not strict. This tree annotates its boundaries and leaves the rest
 # inferred; strict wants a parameter type on every local helper and every
-# fixture, and answers with 5987 findings that say nothing about correctness.
+# fixture, and answers with a wall of findings that say nothing about
+# correctness.
 # What standard still catches is the one that bites here: a helper returning
 # `dict | None` whose caller subscripts it.
 typeCheckingMode = "standard"

@@ -78,40 +78,20 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   record content when the log carried no `message.id` or `requestId`; only the
   log's own key is persisted
 - Which account a record billed to comes from the `account_events` change log,
-  not the JSONL — a session log names no account. The status line checks
-  `~/.claude.json` on every slow-path render and reparses it for `oauthAccount`
-  whenever its `(mtime_ns, size)` moved (so a mid-session `/login` can be
-  recorded up to `FAST_TTL_S` late, and spend in that gap attributes to the old
-  account) and appends a row only when it differs from the newest one. A row
-  carries the four identity fields plus three tiers (`seat_tier`,
-  `user_rate_limit_tier`, `organization_rate_limit_tier`), and the change gate
-  compares all seven — so a seat or plan change on an unchanged login appends a
-  row too, which is how the log dates a tier change.
-  `cache_db._ACCOUNT_IDENTITY_COLS` is the subset that answers "same account?";
-  `cache_db.effective_limit_tier()` picks the user tier over the org one.
-  `ccreport` stamps each record at read time from the newest event at or before
-  its timestamp, so records predating the log report as `unknown` and a later
-  event re-attributes past reports with no re-parse. `ccreport adopt` claims that
-  pre-capture history by writing one backdated event at `ts=0` (undo with
-  `--remove`); it is the only thing that ever deletes from `account_events`, and
-  only that row
+  not the JSONL — a session log names no account. Slow-path renders append an
+  event when `~/.claude.json` names a different identity or tier, and `ccreport`
+  stamps each record at read time from the newest event at or before it.
+  `cache_db._ACCOUNT_IDENTITY_COLS` answers "same account?",
+  `cache_db.effective_limit_tier()` picks the user tier over the org one, and
+  `ccreport adopt` claims pre-capture history — the rest is
+  `docs/calculation-reference.md` section 9
 - How full each rate-limit window got over time lives in `rate_limit_snapshots`,
-  appended by slow-path renders — the live percentages are the only source, so an
-  unobserved window leaves no history. A sample lands only when the whole-percent
-  reading moves and 300 s have passed, or when `resets_at` names a new window
-  instance; `used_pct` keeps the raw float. `resets_at` is stored normalized to
-  the whole minute (`cache_db.rl_window_key`) and a reading more than
-  `RL_MAX_LOOKAHEAD_S` out is refused — the API's float drifts between fetches of
-  one window, which bypassed the gate entirely, and Claude Code sends
-  `9999999999` where it has no reset. Both defects are in stored history, so
-  `ccreport limits` re-normalizes on read and drops the placeholders with a note.
-  Rows carry no account: attribute by `ts` against `account_events`, as
-  `ccreport` does for records. `ccreport limits` is the reader — it groups by
-  `(window, model, resets_at)`, and prices each instance's rise against the
-  records covering its fill span, through `load_all_records` (dedup is what makes
-  the number an answer) bounded to the span the samples cover. A scoped or Sonnet
-  window counts one model family, session and week every model. Nothing prunes
-  this table; the write gate is what bounds it
+  appended by slow-path renders from the live percentages, so an unobserved
+  window leaves no history. `ccreport limits` is the reader: it groups by
+  `(window, model, resets_at)` and prices each instance's rise against the
+  records covering its fill span. `docs/calculation-reference.md` section 9.6
+  has the write gate, the account attribution and the two defects stored history
+  carries
 - NOK conversion uses Norges Bank daily spot rates via `exchange.py`, cached in
   the `exchange_rates` table. Each record's USD cost is converted at its own
   Oslo-date rate, walking back up to 10 days for weekends and holidays. An
@@ -143,9 +123,7 @@ public function, route or CLI command has a pytest test under `tests/`.
 
 Ask before `git push --force`, `git reset --hard`, `git checkout -- .` or
 deleting a branch: the first rewrites history others have already pulled, and
-the rest discard uncommitted work that no reflog can return. `git push` itself
-can reach production — `.deploy.remote.settings.toml` sets `git_push_after`,
-so a deploy pushes as part of its run.
+the rest discard uncommitted work that no reflog can return.
 
 Project creation runs `git init` without an initial commit, so `git log` and
 `git diff HEAD` fail until you make one.

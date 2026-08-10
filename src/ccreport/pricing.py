@@ -1,11 +1,12 @@
 """Shared Claude model pricing data, cost calculation, and cost aggregation.
 
 Single source of truth for pricing tables, model aliases, cost formulas,
-and cost aggregation. get_claude_usage.py, statusline_command.py, and
-ccreport.py all import from this module.
+and cost aggregation. ccreport.py, statusline.py, usage_api.py, ccu.py and
+cache_db.py all import from this module.
 
-AUDIT: All calculations are documented in claude/CLAUDE.md.
-When changing any pricing, tiering, or cost logic here, update CLAUDE.md to match.
+AUDIT: All calculations are documented in docs/calculation-reference.md.
+When changing any calculation, caching, or data format here,
+update that document to match.
 """
 
 from __future__ import annotations
@@ -24,8 +25,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, TypedDict
 if TYPE_CHECKING:
     # Both are slow-path only: zoneinfo's package init resolves TZPATH through
     # sysconfig, and project_identity reads the repo-roots config. A fast render
-    # imports this module and needs neither, so their call sites import them
-    # (macsetup-3jqw).
+    # imports this module and needs neither, so their call sites import them.
     from zoneinfo import ZoneInfo
 
     from ccreport.project_identity import Resolver
@@ -332,8 +332,8 @@ def find_pricing(model: str, ts: datetime | None = None) -> Mapping[str, float] 
 
     Bisects the effective dates for how many periods were in effect at *ts*,
     then resolves the model against that prefix — a lookup cached on the pair,
-    since a corpus of records prices against a handful of models and eleven
-    periods however many records it holds (macsetup-16c7).
+    since a corpus of records prices against a handful of models and as many
+    periods as `PRICING_HISTORY` has, however many records it holds.
     """
     resolved = MODEL_ALIASES.get(model, model)
 
@@ -446,7 +446,6 @@ def rolling_cost_keys() -> list[str]:
 
 
 def _rolling_thresholds(now_local: datetime) -> dict[str, float]:
-    """Compute epoch timestamps for each rolling window boundary."""
     return {w.name: (now_local - w.delta).timestamp() for w in ROLLING_WINDOWS}
 
 
@@ -523,11 +522,11 @@ def dedup_identity(
     """The key two records must share to be one and the same logged message.
 
     Normally the log's own message id plus request id (*dk*). A log missing
-    either one leaves dk NULL — 96 of 88,801 cached rows on a real machine —
-    and read-time dedup used to wave those through, so a row stored twice
-    counted twice everywhere it was read (macsetup-2wgm). The fallback stands
-    in for dk: same session, same timestamp to the microsecond, same message
-    id, same model, same four token counts.
+    either one leaves dk NULL — a small minority of cached rows — and
+    read-time dedup used to wave those through, so a row stored twice counted
+    twice everywhere it was read. The fallback stands in for dk: same session,
+    same timestamp to the microsecond, same message id, same model, same four
+    token counts.
 
     Deliberately narrow. Progressive chunks of one streaming message share a
     message id but differ in their token counts, so the fallback keeps them
@@ -637,15 +636,15 @@ def project_scope(cwd: str, projects_dirs: list[Path]) -> ProjectScope:
     name becomes the merge target and the prefixes grow to cover every other
     project directory that resolves to that same target: a merge has to mean
     "these are one project" for the statusline's cost windows as much as for
-    the reports (macsetup-2qrp).
+    the reports.
 
     The override table is read once per call; the per-file identities only on a
     miss in the per-cwd scope cache, since scanning them is a quarter of a
-    render (macsetup-6cov). A cached scope is only used while it still covers
-    the cwd's own directories — a projects dir that appeared after the row was
-    written is otherwise invisible until something invalidates the table. A
-    cache that cannot be read degrades to the unmerged scope, which is what
-    every render did before merges existed.
+    render. A cached scope is only used while it still covers the cwd's own
+    directories — a projects dir that appeared after the row was written is
+    otherwise invisible until something invalidates the table. A cache that
+    cannot be read degrades to the unmerged scope, which is what every render
+    did before merges existed.
     """
     from ccreport.project_identity import build_override_fn, name_for_cwd
 
@@ -804,7 +803,7 @@ def _iter_jsonl_costs(
 
 
 # ---------------------------------------------------------------------------
-# Session cost — incremental over appended bytes (macsetup-31g6)
+# Session cost — incremental over appended bytes
 # ---------------------------------------------------------------------------
 
 # How much of the already-counted bytes is re-read to prove a file was appended
@@ -1019,7 +1018,7 @@ def _purged_session_cost(session_id: str, cwd: str) -> float:
     """Cost of a session whose JSONL files are gone, from cached records.
 
     Scoped by project path: the loader's predicate is the session id alone, and
-    two projects' sessions can share one (macsetup-2wsk).
+    two projects' sessions can share one.
     """
     try:
         from ccreport.cache_db import load_ccreport_records_for_session
@@ -1049,7 +1048,7 @@ def compute_session_cost(session_id: str, cwd: str) -> float:
     stored total has counted, so an appended log costs a parse of the appended
     bytes. Fingerprinting the whole file made every render of a live session
     reparse it from line 1, and a session's own growth then made that
-    quadratic in its length (macsetup-31g6).
+    quadratic in its length.
 
     Falls back to a full reparse whenever the stored total can no longer be
     trusted as a subtotal, and to cached ccreport_records when the JSONL files
@@ -1162,10 +1161,10 @@ def _orphan_alltime_fingerprint(orphan_paths: set[str]) -> str:
     Any mismatch rebuilds them, so a part missing here is silently wrong
     numbers — the same contract as ccreport's rollup fingerprint, and the same
     two halves: what the DB holds (cache_db.orphan_alltime_stamp) and what
-    prices it. pricing.py is hashed because the rows store a cost, and all but
-    two of ~105k cached records on a real machine carry no stored cost at all
-    — they are priced from their tokens on every read, so a price edit moves
-    the total with no record change to notice.
+    prices it. pricing.py is hashed because the rows store a cost, and almost
+    no cached record carries a stored cost at all — they are priced from their
+    tokens on every read, so a price edit moves the total with no record change
+    to notice.
 
     The orphan set itself is the third part: a file being purged moves its
     records from the live half of the corpus to this one, and moves them to
@@ -1283,30 +1282,14 @@ def _apply_orphan_alltime(
 
 
 def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
-    """Compute rolling cost totals for one project.
-
-    Scans only that project's JSONL files — its counterpart compute_costs walks
-    the whole corpus because it also owes a global total; this one never leaves
-    the project's own directories, which is why the two keep separate live-path
-    sets rather than one.
-
-    "The project" is the merge target when a `ccreport merge` grouped others
-    into it, so the scan covers their directories too (macsetup-2qrp).
+    """Rolling cost totals for one project, `ccreport merge` targets included.
 
     A file whose (mtime_ns, size) still matches what ccreport cached is summed
-    from those cached records instead of re-read: this runs on every render,
-    and re-parsing the project's whole corpus each time was 90 MB and ~93% of
-    the render (macsetup-rn21). What is cached is per-record and
-    time-independent — a file's share of each window moves with `now`, so the
-    windows themselves can never be cached, only the (ts, cost, identity) they
-    are computed from.
+    from those cached records instead of re-read; docs/calculation-reference.md
+    section 5.6 has why, and why the windows themselves are never cached.
 
-    Records are read-only by design: files written since the last `ccreport`
-    run miss and raw-parse — bar the one case where somebody else's cache
-    already holds the answer, below. Making a render write records back would
-    put a second writer on the WAL for a latency win it does not need. The one
-    row a render does write is the resolved scope, once per rule or record
-    change.
+    Read-only bar one row: a render never writes records back, only the
+    resolved scope.
     """
     if not cwd:
         return {}
@@ -1332,9 +1315,9 @@ def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
     # One scoped load, read twice: as the per-file record cache the walk below
     # hits, and as the orphan source after it. Scoped to the project's path
     # prefixes in SQL — this runs on every render, and the prefixes discard all
-    # but one project's share anyway (macsetup-45iv). Empty on any failure,
-    # including a cache the salt says this build cannot read, which degrades to
-    # the full raw parse this used to do unconditionally.
+    # but one project's share anyway. Empty on any failure, including a cache
+    # the salt says this build cannot read, which degrades to the full raw
+    # parse this used to do unconditionally.
     project_ccr: dict[str, list[dict]] = {}
     cached_meta: dict[str, tuple[int, int]] = {}
     # compute_costs' own per-file totals, for the files this one would
@@ -1367,9 +1350,9 @@ def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
             # every file in the project, however far back it goes. A file last
             # written before the widest window opened can only reach all_time,
             # which compute_costs has already summed per file and keyed by the
-            # same (mtime_ns, size) (macsetup-3rm3). A record cannot postdate
-            # the write that appended it, which is the same reading of mtime
-            # compute_costs' own in_rolling_window test makes.
+            # same (mtime_ns, size). A record cannot postdate the write that
+            # appended it, which is the same reading of mtime compute_costs'
+            # own in_rolling_window test makes.
             stored = file_alltime.get(key)
             if (st.st_mtime < oldest_threshold and stored is not None
                     and stored[:2] == (st.st_mtime_ns, st.st_size)):
@@ -1395,7 +1378,7 @@ def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
             if ts_epoch:
                 _bucket_rolling_cost(cost, ts_epoch, thresholds, totals)
 
-    # Include orphaned cached records for this project (macsetup-59zg).
+    # Include orphaned cached records for this project.
     try:
         _accumulate_orphaned_costs(
             project_ccr, project_live_paths, seen_keys, thresholds,
@@ -1482,7 +1465,7 @@ def _rec_cost_from_tokens(rec: dict) -> float:
     What a reader wants when the JSONL is still on disk: the raw parse prices
     every record this way, so a cached record whose stored cost came from the
     log's costUSD would otherwise total differently depending on which path
-    read it (macsetup-rn21).
+    read it.
     """
     t = rec.get("t")
     if not t or len(t) < 4:
@@ -1691,9 +1674,21 @@ def compute_costs(
       seven_day_cost        – rolling 7-day cost
       thirty_day_cost       – rolling 30-day cost
       all_time_cost         – all records, no time filter
+      <name>_project_cost   – each of the six rolling buckets again, scoped to
+                              the cwd's project and whatever a `ccreport merge`
+                              grouped into it: six_hour_project_cost through
+                              all_time_project_cost
 
     session_cost, week_cost, and month_cost use per-file caching (mtime/size).
     session_window_cost and rolling costs are computed fresh.
+
+    session_window_cost is absent from the dict, not zeroed, when no session
+    reset is known: callers merge this over existing data, and a 0.0 there is
+    indistinguishable from "not computed" — it would overwrite a real total
+    with an empty window.
+
+    Writes as well as returns: the result goes through
+    write_cost_summary(result, cwd), which is the row the status line reads.
 
     Every window above is bounded, so the cached records this reads are too:
     one window's worth, not the whole table. all_time is the exception it is
@@ -1730,7 +1725,7 @@ def compute_costs(
 
     # Which files and which orphaned records belong to the current cwd's
     # project — merge rules included, so the report and the statusline group
-    # the same way (macsetup-2qrp).
+    # the same way.
     scope = ProjectScope("", [])
     if cwd:
         scope = project_scope(cwd, projects_dirs)
@@ -1757,11 +1752,10 @@ def compute_costs(
     # The start of the widest window any bucket below is filled from. Every
     # cached record older than this reaches exactly one total, all_time, and
     # that one is answered per file (file_costs.all_time_cost) or per orphan
-    # bucket (ccreport_orphan_costs) — so reading those rows back would be
-    # ~86k of the ~105k on a real machine deserialized to be skipped
-    # (macsetup-3rm3). Not simply thirty_day: the month window is the wider of
-    # the two for the last day of a 31-day month, since it starts at midnight
-    # and the rolling one trails `now` by the time of day.
+    # bucket (ccreport_orphan_costs) — so reading those rows back deserializes
+    # most of the table to skip it. Not simply thirty_day: the month window is
+    # the wider of the two for the last day of a 31-day month, since it starts
+    # at midnight and the rolling one trails `now` by the time of day.
     record_cutoff = min(td_ts, mw_ts, ww_ts, sw_ts if sw_ts is not None else td_ts)
 
     # Both halves of the ccreport cache, each read at its own grain: the
@@ -1804,7 +1798,6 @@ def compute_costs(
                 ),
             )
 
-            # --- Try cache-based handling (branches 1-3) ---
             hit = _try_cached_file(
                 ctx, cached_entry, ccr_records_by_file, seen_keys,
                 thresholds, sw_ts, td_ts,
@@ -1819,7 +1812,6 @@ def compute_costs(
                 new_entries[key] = hit.entry
                 continue
 
-            # --- Cache miss: scan JSONL file ---
             scan = _scan_jsonl_file(
                 jsonl_path, ctx.is_session_file, session_window_start,
                 week_window_start, month_window_start, thresholds, seen_keys,
@@ -1827,7 +1819,6 @@ def compute_costs(
 
             if ctx.file_unchanged:
                 assert cached_entry is not None  # noqa: S101 - file_unchanged implies cache hit
-                # Reuse cached summary for week/month/all_time/session
                 week_total += cached_entry.get("week_cost", 0.0)
                 month_total += cached_entry.get("month_cost", 0.0)
                 _add_model_costs(
@@ -1919,13 +1910,12 @@ def compute_costs(
     if session_window_start is not None:
         # Omitted, not zeroed, without a reset time: callers merge this dict over
         # existing data, and a 0.0 here is indistinguishable from "not computed"
-        # — it would overwrite a real total with an empty window (macsetup-4uja).
+        # — it would overwrite a real total with an empty window.
         result["session_window_cost"] = round(sw_total, 4)
     for name in ROLLING_COST_NAMES:
         result[f"{name}_cost"] = round(rolling_totals.get(name, 0.0), 4)
         result[f"{name}_project_cost"] = round(rolling_proj.get(name, 0.0), 4)
 
-    # Cache for fast reads by statusline
     try:
         from ccreport.cache_db import write_cost_summary
         write_cost_summary(result, cwd=cwd)

@@ -8,13 +8,10 @@ BIN="${BASH_SOURCE[0]%/*}"
 REPO="$BIN/.."
 SRC="$REPO/src"
 
-# CPython writes and reads __pycache__ only for modules it imports, never for
-# the file named on its command line: run as a script, all 109 KB is tokenized
-# and compiled again on every invocation. Importing it caches the bytecode and
-# leaves only this one-line -c string to compile. argv[1] carries the directory
-# to import from and is popped straight back off, so the module sees the argv a
-# script invocation gave it. argv[0] is then the name argparse prints in its
-# usage line — "ccreport" rather than the "-c" a bare -c invocation reports.
+# Imported rather than run as a script, so CPython caches the bytecode; argv[1]
+# carries the directory to import from and is popped straight back off, and
+# argv[0] is the name argparse prints in its usage line. Long form in
+# statusline-command_x.sh.
 #
 # src/ goes on the front of sys.path even though `uv sync` installs the package
 # editable: that way a checkout answers with its own source whatever else is

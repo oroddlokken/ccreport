@@ -1,7 +1,10 @@
 """USD/NOK exchange rate lookups using Norges Bank daily spot rates.
 
-Fetches from the Norges Bank SDMX-JSON API, caches in SQLite, and provides
-rate lookups with automatic fallback for weekends and holidays.
+Fetches the B.USD.NOK.SP series from the Norges Bank SDMX-JSON API and stores
+every observation in SQLite. get_rate then answers one date out of that store,
+walking back up to _MAX_WALKBACK_DAYS days when the date itself has no
+observation — a weekend or a Norwegian holiday — and marking the rate estimated
+only when the walk ran past the newest date the store holds.
 """
 
 from __future__ import annotations
@@ -18,14 +21,23 @@ from zoneinfo import ZoneInfo
 from ccreport import cache_db
 
 OSLO_TZ = ZoneInfo("Europe/Oslo")
+# How far get_rate may walk back from a record's date for a rate, and with it
+# the read horizon of _load_cached_rates and start_prefetch, the reach
+# _resolvable checks, and how far before the earliest wanted date _fetch_span
+# starts its span. Sized for the longest run of dates the series can leave
+# unobserved, which is a Norwegian holiday cluster — Easter's Thursday-to-Monday
+# and the Christmas/New Year stretch, each butting onto a weekend — not the
+# three days of a long weekend. Lower it past one of those and get_rate returns
+# (None, False) for the dates behind the gap: those records leave the NOK column
+# empty and nothing reports an error.
 _MAX_WALKBACK_DAYS = 10
 
-# A cached rate is permanent: _find_missing_range only asks the API for dates
-# with no row, and get_rate's walkback stops at the first date present, sound
-# or not. So one bad value (a 0.0, a misparsed field) silently skews every NOK
-# figure for that date forever. USD/NOK has stayed within roughly 5-12 for as
-# long as the series exists; this band rejects garbage while leaving room for a
-# currency move far outside anything on record.
+# A cached rate is permanent: _fetch_span only asks the API for dates with no
+# row, and get_rate's walkback stops at the first date present, sound or not.
+# So one bad value (a 0.0, a misparsed field) silently skews every NOK figure
+# for that date forever. USD/NOK has stayed within roughly 5-12 for as long as
+# the series exists; this band rejects garbage while leaving room for a currency
+# move far outside anything on record.
 _MIN_PLAUSIBLE_RATE = 5.0
 _MAX_PLAUSIBLE_RATE = 20.0
 
@@ -307,16 +319,16 @@ def get_rate(rates: dict[str, float], d: date, _max_date: str | None = None) -> 
     definitive rate for those dates.
 
     Returns (None, False) if no rate found within the walkback window.
+
+    *_max_date* is the newest key in *rates*, which is what the trailing edge is
+    measured against. Pass it precomputed: without it every call scans the whole
+    dict for max(rates), and this runs once per record.
     """
     for i in range(_MAX_WALKBACK_DAYS + 1):
         key = (d - timedelta(days=i)).isoformat()
         if key in rates:
             if i == 0:
                 return rates[key], False
-            # Walked back: only mark estimated if at the trailing edge
-            # (no later rate exists), meaning the true rate is unknown.
-            # Gaps between two known rates (weekends) use the prior
-            # business day rate definitively.
             latest = _max_date if _max_date is not None else max(rates)
             return rates[key], d.isoformat() >= latest
     return None, False
