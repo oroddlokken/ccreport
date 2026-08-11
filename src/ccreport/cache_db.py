@@ -71,7 +71,6 @@ CREATE TABLE IF NOT EXISTS usage (
     extra_percent         INTEGER,
     extra_spent           REAL,
     extra_limit           REAL,
-    extra_reset           TEXT,
     last_updated          TEXT,
     session_cost          REAL,
     session_window_cost   REAL,
@@ -1091,7 +1090,7 @@ _USAGE_FIELDS = [
     "session_percent", "session_reset", "week_percent", "week_reset",
     "sonnet_percent", "sonnet_reset",
     "scoped_percent", "scoped_model", "scoped_reset", "extra_percent", "extra_spent",
-    "extra_limit", "extra_reset", "last_updated",
+    "extra_limit", "last_updated",
     "session_cost", "session_window_cost", "week_cost", "month_cost",
     # The rolling window columns come from pricing.ROLLING_WINDOWS, so adding a
     # window there reaches the cache without a second edit. Order is internal —

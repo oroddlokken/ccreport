@@ -200,15 +200,22 @@ class TestRender:
 
     def test_extra_usage_shows_what_was_spent_against_the_limit(self):
         out = self._plain(
-            self._row(extra_percent=40, extra_spent=20, extra_limit=50, extra_reset=iso(days=5)),
+            self._row(extra_percent=40, extra_spent=20, extra_limit=50),
         )
         assert "Extra usage" in out
         assert "$20.00 / $50.00 spent" in out
 
     def test_extra_usage_without_amounts_still_shows_the_bar(self):
-        out = self._plain(self._row(extra_percent=40, extra_reset=iso(days=5)))
+        out = self._plain(self._row(extra_percent=40))
         assert "Extra usage" in out
         assert "spent" not in out
+
+    def test_extra_usage_carries_no_reset_line(self):
+        """The API gives the Extra quota no reset, so the section draws none —
+        the week's reset above it is the only one on screen.
+        """
+        out = self._plain(self._row(extra_percent=40, extra_spent=20, extra_limit=50))
+        assert out.count("Resets in") == 2  # session and week
 
     def test_a_null_quota_is_absent_rather_than_zero(self):
         """write_usage_cache stores a lapsed quota as an explicit null."""

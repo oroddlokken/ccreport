@@ -327,9 +327,10 @@ def render(data: dict[str, Any], now: float, zone: str) -> list[str]:
         spent, limit = _num(data, "extra_spent"), _num(data, "extra_limit")
         detail = f"${spent:.2f} / ${limit:.2f} spent" if spent is not None and limit is not None else ""
         lines.append("")
-        lines += section(
-            "Extra usage", extra_pct, _str(data, "extra_reset"), now, zone, detail,
-        )
+        # No reset: the API's extra_usage object carries no resets_at, and its
+        # daily and weekly members are null even on an account with Extra
+        # enabled, so there is nothing to count down to.
+        lines += section("Extra usage", extra_pct, "", now, zone, detail)
 
     lines.append("")
     return lines

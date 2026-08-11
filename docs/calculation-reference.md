@@ -204,14 +204,14 @@ and without the nulls the last reading would outlive the quota it described.
     "scoped_reset": "ISO-8601",
     "extra_percent": int,
     "extra_spent": float,
-    "extra_limit": float,
-    "extra_reset": "ISO-8601"
+    "extra_limit": float
 }
 ```
 
-All fields are optional — present only when the response carried them.
-`extra_reset` is the exception: it is a `usage` column `ccu` renders, and
-nothing in `fetch_usage_api` ever sets it.
+All fields are optional — present only when the response carried them. The Extra
+quota has no reset among them: `extra_usage` carries no `resets_at`, and its
+`daily` and `weekly` members are null even on an account with Extra enabled, so
+`ccu` draws that section without a reset line.
 
 ---
 
