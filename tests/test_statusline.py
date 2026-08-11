@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import re
+import shutil
 import subprocess
 import time
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -700,6 +703,35 @@ class TestDspVerdictIsMemoized:
         sid = "torn-session"
         sl._memo_path(sid).write_text("{not json", encoding="utf-8")
         assert sl._load_memo(sid) == {}
+
+    @pytest.mark.parametrize(
+        "sid",
+        [
+            "9039cf27-6302-4b0c-8be4-33083d6ee07e",
+            "../../etc/passwd",  # the substitution is what keeps rm -f in TMPDIR
+            "a" * 80,  # past the 64-char cap
+            "weird id!#$",
+        ],
+    )
+    def test_the_session_start_hook_deletes_the_file_this_module_writes(self, sid):
+        """The hook rebuilds the memo path in bash rather than importing it.
+        Drift deletes a name nobody wrote, silently, and the resumed session
+        keeps its stale verdict.
+        """
+        if not shutil.which("jq"):
+            pytest.skip("hook parses its stdin with jq")
+        hook = Path(__file__).resolve().parent.parent / "bin" / "clear-statusline-memo.sh"
+        path = sl._memo_path(sid)
+        path.write_text('{"dsp": false}', encoding="utf-8")
+        run = subprocess.run(
+            ["bash", str(hook)],
+            input=json.dumps({"session_id": sid, "hook_event_name": "SessionStart"}),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert not path.exists()
+        assert run.stdout == ""  # SessionStart stdout is appended to the session's context
 
     def test_turning_the_toggle_off_beats_a_memoized_true(self, monkeypatch, tmp_path):
         """_start_dsp_check stops seeing the toggle once a verdict is memoized,

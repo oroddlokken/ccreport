@@ -48,6 +48,35 @@ The status line imports nothing outside the stdlib, so any `python3` runs it;
 it works before `uv sync` has. Quota percentages are refreshed by a detached
 process, so a fresh reading lands on a later render.
 
+### The SessionStart hook
+
+A render memoizes what it reads from the running claude process in a file under
+`TMPDIR`, keyed by session id. `--resume` hands the same id to a new process, so
+`bin/clear-statusline-memo.sh` deletes that file. Install it as a `SessionStart`
+hook, the one moment those readings change:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /path/to/ccreport/bin/clear-statusline-memo.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`SessionStart` takes no matcher — it fires on startup, resume, clear, compact
+and fork alike. The hook needs `jq`, prints nothing (a `SessionStart` hook's
+stdout is appended to the session's context) and exits 0 on anything it cannot
+parse.
+
 ## ccreport
 
 ![ccreport's daily, monthly and project tables in a terminal](assets/ccreport.png)

@@ -427,9 +427,14 @@ def _start_dsp_check(memoized: bool | None = None) -> subprocess.Popen[bytes] | 
     immediate parent isn't necessarily the claude binary. ps -Aww gives us
     untruncated args for every process; we walk pid→ppid until we hit init.
 
-    The answer is fixed for the session's lifetime — the ancestor claude's argv
-    was decided at launch — so _fetch_all memoizes it and passes *memoized* on
-    every later render, which is what keeps this off the slow path entirely.
+    The answer is fixed for the claude process's lifetime — its argv was decided
+    at launch — so _fetch_all memoizes it and passes *memoized* on every later
+    render, which is what keeps this off the slow path entirely.
+
+    Not for the session id's lifetime, though: `--resume` reuses it under a new
+    process. `bin/clear-statusline-memo.sh`, wired as a SessionStart hook, drops
+    the memo; without that hook a session resumed with the flag keeps the verdict
+    from the launch that lacked it.
     """
     import subprocess
 
@@ -2048,7 +2053,7 @@ def _memo_path(session_id: str) -> Path:
     """What a slow render learned that no later render need learn again.
 
     Separate from the fetch cache because nothing in it expires on FAST_TTL_S:
-    the DSP verdict is fixed once the session's claude was launched, and the
+    the DSP verdict is fixed once that claude process was launched, and the
     ~/.claude.json stamp is invalidated by the file itself, not by a clock.
     """
     return _session_state_path(session_id, ".memo")
