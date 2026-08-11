@@ -46,7 +46,8 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
   CLAUDE_STATUSLINE_BATTERY                 — battery % / state / time remaining (pmset) (default 0)
   CLAUDE_STATUSLINE_SESSIONS                — active sessions in last 15 min (default 0)
   CLAUDE_STATUSLINE_USAGE                   — Claude usage (session/week % with countdowns)
-    CLAUDE_STATUSLINE_WEEKLY_PACE           — weekly pace indicator (3d14h/7d(3d10h) +21%)
+    CLAUDE_STATUSLINE_WEEKLY_PACE           — weekly pace indicator (3d14h/7d(3d10h) +21%;
+                                              "7d@5d" when CLAUDE_CODE_PACE_DAYS is not 7)
     CLAUDE_STATUSLINE_SONNET                — Sonnet usage %
     CLAUDE_STATUSLINE_SONNET_THRESHOLD      — hide Sonnet below this % (default 25)
     CLAUDE_STATUSLINE_SCOPED                — per-model weekly limit (label from the model)
@@ -1218,7 +1219,12 @@ def _weekly_pace(
     """Weekly pace indicator: compare actual usage % to expected % based on elapsed time.
 
     Expected = how far through the PACE_DAYS window we are (time-based, not day-based).
-    Display: "{el_d}d{el_h}h/{N}d {sign}{delta}%"
+    Display: "{el_d}d{el_h}h/7d {sign}{delta}%"
+
+    The elapsed figure is measured against the seven days the window actually
+    runs, while the delta is paced against CLAUDE_CODE_PACE_DAYS. When the two
+    differ the window reads "7d@5d", so the segment names both rather than
+    labelling a paced delta with the calendar window.
 
     countdown=False drops the "(4d2h)" parenthetical, for a second segment sharing
     a reset with one already on screen.
@@ -1250,12 +1256,14 @@ def _weekly_pace(
         elapsed_str = f"{el_d}d{el_h}h"
     else:
         elapsed_str = f"{el_d}d"
+    week_d = WEEK_WINDOW_S // 86400
+    window_str = f"{week_d}d" if pace == week_d else f"{week_d}d@{pace}d"
     remain_s = int(reset_epoch - now)
     if remain_s > 0 and countdown:
         cd = _usage_countdown(reset_iso, now)
-        time_part = f"{elapsed_str}/7d({cd})"
+        time_part = f"{elapsed_str}/{window_str}({cd})"
     else:
-        time_part = f"{elapsed_str}/7d"
+        time_part = f"{elapsed_str}/{window_str}"
     d_round = round(delta)
     sign = "+" if d_round >= 0 else ""
     return f"\033[0;90m{time_part} {sign}{d_round}%\033[0m"

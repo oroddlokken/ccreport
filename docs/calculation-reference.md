@@ -897,7 +897,9 @@ The window is always the seven days it actually runs; only `expected` divides by
 `pricing.pace_days()`, which reads `CLAUDE_CODE_PACE_DAYS` (README) and falls
 back to 7 for anything outside 1-7. A pace of 5 means the quota is meant to be
 gone by Friday, so the bar usage is measured against rises faster than the
-clock. The status line's pace segment reads the same function.
+clock. The status line's pace segment reads the same function and names the pace
+the same way, writing its window as "7d@5d" once the two diverge; at the default
+7 it stays a bare "7d".
 
 **Last fetched:**
 ```

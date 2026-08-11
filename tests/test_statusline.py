@@ -340,6 +340,48 @@ class TestScopedCountdown:
         assert render(600000) == "Fa:9% 6d22h"
 
 
+class TestPaceWindowLabel:
+    """The elapsed half counts the seven days the window runs, the delta paces
+    against CLAUDE_CODE_PACE_DAYS. Once they differ the label has to say so, or
+    the two halves of one segment describe different windows silently.
+    """
+
+    # Whole seconds: _parse_iso_epoch truncates, and a fractional now would put
+    # elapsed a hair under three days and render "2d23h" on some runs.
+    NOW = 1785000000.0
+
+    @pytest.fixture
+    def render(self):
+        import datetime as dt
+        import re
+
+        def _render(pct="62"):
+            reset = dt.datetime.fromtimestamp(self.NOW + 4 * 86400, dt.UTC).isoformat()
+            return re.sub(r"\x1b\[[0-9;]*m", "", sl._weekly_pace(pct, reset, self.NOW))
+
+        return _render
+
+    def test_default_pace_leaves_the_window_bare(self, render):
+        assert render() == "3d/7d(4d0h) +19%"
+
+    def test_a_shorter_pace_is_named_beside_the_window(self, render, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CODE_PACE_DAYS", "5")
+        assert render() == "3d/7d@5d(4d0h) +2%"
+
+    def test_the_named_pace_matches_what_ccu_prints(self, render, monkeypatch):
+        """ccu.pace_line names the same knob; the two must not disagree."""
+        from ccreport import ccu
+
+        monkeypatch.setenv("CLAUDE_CODE_PACE_DAYS", "5")
+        import datetime as dt
+        import re
+
+        reset = dt.datetime.fromtimestamp(self.NOW + 4 * 86400, dt.UTC).isoformat()
+        line = re.sub(r"\x1b\[[0-9;]*m", "", ccu.pace_line(62, reset, self.NOW))
+        assert "(pace: 5d)" in line
+        assert "@5d" in render()
+
+
 class TestScopedWeekCost:
     """The scoped quota spends the week window, so it carries a week cost too.
 
