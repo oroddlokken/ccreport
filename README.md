@@ -10,21 +10,39 @@ already writes under `~/.claude/projects/` (or `~/.config/claude/projects/`).
 
 ![status line under a Claude Code session, showing model, context, quota and cost windows](assets/statusline.png)
 
-Model, context fill, session and weekly quota, cost windows, git state. Point
-Claude Code's `settings.json` at the wrapper:
+Model, context fill, session and weekly quota, cost windows, git state.
+
+Segments are toggled with `CLAUDE_STATUSLINE_*` environment variables, `1` on
+and `0` off. The full list, with defaults, is the module docstring of
+`src/ccreport/statusline.py`.
+
+`bin/statusline-command_x.sh` reads each toggle as `${VAR:-default}`, so a
+wrapper of your own that exports them and hands over wins. Keep it outside the
+checkout and your settings survive every `git pull`:
+
+```bash
+#!/usr/bin/env bash
+# ~/.claude/statusline-wrapper.sh — chmod +x
+
+export CLAUDE_STATUSLINE_HOSTNAME=1
+export CLAUDE_STATUSLINE_DOGCAT=1
+export CLAUDE_STATUSLINE_SCOPED_MODE=always
+
+# "$@" carries the arguments Claude Code passes; the JSON arrives on stdin,
+# which exec leaves alone.
+exec bash /path/to/ccreport/bin/statusline-command_x.sh "$@"
+```
+
+Point Claude Code's `settings.json` at that wrapper:
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "bash /path/to/ccreport/bin/statusline-command_x.sh"
+    "command": "bash /path/to/statusline-wrapper.sh"
   }
 }
 ```
-
-Segments are toggled with `CLAUDE_STATUSLINE_*` environment variables; set them
-in that wrapper. The full list, with defaults, is the module docstring of
-`src/ccreport/statusline.py`.
 
 The status line imports nothing outside the stdlib, so any `python3` runs it;
 it works before `uv sync` has. Quota percentages are refreshed by a detached

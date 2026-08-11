@@ -43,6 +43,9 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
                                                minus the ~33k auto-compact reserve)
   CLAUDE_STATUSLINE_CTX_GREEN                — ctx% green below the 50% yellow threshold
                                                instead of dim grey (default 0)
+  CLAUDE_STATUSLINE_USER                    — email address of the signed-in account (default 0)
+  CLAUDE_STATUSLINE_ORG                     — its organization name; parenthesized after the
+                                              email when USER is on too (default 0)
   CLAUDE_STATUSLINE_BATTERY                 — battery % / state / time remaining (pmset) (default 0)
   CLAUDE_STATUSLINE_SESSIONS                — active sessions in last 15 min (default 0)
   CLAUDE_STATUSLINE_USAGE                   — Claude usage (session/week % with countdowns)
@@ -869,6 +872,34 @@ def _capture_account(memo: dict | None = None) -> None:
             memo["account"] = stamp  # type: ignore[index]
     except Exception:  # noqa: BLE001
         pass
+
+
+def _render_account() -> str:
+    """Who this session bills to: email, organization, or both.
+
+    Source is the change log _capture_account writes, not ~/.claude.json: the
+    log is what ccreport attributes records to, so the segment and the reports
+    name one account by one name, and a render whose memo skipped the parse
+    still has the newest event to read.
+
+    Both toggles off returns before the SELECT — a segment nobody displays is
+    not worth a database read on every slow render. Empty too until the first
+    capture, and when the captured event carried neither field.
+    """
+    want_user, want_org = _on("USER", default=False), _on("ORG", default=False)
+    if not (want_user or want_org):
+        return ""
+    try:
+        from ccreport import cache_db
+
+        row = cache_db.read_latest_account() or {}
+    except Exception:  # noqa: BLE001
+        return ""
+    user = (row.get("email") or "") if want_user else ""
+    org = (row.get("organization_name") or "") if want_org else ""
+    if user and org:
+        return f"{SUBDUED}{user} ({org}){RST}"
+    return f"{SUBDUED}{user or org}{RST}" if user or org else ""
 
 
 # --- Rate limit history capture ---
@@ -1878,6 +1909,7 @@ def _layout_and_print(
     usage_rl: str,
     usage_cost: str,
     usage_data: dict,
+    account: str,
     battery_str: str,
     sessions: str,
     now_epoch: float,
@@ -1958,7 +1990,7 @@ def _layout_and_print(
         if rest:
             lines.append(DOT.join(rest))
 
-    last_parts = [s for s in (battery_str, elapsed) if s]
+    last_parts = [s for s in (account, battery_str, elapsed) if s]
     if last_parts:
         lines.append(DOT.join(last_parts))
     if force_red:
@@ -1987,10 +2019,11 @@ class _Fetched(NamedTuple):
     total_in: int          # the change key fetched.cums was accumulated at
     sandbox: str           # rendered badge — three settings files to resolve it
     sessions: str          # rendered badge — a tail of ~/.claude/history.jsonl
+    account: str           # rendered segment — the newest account_events row
 
 # Cache-file layout guard: bump when _Fetched gains, loses or retypes a field,
 # so a render never rebuilds a NamedTuple from a stale shape.
-_FAST_CACHE_SCHEMA = 3
+_FAST_CACHE_SCHEMA = 4
 
 
 def _session_state_path(session_id: str, suffix: str = "") -> Path:
@@ -2085,6 +2118,7 @@ def _load_fetched(session_id: str, cwd: str, now: float) -> tuple[_Fetched, floa
             total_in=f["total_in"],
             sandbox=f["sandbox"],
             sessions=f["sessions"],
+            account=f["account"],
         ), ts
     except Exception:  # noqa: BLE001
         return None
@@ -2117,6 +2151,7 @@ def _save_fetched(session_id: str, cwd: str, ts: float, fetched: _Fetched) -> No
                 "total_in": fetched.total_in,
                 "sandbox": fetched.sandbox,
                 "sessions": fetched.sessions,
+                "account": fetched.account,
             },
         }
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -2190,6 +2225,9 @@ def _fetch_all(
         # Nothing on the line depends on these two; they sit here to overlap the
         # subprocesses started above rather than trail them.
         _capture_account(memo)
+        # After the capture, so a /login this render noticed is the account the
+        # segment names rather than the one before it.
+        account_str = _render_account()
         # S and W samples come from the raw stdin dict, sonnet/scoped from
         # usage_data — the native S/W merge happens later, in main, and would
         # not change what gets sampled here.
@@ -2255,6 +2293,7 @@ def _fetch_all(
         total_in=inp.total_in,
         sandbox=_render_sandbox(inp.cwd, git.toplevel),
         sessions=sessions_str,
+        account=account_str,
     )
 
 
@@ -2372,7 +2411,7 @@ def main() -> None:
 
     _layout_and_print(
         top, session, usage_session_rl, usage_rl, usage_cost,
-        usage_data, battery_str, fetched.sessions, now_epoch, _t_start,
+        usage_data, fetched.account, battery_str, fetched.sessions, now_epoch, _t_start,
         force_red=_on("RED", default=False)
         or (_on("HAIKU_RED") and "haiku" in inp.model.lower()),
     )

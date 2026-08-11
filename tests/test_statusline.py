@@ -1170,6 +1170,103 @@ class TestCaptureAccount:
         assert self._log() == []
 
 
+class TestRenderAccount:
+    """Two independent toggles over one row of the account change log."""
+
+    ACC = {
+        "accountUuid": "uuid-work",
+        "emailAddress": "me@work.example",
+        "organizationName": "Work AS",
+    }
+
+    def _capture(self, **overrides):
+        from ccreport.cache_db import record_account_event
+
+        record_account_event({**self.ACC, **overrides})
+
+    def _rendered(self, monkeypatch, *, user, org):
+        monkeypatch.setenv("CLAUDE_STATUSLINE_USER", "1" if user else "0")
+        monkeypatch.setenv("CLAUDE_STATUSLINE_ORG", "1" if org else "0")
+        return re.sub(r"\033\[[0-9;]*m", "", sl._render_account())
+
+    def test_both_toggles_off_render_nothing(self, monkeypatch):
+        self._capture()
+        assert self._rendered(monkeypatch, user=False, org=False) == ""
+
+    def test_both_toggles_off_read_no_database(self, monkeypatch):
+        """A segment nobody displays must not cost a SELECT on every render."""
+        from ccreport import cache_db
+
+        def boom():
+            msg = "no read without a toggle"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(cache_db, "read_latest_account", boom)
+        assert self._rendered(monkeypatch, user=False, org=False) == ""
+
+    def test_the_user_toggle_alone_renders_the_email(self, monkeypatch):
+        self._capture()
+        assert self._rendered(monkeypatch, user=True, org=False) == "me@work.example"
+
+    def test_the_org_toggle_alone_renders_the_organization_bare(self, monkeypatch):
+        self._capture()
+        assert self._rendered(monkeypatch, user=False, org=True) == "Work AS"
+
+    def test_both_toggles_parenthesize_the_organization(self, monkeypatch):
+        self._capture()
+        assert self._rendered(monkeypatch, user=True, org=True) == "me@work.example (Work AS)"
+
+    def test_nothing_is_rendered_before_the_first_capture(self, monkeypatch):
+        assert self._rendered(monkeypatch, user=True, org=True) == ""
+
+    def test_a_missing_field_renders_without_empty_parentheses(self, monkeypatch):
+        """An event captured before the org was known must not render "x ()"."""
+        self._capture(organizationName=None)
+        assert self._rendered(monkeypatch, user=True, org=True) == "me@work.example"
+
+    def test_the_newest_capture_is_the_one_named(self, monkeypatch):
+        self._capture()
+        self._capture(accountUuid="uuid-home", emailAddress="me@home.example")
+        assert self._rendered(monkeypatch, user=True, org=False) == "me@home.example"
+
+    def test_an_unreadable_log_costs_the_segment_not_the_render(self, monkeypatch):
+        from ccreport import cache_db
+
+        def boom():
+            raise OSError
+
+        monkeypatch.setattr(cache_db, "read_latest_account", boom)
+        assert self._rendered(monkeypatch, user=True, org=True) == ""
+
+
+class TestAccountLandsOnTheLastLine:
+    """Where the segment prints, in both layouts and beside the battery."""
+
+    def _lines(self, monkeypatch, capsys, cols, account, battery=""):
+        monkeypatch.setenv("COLUMNS", str(cols))
+        sl._layout_and_print(
+            ["12:00", "ccreport"], "Opus ctx:42%", "S:23%", "W:41%", "24H:$1.20",
+            {"_native_rl": True}, account, battery, "", 1_000_000.0, time.monotonic(),
+        )
+        return capsys.readouterr().out.rstrip("\n").split("\n")
+
+    def test_it_is_the_fourth_line_when_narrow(self, monkeypatch, capsys):
+        lines = self._lines(monkeypatch, capsys, 100, "me@work.example (Work AS)")
+        assert len(lines) == 4
+        assert "me@work.example (Work AS)" in lines[3]
+
+    def test_it_is_the_last_line_when_wide(self, monkeypatch, capsys):
+        lines = self._lines(monkeypatch, capsys, 200, "me@work.example (Work AS)")
+        assert "me@work.example (Work AS)" in lines[-1]
+
+    def test_it_precedes_the_battery_on_that_line(self, monkeypatch, capsys):
+        last = self._lines(monkeypatch, capsys, 100, "me@work.example", "BAT:80%")[-1]
+        assert last.index("me@work.example") < last.index("BAT:80%")
+
+    def test_no_segment_adds_no_line(self, monkeypatch, capsys):
+        assert len(self._lines(monkeypatch, capsys, 100, "")) == 3
+
+
 class TestRateLimitSamples:
     """What the render offers the snapshot gate, and what it refuses to invent."""
 
@@ -1421,6 +1518,7 @@ class TestFastCache:
             "total_in": 42_000,
             "sandbox": "sbx",
             "sessions": "+2sess",
+            "account": "me@work.example (Work AS)",
         }
         return sl._Fetched(**{**base, **overrides})
 
@@ -1433,10 +1531,14 @@ class TestFastCache:
         assert ts == self.NOW
 
     def test_the_slow_only_badges_survive_the_roundtrip(self):
-        """Both are rendered strings now, resolved on the slow path."""
+        """All three are rendered strings, resolved on the slow path."""
         sl._save_fetched(self.SID, self.CWD, self.NOW, self._fetched())
         got, _ = present(sl._load_fetched(self.SID, self.CWD, self.NOW + 1))
-        assert (got.sandbox, got.sessions) == ("sbx", "+2sess")
+        assert (got.sandbox, got.sessions, got.account) == (
+            "sbx",
+            "+2sess",
+            "me@work.example (Work AS)",
+        )
 
     def test_expired_file_misses(self):
         sl._save_fetched(self.SID, self.CWD, self.NOW, self._fetched())
@@ -1519,6 +1621,7 @@ class TestCatchUpCacheStats:
             total_in=total_in,
             sandbox="",
             sessions="",
+            account="",
         )
 
     def test_unchanged_total_in_touches_nothing(self, monkeypatch):

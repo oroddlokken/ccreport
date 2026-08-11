@@ -34,7 +34,7 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   it, so the row would keep the previous window's total across a rollover
 - Renders within 15 s (`FAST_TTL_S`) reuse the previous render's fetch results —
   git, battery, dsp, dcat, usage row, cost summary, session cost, and the
-  rendered sandbox and sessions badges — from a per-session temp file
+  rendered sandbox, sessions and account segments — from a per-session temp file
   (`_Fetched`, guarded by `_FAST_CACHE_SCHEMA`). Native S/W, clock, ctx% and
   countdowns stay live from stdin. The only bookkeeping the fast path keeps is
   cache-stats accumulation, keyed on `total_in` changing; account capture and

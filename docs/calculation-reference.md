@@ -837,6 +837,19 @@ The entire historic cost line is gated by `CLAUDE_STATUSLINE_HISTORIC_COST` (def
 `ceil(project_cost) < ceil(total_cost)`, the format becomes `LABEL:$project/$total`
 (e.g. `7D:$64/$375`). When they are equal or project cost is 0, only `$total` is shown.
 
+**Signed-in account** (`_render_account()`, last line, both toggles off by default):
+
+| Env Var | Field | Renders |
+|---------|-------|---------|
+| `CLAUDE_STATUSLINE_USER` | `email` | `me@work.example` |
+| `CLAUDE_STATUSLINE_ORG` | `organization_name` | `Work AS` |
+
+Both on renders `me@work.example (Work AS)`. The source is the newest
+`account_events` capture (§9.1), read after this render's own capture, so a
+`/login` shows up on the render that noticed it. Both toggles off skip the
+SELECT. Nothing renders before the first capture, and a field the event did not
+carry is left out rather than shown as empty parentheses.
+
 **Active sessions count:**
 ```
 cutoff_ms = now_epoch * 1000 - 900000    (15 minutes ago)
@@ -997,6 +1010,9 @@ timeline of account changes.
   limits report shows: the user tier when set, else the org one, because a
   per-user bucket overrides the pool the account would otherwise share
 - **Deliberately not stored**: `billingType`, the role fields, `displayName`
+- **Read back by the status line**: `cache_db.read_latest_account()`, for the
+  email and organization segment of §8.1. The log rather than the config, so the
+  segment names the account by the same fields every report attributes records to
 - **Written when**: `cache_db.record_account_event()` compares against the
   newest row and inserts only on a difference. This is an append-only change
   log, not a per-render log — the unchanged case costs one SELECT and no write.
