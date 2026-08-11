@@ -2,7 +2,9 @@
 # /// script
 # requires-python = ">=3.12"
 # ///
-"""Reproducible energy-impact benchmark for src/ccreport/statusline.py.
+"""Reproducible energy-impact benchmark for a status line render.
+
+The target is bin/statusline-command_x.sh, the wrapper Claude Code invokes.
 
 Three phases:
   1. Per-invocation cost — wall time, CPU seconds, peak RSS (process tree
@@ -36,7 +38,11 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-STATUSLINE = HERE / "statusline_command.py"
+# The wrapper, not the module: it is what Claude Code's settings.json invokes,
+# and its choice of interpreter and its `python -c` import boot (which is what
+# gets the module's bytecode cached) are part of the per-render cost measured
+# here. `python -m ccreport.statusline` would skip both.
+STATUSLINE = HERE.parent / "bin" / "statusline-command_x.sh"
 
 # Rough per-active-core power bracket for Apple Silicon (E-core .. P-core)
 # used to convert CPU-seconds to joules when the direct measurement is
