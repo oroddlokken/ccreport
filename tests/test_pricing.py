@@ -2058,7 +2058,10 @@ class TestIncrementalSessionCost:
         monkeypatch.setattr(pricing, "_get_projects_dirs", lambda: [d.parent])
         return d
 
-    def _line(self, mid: str, rid: str, tokens: int = 1000, sid: str = "s1") -> str:
+    def _line(
+        self, mid: str, rid: str, tokens: int = 1000, sid: str = "s1",
+        model: str = "claude-opus-5",
+    ) -> str:
         import json
 
         return (
@@ -2071,7 +2074,7 @@ class TestIncrementalSessionCost:
                     "cwd": self.CWD,
                     "message": {
                         "id": mid,
-                        "model": "claude-opus-5",
+                        "model": model,
                         "usage": {"input_tokens": tokens},
                     },
                 }
@@ -2185,7 +2188,7 @@ class TestIncrementalSessionCost:
     def test_a_legacy_fingerprint_reparses_once_then_migrates(self, proj, monkeypatch):
         import json
 
-        from ccreport import cache_db
+        from ccreport import cache_db, pricing
 
         f = proj / "s1.jsonl"
         f.write_text(self._line("m1", "r1") + self._line("m2", "r2"))
@@ -2194,7 +2197,7 @@ class TestIncrementalSessionCost:
 
         assert self._cost() == pytest.approx(2 * self.ONE)
         stored = present(cache_db.read_session_cost("s1"))
-        assert json.loads(stored[0])["v"] == 2
+        assert json.loads(stored[0])["v"] == pricing._SESSION_STATE_VERSION
 
         parsed = self._parsed(monkeypatch)
         with f.open("a") as fh:
@@ -2219,6 +2222,59 @@ class TestIncrementalSessionCost:
         keys = json.loads(present(cache_db.read_session_cost("s1"))[0])["k"]
         assert len(keys) == 2
         assert all(len(k) == 16 for k in keys), "keys are stored digested, not raw"
+
+    def _families(self, sid: str = "s1") -> frozenset[str]:
+        from ccreport.pricing import compute_session_usage
+
+        return compute_session_usage(sid, self.CWD).families
+
+    def test_every_model_the_session_logged_lands_in_the_family_set(self, proj):
+        """A subagent's model is in the session's own log, so the scan sees it."""
+        (proj / "s1.jsonl").write_text(
+            self._line("m1", "r1") + self._line("m2", "r2", model="claude-fable-5")
+        )
+        assert self._families() == {"opus", "fable"}
+
+    def test_a_subdirectory_file_contributes_its_family(self, proj):
+        (proj / "s1.jsonl").write_text(self._line("m1", "r1"))
+        sub = proj / "s1"
+        sub.mkdir()
+        (sub / "agent.jsonl").write_text(self._line("m2", "r2", model="claude-fable-5"))
+        assert self._families() == {"opus", "fable"}
+
+    def test_a_resumed_scan_keeps_the_families_from_before_the_cursor(self, proj, monkeypatch):
+        f = proj / "s1.jsonl"
+        f.write_text(self._line("m1", "r1", model="claude-fable-5"))
+        assert self._families() == {"fable"}
+
+        parsed = self._parsed(monkeypatch)
+        with f.open("a") as fh:
+            fh.write(self._line("m2", "r2"))
+        assert self._families() == {"fable", "opus"}
+        assert len(parsed) == 1, "the append was not resumed"
+
+    def test_an_unchanged_session_returns_the_stored_families(self, proj):
+        (proj / "s1.jsonl").write_text(self._line("m1", "r1", model="claude-fable-5"))
+        self._families()
+        assert self._families() == {"fable"}, "the no-op resume path dropped them"
+
+    def test_a_purged_session_takes_its_families_from_the_cached_records(self, proj, monkeypatch):
+        """The JSONL is gone, so the record cache answers for both cost and family."""
+        from ccreport import pricing
+        from ccreport.pricing import compute_session_usage
+
+        recs = {
+            str(proj / "s1.jsonl"): [
+                {"model": "claude-fable-5", "cost": 0.25, "ts": self.TS.timestamp()},
+            ]
+        }
+        monkeypatch.setattr(
+            "ccreport.cache_db.load_ccreport_records_for_session", lambda sid: recs
+        )
+        monkeypatch.setattr(pricing, "_find_session_files", lambda *a, **k: set())
+        usage = compute_session_usage("s1", self.CWD)
+        assert usage.cost == pytest.approx(0.25)
+        assert usage.families == {"fable"}
 
 
 # ---------------------------------------------------------------------------

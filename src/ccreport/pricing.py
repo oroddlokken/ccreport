@@ -802,7 +802,7 @@ def _iter_jsonl_costs(
 # counted, which is the part a rewrite changes first.
 _TAIL_BYTES = 256
 
-_SESSION_STATE_VERSION = 2
+_SESSION_STATE_VERSION = 3
 
 
 def _digest(data: bytes) -> str:
@@ -858,6 +858,7 @@ class _SessionCostState(NamedTuple):
     files: dict[str, _FileCursor]
     cost: float
     keys: _DigestKeys
+    families: set[str]
 
 
 def _encode_session_state(state: _SessionCostState) -> str:
@@ -869,13 +870,14 @@ def _encode_session_state(state: _SessionCostState) -> str:
 
     The keys go out in set order. Sorting them would make the blob reproducible
     and nothing reads it that way, at a per-render cost that grows with the
-    session.
+    session. The families are sorted because there are at most a handful.
     """
     return json.dumps(
         {
             "v": _SESSION_STATE_VERSION,
             "f": {p: list(c) for p, c in state.files.items()},
             "k": list(state.keys),
+            "m": sorted(state.families),
         },
         separators=(",", ":"),
     )
@@ -900,9 +902,10 @@ def _decode_session_state(blob: str, cost: float) -> _SessionCostState | None:
             for path, c in data["f"].items()
         }
         keys = _DigestKeys.load([str(k) for k in data["k"]])
+        families = {str(m) for m in data["m"]}
     except (AttributeError, IndexError, KeyError, TypeError, ValueError):
         return None
-    return _SessionCostState(files, cost, keys)
+    return _SessionCostState(files, cost, keys, families)
 
 
 def _tail_digest(f: BinaryIO, offset: int) -> str:
@@ -918,8 +921,14 @@ def _scan_session_file(
     path: str,
     seen_keys: set[str],
     cursor: _FileCursor | None,
+    families: set[str],
 ) -> tuple[float, int, str] | None:
     """Cost of the records after *cursor*, with the offset and tail it reached.
+
+    Adds every scanned record's model family to *families* — mutated in place,
+    and only reliable when the caller keeps it for as long as it keeps the
+    cursor: a resume scans appended bytes alone, so the families of the records
+    before the cursor are the stored set's to remember.
 
     None when the file cannot be read, or cannot be resumed: the bytes before
     the cursor's offset are re-digested first, so a log rewritten in place fails
@@ -945,6 +954,7 @@ def _scan_session_file(
                 got = _line_cost(raw, seen_keys)
                 if got is not None:
                     total += got[0]
+                    families.add(model_family(got[3]))
             return total, offset, _tail_digest(f, offset)
     except OSError:
         return None
@@ -967,6 +977,7 @@ def _resume_session_cost(
 
     files = dict(state.files)
     total = state.cost
+    families = set(state.families)
     changed = False
     for path, (mtime_ns, size) in stats.items():
         cursor = files.get(path)
@@ -975,7 +986,7 @@ def _resume_session_cost(
                 continue
             if size < cursor.offset:
                 return None
-        scanned = _scan_session_file(path, state.keys, cursor)
+        scanned = _scan_session_file(path, state.keys, cursor, families)
         if scanned is None:
             if cursor is not None:
                 return None
@@ -987,26 +998,38 @@ def _resume_session_cost(
         files[path] = _FileCursor(mtime_ns, size, offset, tail)
         changed = True
 
-    return _SessionCostState(files, total, state.keys) if changed else state
+    return _SessionCostState(files, total, state.keys, families) if changed else state
 
 
 def _reparse_session_cost(stats: dict[str, tuple[int, int]]) -> _SessionCostState:
     """Count every session file from its first byte, discarding any subtotal."""
     files: dict[str, _FileCursor] = {}
     keys = _DigestKeys()
+    families: set[str] = set()
     total = 0.0
     for path, (mtime_ns, size) in stats.items():
-        scanned = _scan_session_file(path, keys, None)
+        scanned = _scan_session_file(path, keys, None, families)
         if scanned is None:
             continue
         cost, offset, tail = scanned
         total += cost
         files[path] = _FileCursor(mtime_ns, size, offset, tail)
-    return _SessionCostState(files, total, keys)
+    return _SessionCostState(files, total, keys, families)
 
 
-def _purged_session_cost(session_id: str, cwd: str) -> float:
-    """Cost of a session whose JSONL files are gone, from cached records.
+class SessionUsage(NamedTuple):
+    """A session's cost and the model families its records were billed to.
+
+    The families cover the whole session log, subagent records included, so a
+    main model of one family and a Task subagent of another both land here.
+    """
+
+    cost: float
+    families: frozenset[str]
+
+
+def _purged_session_usage(session_id: str, cwd: str) -> SessionUsage:
+    """Cost and model families of a session whose JSONL files are gone, from cached records.
 
     Scoped by project path: the loader's predicate is the session id alone, and
     two projects' sessions can share one.
@@ -1017,6 +1040,7 @@ def _purged_session_cost(session_id: str, cwd: str) -> float:
         ccr_records_by_file = load_ccreport_records_for_session(session_id)
         project_prefixes = project_path_prefixes(cwd, _get_projects_dirs())
         total = 0.0
+        families: set[str] = set()
         seen: set[str] = set()
         for fp, recs in ccr_records_by_file.items():
             if not path_in_project(fp, project_prefixes):
@@ -1024,16 +1048,22 @@ def _purged_session_cost(session_id: str, cwd: str) -> float:
             for rec in recs:
                 if record_is_duplicate(rec, seen):
                     continue
+                families.add(model_family(rec.get("model", "")))
                 cost = _rec_cost(rec)
                 if cost:
                     total += cost
-        return total
+        return SessionUsage(total, frozenset(families))
     except Exception:  # noqa: BLE001
-        return 0.0
+        return SessionUsage(0.0, frozenset())
 
 
 def compute_session_cost(session_id: str, cwd: str) -> float:
-    """Compute total cost for a single session from its JSONL files.
+    """Total cost for a single session — compute_session_usage's cost alone."""
+    return compute_session_usage(session_id, cwd).cost
+
+
+def compute_session_usage(session_id: str, cwd: str) -> SessionUsage:
+    """Compute total cost and model families for a single session from its JSONL files.
 
     Incremental: the cache stores how far into each of the session's files the
     stored total has counted, so an appended log costs a parse of the appended
@@ -1046,11 +1076,11 @@ def compute_session_cost(session_id: str, cwd: str) -> float:
     have been purged.
     """
     if not session_id or not cwd:
-        return 0.0
+        return SessionUsage(0.0, frozenset())
 
     files = _find_session_files(session_id, cwd)
     if not files:
-        return _purged_session_cost(session_id, cwd)
+        return _purged_session_usage(session_id, cwd)
 
     # Sorted, so the dedup order a full reparse applies is the order the
     # incremental passes built up in.
@@ -1063,7 +1093,7 @@ def compute_session_cost(session_id: str, cwd: str) -> float:
         stats[path] = (st.st_mtime_ns, st.st_size)
 
     if not stats:
-        return 0.0
+        return SessionUsage(0.0, frozenset())
 
     from ccreport.cache_db import read_session_cost, write_session_cost
 
@@ -1073,10 +1103,10 @@ def compute_session_cost(session_id: str, cwd: str) -> float:
     if updated is None:
         updated = _reparse_session_cost(stats)
     elif state is not None and updated is state:
-        return state.cost
+        return SessionUsage(state.cost, frozenset(state.families))
 
     write_session_cost(session_id, _encode_session_state(updated), updated.cost)
-    return updated.cost
+    return SessionUsage(updated.cost, frozenset(updated.families))
 
 
 def _accumulate_orphaned_costs(

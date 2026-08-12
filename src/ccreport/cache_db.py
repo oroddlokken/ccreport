@@ -1407,6 +1407,18 @@ def _lock_is_live(locked_at_str: str | None, now: float, stale_timeout: float) -
         return False
 
 
+def is_costs_refresh_blocked() -> bool:
+    """Whether a live costs lock bars a costs-only refresh now.
+
+    That lock alone, unlike is_fetch_blocked: try_acquire_costs_lock skips the
+    API error backoff on purpose — a failing API says nothing about whether
+    local JSONL can be rescanned — so a gate that consulted the backoff would
+    leave the cost summary unwritten for as long as the API stayed down.
+    """
+    meta = _get_meta_many(get_connection(), ("costs_lock_time",))
+    return _lock_is_live(meta.get("costs_lock_time"), time.time(), _LOCK_STALE_TIMEOUT)
+
+
 def is_fetch_blocked() -> bool:
     """Whether a live refresh lock or the error backoff bars a refresh now.
 

@@ -446,9 +446,15 @@ else:
   `pricing._encode_session_state`: a version (`_SESSION_STATE_VERSION`), a
   `_FileCursor(mtime_ns, size, offset, tail)` per session file, and the session's
   dedup keys as 8-byte digests (`_DigestKeys` — the set is only ever compared for
-  equality, so it is stored at its smallest). The cost stays in its own column;
+  equality, so it is stored at its smallest), and the `model_family()` of every
+  record counted so far. The cost stays in its own column;
   one home keeps the two from disagreeing. Declared `INTEGER` in `_SCHEMA_SQL`
   but holds TEXT — SQLite's dynamic typing lets it through unconverted
+- **The families ride with the cursors**: a resume scans appended bytes alone, so
+  the set has to remember what the bytes before the cursor held.
+  `compute_session_usage()` returns it beside the cost (`SessionUsage`);
+  `compute_session_cost()` is that cost alone. The purged-JSONL fallback derives
+  the same set from the cached records' `model`. §8.1's scoped section reads it
 - **Growth is resumed, not re-parsed**: `_resume_session_cost` skips a file whose
   `(mtime_ns, size)` still match and otherwise re-digests the `_TAIL_BYTES` (256)
   before `offset` — proof the log was appended to rather than rewritten — then
@@ -522,6 +528,12 @@ unit is a commit.
   from a detached spawn on a slow render (`statusline._render_update`), when
   `update_checked_at` is older than `UPDATE_CHECK_INTERVAL_S` (43200 s, twice a
   day). The API call never happens on the render path
+- **Asked on demand**: `ccreport update` (`ccreport.cmd_update`) calls the same
+  three readers inline — no spawn, no interval, since the user asked now — and
+  stores the answer through the same keys, so a CLI check also paces the next
+  detached one. `--pull` runs `git pull --ff-only` in the checkout, and only
+  when the count is above zero; a refused fast-forward exits with git's code
+  rather than merging or rebasing
 - **Source**: `GET api.github.com/repos/{owner}/{repo}/compare/{HEAD}...master`,
   unauthenticated. `owner/repo` comes from origin's URL, so a fork checks
   itself. `status` separates a checkout that is behind from one carrying local
@@ -788,7 +800,17 @@ Sonnet section hidden when `so_pct < CLAUDE_STATUSLINE_SONNET_THRESHOLD` (defaul
 Scoped section (per-model weekly limit, from `limits[]` where `kind` is
 `weekly_scoped`) hidden when `sc_pct < CLAUDE_STATUSLINE_SCOPED_THRESHOLD`
 (default 25), when `scoped_model` is absent, or when the scope names Sonnet and
-the Sonnet section already rendered:
+the Sonnet section already rendered.
+
+`CLAUDE_STATUSLINE_SCOPED_MODE` gates it further: `always` shows it whatever the
+session runs, `off` never, and `current` (the default) only when the session has
+spent on the capped model — `_scoped_model_in_use`, which matches the selected
+model's name against `scoped_model` and `model_family(scoped_model)` against the
+families the session's own log carries (§5.5). The second half is what catches a
+Task subagent: it runs the model its definition names, spends against that
+model's quota, and never reaches stdin. A quota whose model this build does not
+recognize is decided by the selected model alone — its family would be
+`OTHER_FAMILY`, which an ordinary log's `<synthetic>` records already match.
 ```
 Label: first two chars of scoped_model, title-cased ("Fable" → "Fa")
 Display: "{label}:{pct}% ${cost_fmt} {countdown}"
@@ -847,6 +869,16 @@ unnoticed. Otherwise the spawn becomes `--costs-only`, which recomputes costs
 and leaves every API column, `last_updated` included, untouched. Because the
 skip is deliberate, TTL counts to the heartbeat instead of turning red.
 
+A render whose usage row is still fresh spawns `--costs-only` too, when its own
+cost summary has aged past `COST_SUMMARY_MAX_AGE` (900 s) and `HISTORIC_COST` is
+on. The row is a global singleton and the summary is keyed by project, so
+without this a session in one project keeps the row fresh and every other
+project's summary goes unwritten for as long as that session runs — taking
+`week_model_costs` with it, which has no column of its own (§8.1). The gate is
+`cache_db.is_costs_refresh_blocked()`, the costs lock alone: `is_fetch_blocked()`
+also reports the API error backoff, which `try_acquire_costs_lock` ignores on
+purpose, and consulting it here would starve the summary for the whole backoff.
+
 **Historic cost line** (separate from rate-limit line):
 
 Each bucket is controlled by an env var and hidden when value rounds to $0:
@@ -868,7 +900,10 @@ The entire historic cost line is gated by `CLAUDE_STATUSLINE_HISTORIC_COST` (def
 
 **Update available** (`_render_update()`, `CLAUDE_STATUSLINE_UPDATE`, default
 on): a line of its own directly under the cost windows, in both layouts —
-`↑ 12 commits behind · git pull`. The count and the gates it passes are §5.7.
+`↑ A newer version of ccreport is available, run 'ccreport update --pull' to
+update`. The count gates the line without appearing in it, and it names that
+command rather than `git pull` because the line renders in whatever project the
+session is in. The count and the gates it passes are §5.7.
 
 **Signed-in account** (`_render_account()`, last line, both toggles off by default):
 

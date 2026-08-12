@@ -579,6 +579,42 @@ class TestFetchBlockedGate:
         assert selects() == 1
 
 
+class TestIsCostsRefreshBlocked:
+    """The costs-only spawn's own gate: the costs lock and nothing else.
+
+    A render with a fresh usage row asks this when its project's cost summary
+    has expired, and the answer has to agree with try_acquire_costs_lock — which
+    skips the API backoff, since a failing API says nothing about whether local
+    JSONL can be rescanned.
+    """
+
+    def test_a_held_costs_lock_blocks(self, db):
+        assert try_acquire_costs_lock() is True
+        assert cache_db.is_costs_refresh_blocked() is True
+        release_costs_lock()
+        assert cache_db.is_costs_refresh_blocked() is False
+
+    def test_a_held_fetch_lock_does_not(self, db):
+        """The two locks are separate; a fetch never writes the cost summary."""
+        assert try_acquire_fetch_lock() is True
+        assert cache_db.is_costs_refresh_blocked() is False
+        release_fetch_lock()
+
+    def test_the_api_backoff_does_not(self, db):
+        record_fetch_failure()
+        assert cache_db.is_costs_refresh_blocked() is False
+        assert try_acquire_costs_lock() is True, "the gate and the acquire agree"
+
+    def test_a_lock_the_acquire_would_take_over_does_not_block(self, db):
+        _hold_lock(db, "costs", age=cache_db._LOCK_STALE_TIMEOUT + 1)
+        assert cache_db.is_costs_refresh_blocked() is False
+
+    def test_a_corrupt_lock_time_does_not_block(self, db):
+        cache_db._set_meta(db, "costs_lock_time", "not-a-number")
+        db.commit()
+        assert cache_db.is_costs_refresh_blocked() is False
+
+
 class TestBackoff:
     def test_no_failures_means_no_backoff(self, db):
         assert check_fetch_backoff() is False

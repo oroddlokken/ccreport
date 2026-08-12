@@ -435,6 +435,61 @@ class TestScopedWeekCost:
         assert render({"opus": 40.0}, scoped_model="Opus") == "Op:31% $40 2d21h/7d -11%"
 
 
+class TestScopedModeCurrent:
+    """SCOPED_MODE=current asks whether the session spends on the capped model.
+
+    The selected model answers only half of it: a Task subagent runs the model
+    its definition names, and stdin never says so.
+    """
+
+    @pytest.fixture
+    def shown(self, monkeypatch):
+        import datetime as dt
+        import time
+
+        monkeypatch.setenv("CLAUDE_STATUSLINE_SCOPED_THRESHOLD", "0")
+        now = time.time()
+
+        def _shown(current_model, families, scoped_model="Fable"):
+            reset = dt.datetime.fromtimestamp(now + 353000, dt.UTC).isoformat()
+            usage = {
+                "week_percent": "84",
+                "week_reset": reset,
+                "scoped_percent": "31",
+                "scoped_model": scoped_model,
+                "scoped_reset": reset,
+                "_current_model": current_model,
+                "_session_families": families,
+                "_native_rl": True,
+            }
+            return sl._render_rate_limits(usage, now)[2]
+
+        return _shown
+
+    def test_the_selected_model_still_shows_it(self, shown):
+        assert shown("Fable 5", [])
+
+    def test_a_subagents_family_shows_it_under_another_model(self, shown):
+        assert shown("Opus 5 (1M context)", ["fable", "opus"])
+
+    def test_a_family_the_session_never_ran_stays_hidden(self, shown):
+        assert not shown("Opus 5 (1M context)", ["opus"])
+
+    def test_a_session_with_no_families_read_yet_stays_hidden(self, shown):
+        assert not shown("Opus 5 (1M context)", [])
+
+    def test_an_unknown_capped_model_ignores_the_families(self, shown):
+        """Its family is OTHER_FAMILY, which every log's synthetic records match."""
+        assert not shown("Opus 5", ["other", "opus"], scoped_model="Glasswing")
+        assert shown("Glasswing 1", ["opus"], scoped_model="Glasswing")
+
+    def test_always_and_off_ignore_both(self, shown, monkeypatch):
+        monkeypatch.setenv("CLAUDE_STATUSLINE_SCOPED_MODE", "always")
+        assert shown("Opus 5", [])
+        monkeypatch.setenv("CLAUDE_STATUSLINE_SCOPED_MODE", "off")
+        assert not shown("Fable 5", ["fable"])
+
+
 class TestMergeCostData:
     """The cold-start recompute must get the window bounds from stdin.
 
@@ -746,7 +801,7 @@ class TestDspVerdictIsMemoized:
         monkeypatch.setattr(sl, "_fetch_dcat", lambda cwd: {})
         monkeypatch.setattr(sl, "_capture_account", lambda memo=None: None)
         monkeypatch.setattr(sl, "_accumulate_cache_stats", lambda *a: (0, 0, 0))
-        monkeypatch.setattr(sl, "compute_session_cost", lambda *a: 0.0)
+        monkeypatch.setattr(sl, "compute_session_usage", lambda *a: (0.0, frozenset()))
         inp = sl._InputData(
             cwd=str(tmp_path),
             model="Opus",
@@ -975,6 +1030,61 @@ class TestFetchUsageReadsTheRowOnce:
         )
         cache_db.record_fetch_failure()
         assert sl._fetch_usage("sid", "/tmp/proj", {}, None)["_stale"] is True
+
+
+class TestAFreshRowStillRefreshesAnExpiredSummary:
+    """The usage row is global; the cost summary it feeds is per project.
+
+    A session in one project keeping the row fresh used to stop every other
+    project's summary from ever being rewritten, and week_model_costs has no
+    column of its own to fall back on.
+    """
+
+    @pytest.fixture
+    def spawns(self, monkeypatch):
+        from ccreport import cache_db
+
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            sl, "_spawn_usage_refresh",
+            lambda *a, costs_only, **k: calls.append({"costs_only": costs_only}),
+        )
+        cache_db.write_usage_cache(
+            {"session_percent": 5, "last_updated": _iso_offset(0)},
+        )
+
+        def _run(cost_summary):
+            sl._fetch_usage("sid", "/tmp/proj", {}, cost_summary)
+            return calls
+
+        return _run
+
+    def test_an_expired_summary_spawns_a_costs_only_refresh(self, spawns):
+        assert spawns(None) == [{"costs_only": True}]
+
+    def test_a_fresh_summary_spawns_nothing(self, spawns):
+        assert spawns({"week_cost": 12.0}) == []
+
+    def test_historic_cost_off_spawns_nothing(self, spawns, monkeypatch):
+        """Nothing reads the summary with the toggle off, so nothing pays for it."""
+        monkeypatch.setenv("CLAUDE_STATUSLINE_HISTORIC_COST", "0")
+        assert spawns(None) == []
+
+    def test_a_live_costs_lock_suppresses_the_spawn(self, spawns):
+        from ccreport import cache_db
+
+        assert cache_db.try_acquire_costs_lock()
+        try:
+            assert spawns(None) == []
+        finally:
+            cache_db.release_costs_lock()
+
+    def test_the_api_backoff_does_not_suppress_it(self, spawns):
+        """A failing API says nothing about whether local JSONL can be rescanned."""
+        from ccreport import cache_db
+
+        cache_db.record_fetch_failure()
+        assert spawns(None) == [{"costs_only": True}]
 
 
 class TestRenderSurvivesContention:
@@ -1329,14 +1439,24 @@ class TestUpdateSegment:
 
         cache_db.write_update_check(self.SHA if sha is None else sha, behind, self.NOW - age)
 
-    def test_it_names_the_count_and_what_to_do(self, checkout, spawns):
+    def test_it_names_ccreport_and_what_to_run(self, checkout, spawns):
         self._store(12)
-        assert "12 commits behind" in sl._render_update(self.NOW)
-        assert "git pull" in sl._render_update(self.NOW)
+        line = sl._render_update(self.NOW)
+        assert "A newer version of ccreport is available" in line
+        assert "ccreport update --pull" in line
 
-    def test_one_commit_is_singular(self, checkout, spawns):
+    def test_it_does_not_send_the_user_to_git_pull(self, checkout, spawns):
+        """The line renders in whatever project the session is in, not this checkout."""
+        self._store(12)
+        line = sl._render_update(self.NOW)
+        assert "git pull" not in line.replace("ccreport update --pull", "")
+
+    def test_the_count_gates_the_line_without_appearing_in_it(self, checkout, spawns):
+        """One commit behind and twelve read alike; only the gate uses the number."""
         self._store(1)
-        assert "1 commit behind" in sl._render_update(self.NOW)
+        one = sl._render_update(self.NOW)
+        self._store(12)
+        assert one == sl._render_update(self.NOW) != ""
 
     def test_up_to_date_shows_nothing(self, checkout, spawns):
         self._store(0)
@@ -1421,7 +1541,14 @@ class TestUpdateSegment:
 
 
 class TestUpdateLandsUnderTheCostLine:
-    """Where the segment prints, in both layouts."""
+    """Where the segment prints, in both layouts.
+
+    A stand-in string stands where the rendered segment would: what is under
+    test is the placement, and pinning the wording here would make every
+    rewording of the sentence look like a layout regression.
+    """
+
+    SEG = "UPDATE-SEGMENT"
 
     def _lines(self, monkeypatch, capsys, cols, update):
         monkeypatch.setenv("COLUMNS", str(cols))
@@ -1434,19 +1561,19 @@ class TestUpdateLandsUnderTheCostLine:
 
     @pytest.mark.parametrize("cols", [100, 200])
     def test_it_follows_the_cost_windows(self, monkeypatch, capsys, cols):
-        lines = self._lines(monkeypatch, capsys, cols, "12 commits behind")
+        lines = self._lines(monkeypatch, capsys, cols, self.SEG)
         cost = next(i for i, line in enumerate(lines) if "24H:$1.20" in line)
-        assert "12 commits behind" in lines[cost + 1]
+        assert self.SEG in lines[cost + 1]
 
     @pytest.mark.parametrize("cols", [100, 200])
     def test_it_precedes_the_account_line(self, monkeypatch, capsys, cols):
-        lines = self._lines(monkeypatch, capsys, cols, "12 commits behind")
+        lines = self._lines(monkeypatch, capsys, cols, self.SEG)
         assert "me@work.example" in lines[-1]
-        assert "12 commits behind" in lines[-2]
+        assert self.SEG in lines[-2]
 
     @pytest.mark.parametrize("cols", [100, 200])
     def test_no_segment_adds_no_line(self, monkeypatch, capsys, cols):
-        with_it = self._lines(monkeypatch, capsys, cols, "12 commits behind")
+        with_it = self._lines(monkeypatch, capsys, cols, self.SEG)
         without = self._lines(monkeypatch, capsys, cols, "")
         assert len(without) == len(with_it) - 1
 
@@ -1698,6 +1825,7 @@ class TestFastCache:
             "dcat": {"by_status": {"open": 2}},
             "usage": {"session_percent": 23, "week_cost": 12.5},
             "chat_cost": 1.25,
+            "chat_families": ["fable", "opus"],
             "cums": (10, 20, 30),
             "total_in": 42_000,
             "sandbox": "sbx",
@@ -1802,6 +1930,7 @@ class TestCatchUpCacheStats:
             dcat={},
             usage={},
             chat_cost=0.0,
+            chat_families=[],
             cums=(1, 2, 3),
             total_in=total_in,
             sandbox="",

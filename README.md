@@ -135,14 +135,23 @@ installed copy, so an edit takes effect on the next invocation.
 
 ## Updates
 
-There are no tagged versions. master is the release, so updating is `git pull`
-in the checkout.
+There are no tagged versions. master is the release, so updating is a
+fast-forward in the checkout:
+
+```
+ccreport update           # how far behind master is this checkout?
+ccreport update --pull    # fast-forward it
+```
+
+Both run from any directory — the checkout is found from where the package is
+installed, not from your cwd. The check is live, and `--pull` runs
+`git pull --ff-only`, so a checkout with commits of its own is left alone.
 
 The status line says when that is worth doing, on a line under the cost
 windows:
 
 ```
-↑ 12 commits behind · git pull
+↑ A newer version of ccreport is available, run 'ccreport update --pull' to update
 ```
 
 Twice a day a detached process asks GitHub's API how far origin's master has

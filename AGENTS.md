@@ -28,14 +28,21 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   `.seven_day`), never from a fetch. The usage API is called only for what it
   alone supplies — Sonnet %, the scoped per-model limit, Extra spend — per
   `_api_fetch_needed`; otherwise the spawn is `--costs-only`
+- The usage row is one global singleton; the cost summary is keyed by project. A
+  fresh row therefore does not mean a fresh summary, and `_fetch_usage` spawns
+  `--costs-only` on the fresh-row path too once this project's summary has aged
+  out — otherwise one project's session starves every other project's. That gate
+  is `cache_db.is_costs_refresh_blocked()`, never `is_fetch_blocked()`: the
+  costs lock skips the API error backoff on purpose
 - Both refresh spawns carry the window bounds as `--session-reset`/`--week-reset`,
   native stdin readings first and the cached row only as fallback; `usage_api.py`
   in turn treats them as the fallback for a response that omitted `resets_at`.
   Without a bound `compute_costs` omits `session_window_cost` instead of zeroing
   it, so the row would keep the previous window's total across a rollover
 - Renders within 15 s (`FAST_TTL_S`) reuse the previous render's fetch results —
-  git, battery, dsp, dcat, usage row, cost summary, session cost, and the
-  rendered sandbox, sessions, account and update segments — from a per-session file
+  git, battery, dsp, dcat, usage row, cost summary, session cost and the model
+  families that session logged, and the rendered sandbox, sessions, account and
+  update segments — from a per-session file
   (`_Fetched`, guarded by `_FAST_CACHE_SCHEMA`). Native S/W, clock, ctx% and
   countdowns stay live from stdin. The only bookkeeping the fast path keeps is
   cache-stats accumulation, keyed on `total_in` changing; account capture and
@@ -50,7 +57,9 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   cannot become a spawn per render. A stored count is rendered only while
   `update_local_sha` still equals HEAD, so a pull silences the line instead of
   repeating a number the user has acted on. There are no tags and no releases —
-  master is the release and the unit is a commit
+  master is the release and the unit is a commit. `ccreport update` asks the
+  same question inline, with no spawn and no interval, and writes its answer
+  through the same keys
 - All pricing data lives in `pricing.py` — update only this file when prices
   change. Source: the LiteLLM pricing database; update `LAST_CHECKED` after
   verifying
@@ -78,7 +87,11 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
 - The week bucket alone is also split by model family (`week_model_costs`), for
   the `weekly_scoped` quota's segment. `pricing.model_family()` keys both ends —
   the record's model ID when accumulating, the quota's display name when
-  rendering — so neither side may match a family inline. It is cached per file in
+  rendering — so neither side may match a family inline. It also decides whether
+  that segment shows at all: under `SCOPED_MODE=current`, `_scoped_model_in_use`
+  matches the quota's family against the families the session's own log carries
+  (`compute_session_usage`), because a Task subagent spends on the model its
+  definition names and stdin only ever reports the selected one. It is cached per file in
   `file_costs.week_model_json`, and an entry whose stored shape gains or loses a
   field needs `cache_db._COST_ENTRY_SCHEMA` bumped: mtime and size still match,
   so nothing else re-scans it and the missing field totals as zero

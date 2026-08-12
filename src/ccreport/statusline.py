@@ -57,7 +57,8 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
     CLAUDE_STATUSLINE_SCOPED_THRESHOLD      — hide scoped limit below this % (default 25)
     CLAUDE_STATUSLINE_SCOPED_MODE           — always / off / current: show the scoped
                                               segment regardless, never, or only when the
-                                              session runs the capped model (default current)
+                                              session has spent on the capped model —
+                                              selected or run by a subagent (default current)
     CLAUDE_STATUSLINE_EXTRA                 — Extra usage spent/limit + per-window deltas (S/W)
     CLAUDE_STATUSLINE_EXTRA_SESSION_THRESHOLD — show Extra when S% >= this (default 60)
     CLAUDE_STATUSLINE_TTL                   — time until next usage fetch (default 0;
@@ -109,12 +110,13 @@ if TYPE_CHECKING:
 # reads no database at all, and the import is a measurable slice of its runtime.
 # pricing stays eager — rendering the usage line needs it on every path.
 from ccreport.pricing import (
+    OTHER_FAMILY,
     ROLLING_WINDOWS,
     SESSION_WINDOW_S,
     WEEK_WINDOW_S,
     compute_costs,
     compute_project_rolling_costs,
-    compute_session_cost,
+    compute_session_usage,
     model_family,
     pace_days,
     rolling_cost_keys,
@@ -717,7 +719,10 @@ def _fetch_usage(
     being killed by the statusline framework (e.g. tmux interval).
 
     When the API cannot affect the render the spawn becomes --costs-only, which
-    skips the network entirely but keeps the cost windows current.
+    skips the network entirely but keeps the cost windows current. A fresh row
+    spawns it too when *cost_summary* has expired: the row is global and the
+    summary is per project, so one project's session keeping the row fresh would
+    otherwise leave every other project's summary unwritten indefinitely.
 
     The singleton usage row is read exactly once here, and every decision below
     is a predicate over that one dict: freshness, whether the API could still
@@ -739,12 +744,20 @@ def _fetch_usage(
         row = cache_db.read_usage_stale() or {}
         fresh = cache_db.usage_is_fresh(row, USAGE_FETCH_INTERVAL_S)
         blocked = not fresh and cache_db.is_fetch_blocked()
+        costs_due = cost_summary is None and _on("HISTORIC_COST")
+        costs_blocked = fresh and costs_due and cache_db.is_costs_refresh_blocked()
     except sqlite3.OperationalError:
         # Only the first-touch schema bootstrap takes a write lock on this
         # path — WAL readers do not block — but a render with no usage data
         # still beats a render that raised.
         return {}
     if fresh:
+        # The row is global and the summary is per project, so a session in one
+        # project keeping this row fresh used to stop every other project's
+        # summary from ever being rewritten — and week_model_costs, which has no
+        # column here, reaches the render through that summary alone.
+        if costs_due and not costs_blocked:
+            _spawn_usage_refresh(session_id, cwd, row, costs_only=True, native_rl=native_rl)
         return _adjust_passed_resets(row, now)
     if blocked:
         # A lock is held or the API is in error backoff: spawning anything
@@ -941,11 +954,11 @@ def _render_update(now: float) -> str:
     goes into the fetch cache beside the other rendered segments, so the
     fast path neither reads the database nor re-spawns.
 
-    Three things have to hold before a number goes on screen. The count is
-    above zero; the check is recent enough to still describe the world; and
-    the SHA it compared is still the one at HEAD — a pull between the check
-    and the render silences the line rather than letting it repeat a number
-    the user has already acted on.
+    Three things have to hold before the line appears. The count is above
+    zero; the check is recent enough to still describe the world; and the SHA
+    it compared is still the one at HEAD — a pull between the check and the
+    render silences the line rather than letting it repeat an answer the user
+    has already acted on.
     """
     if not _on("UPDATE"):
         return ""
@@ -966,8 +979,11 @@ def _render_update(now: float) -> str:
         return ""
     if compared_sha != update_check.local_head_sha(root):
         return ""
-    commits = "commit" if behind == 1 else "commits"
-    return f"\033[0;33m↑ {behind} {commits} behind{RST}{SUBDUED} · git pull{RST}"
+    # Not `git pull`: this line renders in whatever project the session is in,
+    # where that command pulls that project's repo and not this checkout.
+    # `ccreport update --pull` is the one that works from any directory.
+    return (f"\033[0;33m↑ A newer version of ccreport is available, run{RST}"
+            f"{SUBDUED} 'ccreport update --pull' {RST}\033[0;33mto update{RST}")
 
 
 # --- Rate limit history capture ---
@@ -1557,6 +1573,30 @@ def _scoped_week_cost(usage: dict, scoped_model: str) -> str:
     return _ustr(by_family, model_family(scoped_model))
 
 
+def _scoped_model_in_use(usage: dict, scoped_model: str) -> bool:
+    """Whether the capped model is the one the session is spending on.
+
+    The selected model is only half of it: a Task subagent runs whatever model
+    its definition names, so an Opus session dispatching Fable subagents burns
+    the Fable quota with nothing on stdin to say so. `_session_families` holds
+    the families the session's own log carries, subagent records included, and
+    answers the other half. Empty on a session whose log has not been read yet,
+    which leaves the selected model deciding alone.
+
+    A quota named after a model this build does not know falls back to the
+    selected model too: its family would be OTHER_FAMILY, which the synthetic
+    records in an ordinary log already match, and the segment would then show
+    for every session.
+    """
+    if scoped_model.lower() in _ustr(usage, "_current_model").lower():
+        return True
+    family = model_family(scoped_model)
+    if family == OTHER_FAMILY:
+        return False
+    families = usage.get("_session_families")
+    return isinstance(families, (list, tuple, set, frozenset)) and family in families
+
+
 def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool, bool]:
     """Build rate-limit inner sections (S/W/So + TTL).
 
@@ -1607,10 +1647,7 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool, bool]
     sc_model = _ustr(usage, "scoped_model")
     sc_shown = False
     sc_mode = _env("SCOPED_MODE", "current").lower()
-    sc_wanted = sc_mode == "always" or (
-        sc_mode == "current"
-        and sc_model.lower() in _ustr(usage, "_current_model").lower()
-    )
+    sc_wanted = sc_mode == "always" or (sc_mode == "current" and _scoped_model_in_use(usage, sc_model))
     if _on("SCOPED") and sc_wanted and sc_pct and sc_model:
         if not (so_shown and sc_model.lower().startswith("sonnet")):
             try:
@@ -2089,6 +2126,7 @@ class _Fetched(NamedTuple):
     dcat: dict
     usage: dict            # post cost-merge, pre native-S/W merge — native comes from stdin
     chat_cost: float
+    chat_families: list[str]  # model families this session logged, subagents included
     cums: tuple[int, int, int]
     total_in: int          # the change key fetched.cums was accumulated at
     sandbox: str           # rendered badge — three settings files to resolve it
@@ -2098,7 +2136,7 @@ class _Fetched(NamedTuple):
 
 # Cache-file layout guard: bump when _Fetched gains, loses or retypes a field,
 # so a render never rebuilds a NamedTuple from a stale shape.
-_FAST_CACHE_SCHEMA = 5
+_FAST_CACHE_SCHEMA = 6
 
 
 def _session_state_path(session_id: str, suffix: str = "") -> Path:
@@ -2189,6 +2227,7 @@ def _load_fetched(session_id: str, cwd: str, now: float) -> tuple[_Fetched, floa
             dcat=f["dcat"],
             usage=f["usage"],
             chat_cost=f["chat_cost"],
+            chat_families=list(f["chat_families"]),
             cums=tuple(f["cums"]),
             total_in=f["total_in"],
             sandbox=f["sandbox"],
@@ -2223,6 +2262,7 @@ def _save_fetched(session_id: str, cwd: str, ts: float, fetched: _Fetched) -> No
                 "dcat": fetched.dcat,
                 "usage": fetched.usage,
                 "chat_cost": fetched.chat_cost,
+                "chat_families": fetched.chat_families,
                 "cums": list(fetched.cums),
                 "total_in": fetched.total_in,
                 "sandbox": fetched.sandbox,
@@ -2324,9 +2364,9 @@ def _fetch_all(
         except sqlite3.OperationalError:
             cums = (0, 0, 0)
         try:
-            chat_cost_val = compute_session_cost(inp.session_id, inp.cwd)
+            chat_cost_val, chat_families = compute_session_usage(inp.session_id, inp.cwd)
         except sqlite3.OperationalError:
-            chat_cost_val = 0.0
+            chat_cost_val, chat_families = 0.0, frozenset()
 
         # Collect subprocess results
         git = _collect_git(git_procs)
@@ -2353,9 +2393,9 @@ def _fetch_all(
     # cost that needs git, so it is all that waits for the join.
     if not chat_cost_val and git.toplevel and git.toplevel != inp.cwd:
         try:
-            chat_cost_val = compute_session_cost(inp.session_id, git.toplevel)
+            chat_cost_val, chat_families = compute_session_usage(inp.session_id, git.toplevel)
         except sqlite3.OperationalError:
-            chat_cost_val = 0.0
+            chat_cost_val, chat_families = 0.0, frozenset()
 
     if memo != memo_before:
         _save_memo(inp.session_id, memo)
@@ -2367,6 +2407,7 @@ def _fetch_all(
         dcat=dcat_data,
         usage=usage_data,
         chat_cost=chat_cost_val,
+        chat_families=sorted(chat_families),
         cums=cums,
         total_in=inp.total_in,
         sandbox=_render_sandbox(inp.cwd, git.toplevel),
@@ -2484,8 +2525,10 @@ def main() -> None:
     ctx_pct = _render_ctx_pct(used_tokens, inp.ctx_size, label=not session)
     session = f"{session}{ctx_pct}"
     battery_str = _render_battery(fetched.battery)
-    # The scoped segment's "current" mode compares against the session model.
+    # The scoped segment's "current" mode compares against the session model and
+    # against the families the session's log carries — see _scoped_model_in_use.
     usage_data["_current_model"] = inp.model
+    usage_data["_session_families"] = fetched.chat_families
     usage_session_rl, usage_rl, usage_cost = _render_usage(usage_data, now_epoch)
 
     _layout_and_print(

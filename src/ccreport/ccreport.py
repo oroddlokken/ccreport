@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -1859,6 +1860,81 @@ def cmd_migrate(args) -> None:
         print(f"moved {line}")
 
 
+def _pull_ff_only(root: Path) -> int:
+    """Fast-forward the checkout and echo what git said. Returns git's exit code.
+
+    `--ff-only` and nothing else. A merge or a rebase here would resolve someone
+    else's conflicts inside a reporting tool; refusing leaves the user in a tree
+    they can still reason about, with git's own message saying why.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "pull", "--ff-only"],
+            capture_output=True, text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"Could not run git pull: {exc}", file=sys.stderr)
+        return 1
+    for stream, sink in ((out.stdout, sys.stdout), (out.stderr, sys.stderr)):
+        text = stream.strip()
+        if text:
+            print(text, file=sink)
+    if out.returncode != 0:
+        print("Fast-forward refused — the checkout has commits of its own, "
+              "or the pull needs a merge. Resolve it with git.", file=sys.stderr)
+    return out.returncode
+
+
+def cmd_update(args) -> None:
+    """Report how far origin's master has moved past this checkout.
+
+    The status line renders the same number, but from an answer a detached
+    child refreshes twice a day. Asking here runs the check live, because the
+    user asked now, and writes the result back through the same meta keys — so
+    a check from the CLI also paces the next spawn and refreshes the segment.
+
+    Every outcome the check itself can reach exits 0, including the ones that
+    could not answer: not knowing is not a failure of the command. Only a
+    refused `--pull` exits non-zero, with git's own code.
+    """
+    from ccreport import update_check
+
+    root = update_check.checkout_root()
+    if root is None:
+        print("Installed as a package — there is no checkout here to update.")
+        return
+
+    upstream = f"origin/{update_check.UPSTREAM_BRANCH}"
+    sha = update_check.local_head_sha(root)
+    if sha is None:
+        cache_db.write_update_check("", None, time.time())
+        print(f"Could not read HEAD in {root}.")
+        return
+
+    slug = update_check.remote_slug(root)
+    behind = update_check.commits_behind(slug, sha) if slug else None
+    cache_db.write_update_check(sha, behind, time.time())
+
+    if slug is None:
+        print("origin is not a GitHub remote, so there is nothing to compare against.")
+        return
+    if behind is None:
+        print(f"Could not reach GitHub to compare against {upstream}.")
+        return
+    if behind == 0:
+        print(f"Up to date with {upstream}.")
+        return
+
+    commits = "commit" if behind == 1 else "commits"
+    print(f"{behind} {commits} behind {upstream}.")
+    if not args.pull:
+        print("Pull them: ccreport update --pull")
+        return
+    code = _pull_ff_only(root)
+    if code != 0:
+        sys.exit(code)
+
+
 def cmd_overrides(args) -> None:
     """Manage the local project-grouping override rules."""
     if args.command == "merge":
@@ -2622,6 +2698,7 @@ def main() -> None:
                "  ccreport monthly --account personal@example.com\n"
                "  ccreport adopt            # claim pre-capture history\n"
                "  ccreport limits -w session\n"
+               "  ccreport update           # is master ahead of this checkout?\n"
                "  ccreport migrate --dry-run\n",
     )
     sub = parser.add_subparsers(dest="command", help="Report type")
@@ -2670,6 +2747,11 @@ def main() -> None:
     pmg.add_argument("--dry-run", "-n", action="store_true",
                      help="List what would move without moving it")
 
+    # The same "master has moved" check the status line renders, asked live.
+    pup = sub.add_parser("update", help="Check whether origin's master is ahead of this checkout")
+    pup.add_argument("--pull", action="store_true",
+                     help="Fast-forward the checkout when it is behind")
+
     # Rate-limit utilization history, from the statusline's samples.
     pl = sub.add_parser("limits", help="Rate-limit window utilization history")
     pl.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
@@ -2699,6 +2781,11 @@ def main() -> None:
 
     if args.command in ("overrides", "merge", "unmerge"):
         cmd_overrides(args)
+        return
+    # Reads no records and prints no report: it wants the checkout and the
+    # compare API, neither of which the corpus load below has anything to add to.
+    if args.command == "update":
+        cmd_update(args)
         return
     # Loads records itself, bounded to the span its samples cover, so it runs
     # here rather than falling through to the report path's unbounded load and
