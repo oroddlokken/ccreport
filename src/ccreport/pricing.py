@@ -113,7 +113,7 @@ def _tz_from_env(tz_env: str | None) -> ZoneInfo:
         return ZoneInfo("UTC")
 
 # Source: https://github.com/BerriAI/litellm model_prices_and_context_window.json
-LAST_CHECKED = "2026-07-24"
+LAST_CHECKED = "2026-08-12"
 
 PRICING_HISTORY: list[dict[str, Any]] = [
     {
@@ -199,7 +199,8 @@ PRICING_HISTORY: list[dict[str, Any]] = [
         },
     },
     {
-        # Sonnet 5 introductory pricing, $2/$10 per MTok through 2026-08-31.
+        # Sonnet 5, $2/$10 per MTok. Launched as introductory pricing through
+        # 2026-08-31; Anthropic made the rate permanent before that expired.
         # Release date unknown; 2026-06-01 covers all current records.
         "effective": "2026-06-01",
         "models": {
@@ -235,16 +236,6 @@ PRICING_HISTORY: list[dict[str, Any]] = [
             "claude-opus-5": {
                 "input": 5e-06, "output": 25e-06,
                 "cache_create": 6.25e-06, "cache_read": 0.5e-06,
-            },
-        },
-    },
-    {
-        # Sonnet 5 standard pricing, $3/$15 per MTok, after intro window ends.
-        "effective": "2026-09-01",
-        "models": {
-            "claude-sonnet-5": {
-                "input": 3e-06, "output": 15e-06,
-                "cache_create": 3.75e-06, "cache_read": 0.3e-06,
             },
         },
     },
