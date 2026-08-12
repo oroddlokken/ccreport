@@ -2233,6 +2233,31 @@ class TestWindowBurn:
         assert _instances()[0].burn_pph == 2.5
 
 
+class TestPartialWindows:
+    """A window that had already filled when the first render looked at it."""
+
+    def test_a_window_first_seen_high_is_partial(self):
+        _seed_samples("week", _W1_RESET, _W1_START, [77.0, 93.0])
+        assert _instances()[0].partial is True
+
+    def test_a_window_first_seen_near_empty_is_whole(self):
+        """Capture starts at a render, so a point or two of lag is ordinary."""
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
+        assert _instances()[0].partial is False
+
+    def test_the_start_is_the_reset_less_the_window_length(self):
+        _seed_samples("week", _W1_RESET, _W1_START, [77.0])
+        inst = _instances()[0]
+        start = _W1_RESET - 7 * 86400
+        assert (inst.started_at, inst.unseen_s) == (start, _W1_START - start)
+
+    def test_a_window_type_the_report_does_not_know_has_no_start(self):
+        """Its opening reading still stands; only the lag is unknowable."""
+        _seed_samples("opus_hourly", _W1_RESET, _W1_START, [61.0])
+        inst = _instances()[0]
+        assert (inst.started_at, inst.unseen_s, inst.partial) == (None, None, True)
+
+
 def _spend_rec(iso, *, usd, model="claude-opus-5"):
     return _rec(
         model=model,
@@ -2489,6 +2514,9 @@ class TestCmdLimits:
                 "usd_per_pp": 8.0 / 97.7,
                 "headroom_usd": None,
                 "hit_limit": True,
+                "partial": False,
+                "window_start": _W1_START,
+                "unseen_seconds": 0.0,
                 "account": "me@work.example",
                 "limit_tier": "default_claude_max_5x",
             }
@@ -2638,6 +2666,17 @@ class TestLimitsRendering:
         _seed_samples("session", _W1_RESET, _W1_START, [30.0])
         out = self._render(monkeypatch, now="2026-06-15T10:00")
         assert "no rate to project from yet" in out
+
+    def test_a_partial_window_is_starred_and_read_out(self, monkeypatch):
+        _seed_samples("week", _W1_RESET, _W1_START, [77.0, 93.0])
+        out = self._render(monkeypatch, now="2026-06-15T13:01")
+        assert "93.0%*" in out
+        assert "first sampled at 77.0%" in out
+        assert "Peak counts that rise" in out
+
+    def test_a_window_watched_from_the_start_carries_no_mark(self, monkeypatch):
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
+        assert "*" not in self._render(monkeypatch, now="2026-06-15T13:01")
 
     def test_a_narrow_terminal_drops_the_named_columns_in_order(self, monkeypatch):
         _seed_samples("session", _W1_RESET, _W1_START, [10.0, 30.0])

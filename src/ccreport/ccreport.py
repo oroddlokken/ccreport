@@ -2074,6 +2074,22 @@ _LIMIT_WINDOW_LABELS = {
 # recorded" instead of as a rendering fault.
 _ABSENT = "—"
 
+# How long each window runs, so its reset time says when it opened. pricing owns
+# both spans; the three 7-day quotas differ in what they count, not in how long
+# they run. A window type not listed here — one the writer added since — has no
+# derivable start, so its note names the opening reading and no lag.
+_LIMIT_WINDOW_SPAN_S = {
+    "session": float(pricing.SESSION_WINDOW_S),
+    "week": float(pricing.WEEK_WINDOW_S),
+    "sonnet": float(pricing.WEEK_WINDOW_S),
+    "scoped": float(pricing.WEEK_WINDOW_S),
+}
+
+# Points a window may already carry when first sampled before the report calls
+# it partial. Capture starts at a render, so a point or two of lag is ordinary;
+# past this the peak counts a rise the spend columns never priced.
+_PARTIAL_OPENING_PP = 5.0
+
 
 @dataclass
 class WindowInstance:
@@ -2177,6 +2193,30 @@ class WindowInstance:
         if self.fill_s <= 0 or self.rise <= 0:
             return None
         return self.rise / (self.fill_s / 3600)
+
+    @property
+    def started_at(self) -> float | None:
+        """When the window opened, or None where its length is unknown."""
+        span = _LIMIT_WINDOW_SPAN_S.get(self.window)
+        return None if span is None else self.resets_at - span
+
+    @property
+    def unseen_s(self) -> float | None:
+        """Seconds the window ran before the first sample of it was taken."""
+        start = self.started_at
+        return None if start is None else max(0.0, self.first_ts - start)
+
+    @property
+    def partial(self) -> bool:
+        """Whether the window had filled measurably before capture began.
+
+        The gap is opening_pct — what the first render found already spent —
+        and not the hours before that render, which cost nothing while nobody
+        was working. A partial instance still reports a true peak, but its
+        Spend and $/pp price the sampled span alone, so the two columns answer
+        different stretches of the same window.
+        """
+        return self.opening_pct >= _PARTIAL_OPENING_PP
 
     def is_open(self, now: float) -> bool:
         """Whether the window has yet to reset."""
@@ -2479,9 +2519,30 @@ def _limits_entry(
         "usd_per_pp": spend.per_pp,
         "headroom_usd": spend.headroom_usd,
         "hit_limit": inst.hit_limit,
+        "partial": inst.partial,
+        "window_start": inst.started_at,
+        "unseen_seconds": inst.unseen_s,
         "account": accounts.label_at(when),
         "limit_tier": accounts.tier_at(when),
     }
+
+
+def _partial_note(inst: WindowInstance) -> str | None:
+    """The caption line for a window that was already filling when first seen.
+
+    Marked in words under the table rather than by dropping the instance: the
+    readings taken are real, and the peak is the only record that the window
+    reached that height at all.
+    """
+    if not inst.partial:
+        return None
+    named = f"{short_model(inst.model)} " if inst.model else ""
+    unseen = inst.unseen_s
+    lag = f", {_fmt_span(unseen)} after it opened" if unseen else ""
+    return (
+        f"* {named}{_fmt_epoch(inst.resets_at)}: first sampled at "
+        f"{inst.opening_pct:.1f}%{lag} — Peak counts that rise, Spend and $/pp do not"
+    )
 
 
 def _open_note(inst: WindowInstance, spend: WindowSpend, now: float) -> str | None:
@@ -2546,7 +2607,8 @@ def report_limits(
     for window in _window_types(instances):
         group = [i for i in instances if i.window == window]
         scoped = window == "scoped"
-        notes = [n for n in (_open_note(i, spends[i.key], now) for i in group) if n]
+        notes = [n for n in (_partial_note(i) for i in group) if n]
+        notes += [n for n in (_open_note(i, spends[i.key], now) for i in group) if n]
         table = Table(
             title=f"{_LIMIT_WINDOW_LABELS.get(window, window)} — {len(group)} window(s)",
             title_style="bold", box=box.ROUNDED, expand=False, show_lines=False,
@@ -2574,7 +2636,10 @@ def report_limits(
             if scoped:
                 row.append(short_model(inst.model) if inst.model else _ABSENT)
             row += [
-                Text(f"{inst.peak:.1f}%", style=_peak_style(inst.peak)),
+                Text(
+                    f"{inst.peak:.1f}%{'*' if inst.partial else ''}",
+                    style=_peak_style(inst.peak),
+                ),
                 str(len(inst.samples)),
                 _fmt_span(inst.fill_s),
                 _fmt_burn(inst.burn_pph),

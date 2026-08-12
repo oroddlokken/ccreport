@@ -1233,7 +1233,7 @@ Per instance:
 
 | Field | Meaning |
 |-------|---------|
-| Peak | the fullest reading, raw float as stored |
+| Peak | the fullest reading, raw float as stored. A trailing `*` marks a partial instance: one whose first sample already read `_PARTIAL_OPENING_PP` (5.0) or more, so points filled before capture began. The peak then counts a rise the Spend beside it never priced, and a caption line says so, naming the opening reading and how long the window had been running (`WindowInstance.partial` / `.started_at` / `.unseen_s`, spans from `_LIMIT_WINDOW_SPAN_S`). The mark is on the opening percentage, not on the delay: idle hours before the first render cost nothing. `--json` carries it as `partial`, `window_start`, `unseen_seconds` |
 | Samples | how many readings the write gate let through |
 | Fill | first sample → **first** sample at the peak. Hours spent sitting at the peak are plateau, not fill, and the value is a floor: the window may have been filling before the first render saw it |
 | pp/h | the rise (peak − **first reading taken**) over the fill span. Wall-clock, so an overnight gap between two renders counts as time the window took to fill — the rate to project a reset with, and the wrong one for "how fast does a working hour spend the quota". `None` (rendered `—`) for one sample or a window that never rose while it was watched, never 0, which would read as "not filling" |
@@ -1249,7 +1249,8 @@ that never rose prices as absent rather than as $0.00 — its fill span is a
 single instant, and the spend of an instant would read as "this window was
 free". So does every window when no corpus loaded at all.
 
-Below each table, one caption line per **open** window (`resets_at` in the
+Below each table, one caption line per **partial** window and then one per
+**open** window (`resets_at` in the
 future): where it stands, the reading it was first seen at, the rate, the
 projected fill at reset, and what the points left are worth at that window's own
 $/pp — `_open_note` has why a caption rather than a column. The arithmetic and
