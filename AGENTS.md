@@ -12,8 +12,9 @@ Two tools over one SQLite cache at `~/.cache/ccreport/cache.db`:
   and draws bars, reset countdowns and a weekly pace line from what it printed.
 
 `pricing.py`, `cache_db.py`, `exchange.py`, `project_identity.py` and
-`usage_api.py` are shared by both. `bin/` holds the wrappers that Claude Code's
-settings.json and a PATH entry point at.
+`usage_api.py` are shared by both. `update_check.py` is spawned by the status
+line alone. `bin/` holds the wrappers that Claude Code's settings.json and a
+PATH entry point at.
 
 The status line renders on every frame, which is why it imports nothing outside
 the stdlib and defers `cache_db` (and with it sqlite3) into the functions that
@@ -34,7 +35,7 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   it, so the row would keep the previous window's total across a rollover
 - Renders within 15 s (`FAST_TTL_S`) reuse the previous render's fetch results —
   git, battery, dsp, dcat, usage row, cost summary, session cost, and the
-  rendered sandbox, sessions and account segments — from a per-session temp file
+  rendered sandbox, sessions, account and update segments — from a per-session file
   (`_Fetched`, guarded by `_FAST_CACHE_SCHEMA`). Native S/W, clock, ctx% and
   countdowns stay live from stdin. The only bookkeeping the fast path keeps is
   cache-stats accumulation, keyed on `total_in` changing; account capture and
@@ -43,6 +44,13 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   no later render need re-derive and so has no TTL: the DSP verdict, fixed once
   the session's `claude` was launched, and the `(mtime_ns, size)` of
   `~/.claude.json` that the last account capture parsed
+- The update line comes from `update_check.py`, spawned detached on slow renders
+  when the stored stamp is older than `UPDATE_CHECK_INTERVAL_S` (12 h). The child
+  writes that stamp on every outcome, failures included, so an unreachable API
+  cannot become a spawn per render. A stored count is rendered only while
+  `update_local_sha` still equals HEAD, so a pull silences the line instead of
+  repeating a number the user has acted on. There are no tags and no releases —
+  master is the release and the unit is a commit
 - All pricing data lives in `pricing.py` — update only this file when prices
   change. Source: the LiteLLM pricing database; update `LAST_CHECKED` after
   verifying

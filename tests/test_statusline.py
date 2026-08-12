@@ -1278,7 +1278,7 @@ class TestAccountLandsOnTheLastLine:
         monkeypatch.setenv("COLUMNS", str(cols))
         sl._layout_and_print(
             ["12:00", "ccreport"], "Opus ctx:42%", "S:23%", "W:41%", "24H:$1.20",
-            {"_native_rl": True}, account, battery, "", 1_000_000.0, time.monotonic(),
+            {"_native_rl": True}, account, battery, "", "", 1_000_000.0, time.monotonic(),
         )
         return capsys.readouterr().out.rstrip("\n").split("\n")
 
@@ -1297,6 +1297,158 @@ class TestAccountLandsOnTheLastLine:
 
     def test_no_segment_adds_no_line(self, monkeypatch, capsys):
         assert len(self._lines(monkeypatch, capsys, 100, "")) == 3
+
+
+class TestUpdateSegment:
+    """What has to hold before a commits-behind count goes on screen."""
+
+    NOW = 1_000_000.0
+    SHA = "a" * 40
+    OTHER = "b" * 40
+
+    @pytest.fixture
+    def checkout(self, tmp_path, monkeypatch):
+        """A tree update_check reads as its own checkout, with HEAD at SHA."""
+        from ccreport import update_check
+
+        (tmp_path / "src" / "ccreport").mkdir(parents=True)
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "HEAD").write_text(f"{self.SHA}\n", encoding="utf-8")
+        monkeypatch.setattr(
+            update_check, "__file__", str(tmp_path / "src" / "ccreport" / "update_check.py"))
+        return tmp_path
+
+    @pytest.fixture
+    def spawns(self, monkeypatch):
+        seen: list[list[str]] = []
+        monkeypatch.setattr(sl, "_spawn_update_check", lambda: seen.append(["spawn"]))
+        return seen
+
+    def _store(self, behind, *, age=0.0, sha=None):
+        from ccreport import cache_db
+
+        cache_db.write_update_check(self.SHA if sha is None else sha, behind, self.NOW - age)
+
+    def test_it_names_the_count_and_what_to_do(self, checkout, spawns):
+        self._store(12)
+        assert "12 commits behind" in sl._render_update(self.NOW)
+        assert "git pull" in sl._render_update(self.NOW)
+
+    def test_one_commit_is_singular(self, checkout, spawns):
+        self._store(1)
+        assert "1 commit behind" in sl._render_update(self.NOW)
+
+    def test_up_to_date_shows_nothing(self, checkout, spawns):
+        self._store(0)
+        assert sl._render_update(self.NOW) == ""
+
+    def test_an_unanswered_check_shows_nothing(self, checkout, spawns):
+        """A 404 or a rate limit stores no count; silence beats a guess."""
+        self._store(None)
+        assert sl._render_update(self.NOW) == ""
+
+    def test_a_pull_since_the_check_silences_the_line(self, checkout, spawns):
+        """The count describes a commit the user has already left."""
+        self._store(12, sha=self.OTHER)
+        assert sl._render_update(self.NOW) == ""
+
+    def test_a_count_older_than_the_max_age_is_not_repeated(self, checkout, spawns):
+        from ccreport import update_check
+
+        self._store(12, age=update_check.UPDATE_MAX_AGE_S + 1)
+        assert sl._render_update(self.NOW) == ""
+
+    def test_the_toggle_turns_it_off(self, checkout, spawns, monkeypatch):
+        self._store(12)
+        monkeypatch.setenv("CLAUDE_STATUSLINE_UPDATE", "0")
+        assert sl._render_update(self.NOW) == ""
+
+    def test_an_installed_package_has_nothing_to_pull(self, tmp_path, monkeypatch, spawns):
+        """No .git beside the package: `uv tool install .`, or a wheel."""
+        from ccreport import update_check
+
+        (tmp_path / "src" / "ccreport").mkdir(parents=True)
+        monkeypatch.setattr(
+            update_check, "__file__", str(tmp_path / "src" / "ccreport" / "update_check.py"))
+        self._store(12)
+        assert sl._render_update(self.NOW) == ""
+        assert spawns == []
+
+    def test_a_stale_stamp_spawns_the_check(self, checkout, spawns):
+        self._store(0, age=sl.UPDATE_CHECK_INTERVAL_S)
+        sl._render_update(self.NOW)
+        assert len(spawns) == 1
+
+    def test_a_fresh_stamp_spawns_nothing(self, checkout, spawns):
+        self._store(0, age=sl.UPDATE_CHECK_INTERVAL_S - 1)
+        sl._render_update(self.NOW)
+        assert spawns == []
+
+    def test_a_never_run_check_spawns(self, checkout, spawns):
+        sl._render_update(self.NOW)
+        assert len(spawns) == 1
+
+    def test_the_toggle_is_read_before_the_database(self, checkout, spawns, monkeypatch):
+        """Off means off: no read, and no check spawned to feed a line nobody sees."""
+        from ccreport import cache_db
+
+        def boom():
+            raise AssertionError("no database read with the segment off")
+
+        monkeypatch.setattr(cache_db, "read_update_check", boom)
+        monkeypatch.setenv("CLAUDE_STATUSLINE_UPDATE", "0")
+        assert sl._render_update(self.NOW) == ""
+        assert spawns == []
+
+    def test_a_busy_database_costs_the_line_not_the_render(
+        self, checkout, spawns, monkeypatch,
+    ):
+        from ccreport import cache_db
+
+        def boom():
+            raise OSError
+
+        monkeypatch.setattr(cache_db, "read_update_check", boom)
+        assert sl._render_update(self.NOW) == ""
+
+    def test_the_spawn_is_detached(self, monkeypatch):
+        """It outlives the render that started it, like the usage refresh."""
+        seen: list[dict] = []
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: seen.append({**kw, "cmd": cmd}))
+        sl._spawn_update_check()
+        assert seen[0]["start_new_session"] is True
+        assert seen[0]["cmd"][1:] == ["-m", "ccreport.update_check"]
+
+
+class TestUpdateLandsUnderTheCostLine:
+    """Where the segment prints, in both layouts."""
+
+    def _lines(self, monkeypatch, capsys, cols, update):
+        monkeypatch.setenv("COLUMNS", str(cols))
+        sl._layout_and_print(
+            ["12:00", "ccreport"], "Opus ctx:42%", "S:23%", "W:41%", "24H:$1.20",
+            {"_native_rl": True}, "me@work.example", "", "", update,
+            1_000_000.0, time.monotonic(),
+        )
+        return capsys.readouterr().out.rstrip("\n").split("\n")
+
+    @pytest.mark.parametrize("cols", [100, 200])
+    def test_it_follows_the_cost_windows(self, monkeypatch, capsys, cols):
+        lines = self._lines(monkeypatch, capsys, cols, "12 commits behind")
+        cost = next(i for i, line in enumerate(lines) if "24H:$1.20" in line)
+        assert "12 commits behind" in lines[cost + 1]
+
+    @pytest.mark.parametrize("cols", [100, 200])
+    def test_it_precedes_the_account_line(self, monkeypatch, capsys, cols):
+        lines = self._lines(monkeypatch, capsys, cols, "12 commits behind")
+        assert "me@work.example" in lines[-1]
+        assert "12 commits behind" in lines[-2]
+
+    @pytest.mark.parametrize("cols", [100, 200])
+    def test_no_segment_adds_no_line(self, monkeypatch, capsys, cols):
+        with_it = self._lines(monkeypatch, capsys, cols, "12 commits behind")
+        without = self._lines(monkeypatch, capsys, cols, "")
+        assert len(without) == len(with_it) - 1
 
 
 class TestRateLimitSamples:
@@ -1551,6 +1703,7 @@ class TestFastCache:
             "sandbox": "sbx",
             "sessions": "+2sess",
             "account": "me@work.example (Work AS)",
+            "update": "",
         }
         return sl._Fetched(**{**base, **overrides})
 
@@ -1654,6 +1807,7 @@ class TestCatchUpCacheStats:
             sandbox="",
             sessions="",
             account="",
+            update="",
         )
 
     def test_unchanged_total_in_touches_nothing(self, monkeypatch):

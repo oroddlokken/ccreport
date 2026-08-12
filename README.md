@@ -133,6 +133,27 @@ uv tool install .
 Every wrapper in `bin/` runs the modules out of the checkout rather than an
 installed copy, so an edit takes effect on the next invocation.
 
+## Updates
+
+There are no tagged versions. master is the release, so updating is `git pull`
+in the checkout.
+
+The status line says when that is worth doing, on a line under the cost
+windows:
+
+```
+↑ 12 commits behind · git pull
+```
+
+Twice a day a detached process asks GitHub's API how far origin's master has
+moved past your HEAD. It reads `.git` as files and writes nothing there — no
+fetch, no refs touched — and the request never happens on the render path. Set
+`CLAUDE_STATUSLINE_UPDATE=0` to turn the line and the request off. An installed
+copy with no checkout beside it never checks at all.
+
+The line goes quiet the moment you pull, rather than waiting for the next
+check: the stored count is tied to the commit it was measured against.
+
 ## Where the data lives
 
 | Path | What |

@@ -71,6 +71,9 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
       CLAUDE_STATUSLINE_30D_COST           — rolling 30-day cost
       CLAUDE_STATUSLINE_AT_COST            — all-time cost (when > 30D)
   CLAUDE_STATUSLINE_USAGE_JSON              — pre-provided usage JSON (skips usage_api.py)
+  CLAUDE_STATUSLINE_UPDATE                  — a line of its own when this ccreport checkout is
+                                              behind origin's master, from a check that runs
+                                              twice a day against GitHub's API
 
 Other environment variables:
   CLAUDE_CODE_PACE_DAYS                     — pace window in days (1-7, default 7)
@@ -137,6 +140,11 @@ NEAR_THRESHOLD_MARGIN = 10  # % below a display threshold that still warrants fe
 # rescan half again as often.
 COST_SUMMARY_MAX_AGE = 900  # seconds the cached compute_costs() result stays usable
 FAST_TTL_S = 15            # seconds a render may reuse the previous render's fetch results
+# Twice a day, which is what the update line is worth: master moves in commits,
+# not releases, and nobody pulls on the hour. The stamp behind this is written
+# by the child on every outcome, so an unreachable API waits the same interval
+# as an answered one instead of spawning a process per render.
+UPDATE_CHECK_INTERVAL_S = 43_200
 EXTRA_ACCRUAL_PCT = 90     # session % from which extra credits could start accruing
 LAYOUT_WIDE_COLS = 150     # terminal columns threshold for 2-line layout
 SESSION_WINDOW_MS = 900_000  # 15 min — active sessions lookback
@@ -905,6 +913,61 @@ def _render_account() -> str:
     if user and org:
         return f"{SUBDUED}{user} ({org}){RST}"
     return f"{SUBDUED}{user or org}{RST}" if user or org else ""
+
+
+# --- Update check ---
+
+
+def _spawn_update_check() -> None:
+    """Start the detached check. Same shape and the same reasons as the usage refresh."""
+    import subprocess
+
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "ccreport.update_check"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=_refresh_env(),
+        )
+    except OSError:
+        pass
+
+
+def _render_update(now: float) -> str:
+    """How far origin's master is ahead of this checkout, plus the spawn that refreshes it.
+
+    Slow path only, which is what the one meta read buys: the rendered string
+    goes into the fetch cache beside the other rendered segments, so the
+    fast path neither reads the database nor re-spawns.
+
+    Three things have to hold before a number goes on screen. The count is
+    above zero; the check is recent enough to still describe the world; and
+    the SHA it compared is still the one at HEAD — a pull between the check
+    and the render silences the line rather than letting it repeat a number
+    the user has already acted on.
+    """
+    if not _on("UPDATE"):
+        return ""
+    from ccreport import update_check
+
+    root = update_check.checkout_root()
+    if root is None:
+        return ""  # installed as a package: nothing here to pull into
+    try:
+        from ccreport import cache_db
+
+        checked_at, compared_sha, behind = cache_db.read_update_check()
+    except Exception:  # noqa: BLE001 — a busy database costs the line, not the render
+        return ""
+    if now - checked_at >= UPDATE_CHECK_INTERVAL_S:
+        _spawn_update_check()
+    if not behind or now - checked_at >= update_check.UPDATE_MAX_AGE_S:
+        return ""
+    if compared_sha != update_check.local_head_sha(root):
+        return ""
+    commits = "commit" if behind == 1 else "commits"
+    return f"\033[0;33m↑ {behind} {commits} behind{RST}{SUBDUED} · git pull{RST}"
 
 
 # --- Rate limit history capture ---
@@ -1917,6 +1980,7 @@ def _layout_and_print(
     account: str,
     battery_str: str,
     sessions: str,
+    update: str,
     now_epoch: float,
     _t_start: float,
     force_red: bool = False,
@@ -1995,6 +2059,11 @@ def _layout_and_print(
         if rest:
             lines.append(DOT.join(rest))
 
+    # One insertion point for both layouts: the cost windows close whichever
+    # line they are on in each, so this lands directly under them either way.
+    if update:
+        lines.append(update)
+
     last_parts = [s for s in (account, battery_str, elapsed) if s]
     if last_parts:
         lines.append(DOT.join(last_parts))
@@ -2025,10 +2094,11 @@ class _Fetched(NamedTuple):
     sandbox: str           # rendered badge — three settings files to resolve it
     sessions: str          # rendered badge — a tail of ~/.claude/history.jsonl
     account: str           # rendered segment — the newest account_events row
+    update: str            # rendered segment — the stored update check, plus its respawn
 
 # Cache-file layout guard: bump when _Fetched gains, loses or retypes a field,
 # so a render never rebuilds a NamedTuple from a stale shape.
-_FAST_CACHE_SCHEMA = 4
+_FAST_CACHE_SCHEMA = 5
 
 
 def _session_state_path(session_id: str, suffix: str = "") -> Path:
@@ -2124,6 +2194,7 @@ def _load_fetched(session_id: str, cwd: str, now: float) -> tuple[_Fetched, floa
             sandbox=f["sandbox"],
             sessions=f["sessions"],
             account=f["account"],
+            update=f["update"],
         ), ts
     except Exception:  # noqa: BLE001
         return None
@@ -2157,6 +2228,7 @@ def _save_fetched(session_id: str, cwd: str, ts: float, fetched: _Fetched) -> No
                 "sandbox": fetched.sandbox,
                 "sessions": fetched.sessions,
                 "account": fetched.account,
+                "update": fetched.update,
             },
         }
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -2238,6 +2310,7 @@ def _fetch_all(
         # not change what gets sampled here.
         _snapshot_rate_limits(data, usage_data, now_epoch, test_mode=test_mode)
         sessions_str = _render_sessions(inp.cwd, now_epoch)
+        update_str = _render_update(now_epoch)
 
         # Cache stats and the session cost. Neither depends on a git result, so
         # both belong on this side of the join: the render costs the longer of
@@ -2299,6 +2372,7 @@ def _fetch_all(
         sandbox=_render_sandbox(inp.cwd, git.toplevel),
         sessions=sessions_str,
         account=account_str,
+        update=update_str,
     )
 
 
@@ -2416,7 +2490,8 @@ def main() -> None:
 
     _layout_and_print(
         top, session, usage_session_rl, usage_rl, usage_cost,
-        usage_data, fetched.account, battery_str, fetched.sessions, now_epoch, _t_start,
+        usage_data, fetched.account, battery_str, fetched.sessions, fetched.update,
+        now_epoch, _t_start,
         force_red=_on("RED", default=False)
         or (_on("HAIKU_RED") and "haiku" in inp.model.lower()),
     )

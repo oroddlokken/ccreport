@@ -3095,6 +3095,46 @@ def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Update check (how far master is ahead of the checkout, used by update_check.py)
+# ---------------------------------------------------------------------------
+
+# The SHA rides along with the count because it is what keeps the count honest.
+# A render compares it against HEAD as it stands now: once the user pulls, the
+# stored count describes a commit they have left, and the segment goes quiet
+# until the next check rather than repeating a number that is no longer true.
+_UPDATE_KEYS = ("update_checked_at", "update_local_sha", "update_behind")
+
+
+def read_update_check() -> tuple[float, str, int | None]:
+    """(checked_at, the SHA compared, commits behind) from the last check.
+
+    A never-run check is (0.0, "", None), and so is one that could not reach
+    the API — None is "unanswered", distinct from a 0 that means up to date.
+    """
+    conn = get_connection()
+    vals = _get_meta_many(conn, _UPDATE_KEYS)
+    try:
+        checked_at = float(vals.get("update_checked_at") or 0)
+    except ValueError:
+        checked_at = 0.0
+    behind_raw = vals.get("update_behind") or ""
+    try:
+        behind = int(behind_raw) if behind_raw else None
+    except ValueError:
+        behind = None
+    return checked_at, vals.get("update_local_sha") or "", behind
+
+
+def write_update_check(local_sha: str, behind: int | None, checked_at: float) -> None:
+    """Store one check's result. *behind* None clears the count, keeping the stamp."""
+    conn = get_connection()
+    _set_meta(conn, "update_checked_at", str(checked_at))
+    _set_meta(conn, "update_local_sha", local_sha)
+    _set_meta(conn, "update_behind", "" if behind is None else str(behind))
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
 # Exchange rates (Norges Bank USD/NOK daily spot, used by exchange.py)
 # ---------------------------------------------------------------------------
 

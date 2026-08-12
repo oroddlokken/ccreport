@@ -356,7 +356,7 @@ new `CREATE TABLE` there gets a row here.
 
 | Table | Purpose | Consumers |
 |-------|---------|-----------|
-| `meta` | Global metadata (week/month keys, ccreport version/hash/salt, rollup and orphan fingerprints, migration flags) | all |
+| `meta` | Global metadata (week/month keys, ccreport version/hash/salt, rollup and orphan fingerprints, migration flags, the update check of §5.7) | all |
 | `usage` | Singleton row with fetched usage data + computed costs | usage_api.py, statusline.py |
 | `file_costs` | Per-JSONL-file cost totals for compute_costs() | pricing.py |
 | `dedup_keys` | Dedup keys of in-window files, linked to file_costs | pricing.py |
@@ -508,6 +508,35 @@ else:
   that appeared since the write show up without waiting for an invalidation.
   This is the one thing a render does write, best-effort: a failing write costs
   the next render a re-derivation and nothing else
+
+### 5.7 Update Check
+
+How far origin's master has moved past the checkout, for the status line's
+update segment. There are no tagged versions — master is the release, so the
+unit is a commit.
+
+- **Keys**: `update_checked_at`, `update_local_sha`, `update_behind` in `meta`,
+  read and written as a set by `cache_db.read_update_check()` /
+  `write_update_check()`
+- **Written by**: `update_check.py`, run as `python3 -m ccreport.update_check`
+  from a detached spawn on a slow render (`statusline._render_update`), when
+  `update_checked_at` is older than `UPDATE_CHECK_INTERVAL_S` (43200 s, twice a
+  day). The API call never happens on the render path
+- **Source**: `GET api.github.com/repos/{owner}/{repo}/compare/{HEAD}...master`,
+  unauthenticated. `owner/repo` comes from origin's URL, so a fork checks
+  itself. `status` separates a checkout that is behind from one carrying local
+  commits; `ahead_by` is the count stored
+- **Local SHA**: read from `.git/HEAD` plus the loose ref or `packed-refs` — a
+  file read, no git process, because `_render_update` needs it too. Nothing is
+  ever written into the checkout
+- **Unanswered vs zero**: `update_behind` empty means the check could not
+  answer — a 404 for a commit never pushed, a rate-limited 403, an unreachable
+  host. `0` means up to date. Only a count above zero renders
+- **Stamp on failure**: written on every outcome, including the ones storing no
+  count, since it is what paces the spawn
+- **Render gate**: the stored count shows only while `update_local_sha` still
+  equals HEAD and the stamp is under `update_check.UPDATE_MAX_AGE_S` (1.5 days).
+  A pull silences the line at the next render rather than at the next check
 
 ---
 
@@ -836,6 +865,10 @@ The entire historic cost line is gated by `CLAUDE_STATUSLINE_HISTORIC_COST` (def
 **Per-project cost display**: When a project-specific cost is available and
 `ceil(project_cost) < ceil(total_cost)`, the format becomes `LABEL:$project/$total`
 (e.g. `7D:$64/$375`). When they are equal or project cost is 0, only `$total` is shown.
+
+**Update available** (`_render_update()`, `CLAUDE_STATUSLINE_UPDATE`, default
+on): a line of its own directly under the cost windows, in both layouts —
+`↑ 12 commits behind · git pull`. The count and the gates it passes are §5.7.
 
 **Signed-in account** (`_render_account()`, last line, both toggles off by default):
 
