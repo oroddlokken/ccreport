@@ -49,7 +49,7 @@ _conn: sqlite3.Connection | None = None
 # BUMP THIS on any change to _SCHEMA_SQL, _ADDED_COLUMNS, or the migration list
 # in _run_migrations — an existing DB is otherwise never reopened on the slow
 # path and never sees the new DDL. A needless bump costs one slow open per DB.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 _SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS meta (
@@ -314,6 +314,35 @@ CREATE TABLE IF NOT EXISTS rate_limit_snapshots (
     model     TEXT,            -- scoped window only
     source    TEXT NOT NULL,   -- 'stdin' | 'api'
     PRIMARY KEY (window, ts)
+) WITHOUT ROWID;
+
+-- What each ccreport server has acknowledged storing, per file. The push
+-- client resends a file whose (mtime_ns, size) differs from the row here, so
+-- the watermark is written from the server's response and never from having
+-- sent it: a file the server rejected stays unrecorded and is retried.
+--
+-- Keyed by server first, because a machine can push to more than one and each
+-- has its own idea of what it holds. Local and disposable: delete it and the
+-- next push re-sends everything, which the server answers by skipping every
+-- file whose fingerprint it already has.
+-- Per-account spend ceilings and subscription renewal days, for the forecast.
+-- A table rather than an environment variable: two accounts on one machine each
+-- carry their own, and a variable would need a parsing convention to hold both.
+-- The renewal day is configured because the usage API response carries none.
+CREATE TABLE IF NOT EXISTS account_budgets (
+    account     TEXT PRIMARY KEY,
+    ceiling_usd REAL,
+    renewal_day INTEGER,
+    updated_at  REAL NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS push_state (
+    server_url TEXT NOT NULL,
+    file_path  TEXT NOT NULL,
+    mtime_ns   INTEGER NOT NULL,
+    size       INTEGER NOT NULL,
+    pushed_at  REAL NOT NULL,
+    PRIMARY KEY (server_url, file_path)
 ) WITHOUT ROWID;
 """
 
@@ -3118,6 +3147,188 @@ def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value)
     )
+
+
+# ---------------------------------------------------------------------------
+# Account budgets (spend ceilings and renewal days, used by forecast.py)
+# ---------------------------------------------------------------------------
+
+def load_budgets() -> dict[str, tuple[float | None, int | None]]:
+    """Account name -> (ceiling in USD, renewal day). Either may be None."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT account, ceiling_usd, renewal_day FROM account_budgets ORDER BY account",
+    ).fetchall()
+    return {row[0]: (row[1], row[2]) for row in rows}
+
+
+def save_budget(
+    account: str, ceiling: float | None, renewal_day: int | None, now: float,
+) -> None:
+    """Set one account's ceiling and renewal day, leaving the other alone.
+
+    A None means "do not change this one", so setting a renewal day does not
+    quietly drop a ceiling somebody set months ago.
+    """
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO account_budgets (account, ceiling_usd, renewal_day, updated_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(account) DO UPDATE SET "
+        "ceiling_usd = COALESCE(excluded.ceiling_usd, ceiling_usd), "
+        "renewal_day = COALESCE(excluded.renewal_day, renewal_day), "
+        "updated_at = excluded.updated_at",
+        (account, ceiling, renewal_day, now),
+    )
+    conn.commit()
+
+
+def clear_budget(account: str) -> bool:
+    """Forget one account's budget. False when there was none."""
+    conn = get_connection()
+    cur = conn.execute("DELETE FROM account_budgets WHERE account = ?", (account,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Push state (what each ccreport server has acknowledged, used by push.py)
+# ---------------------------------------------------------------------------
+
+def _push_meta_key(name: str, server_url: str) -> str:
+    """A per-server meta key. One machine can push to more than one server."""
+    return f"push_{name}:{server_url}"
+
+
+def load_push_state(server_url: str) -> dict[str, tuple[int, int]]:
+    """file_path → the (mtime_ns, size) *server_url* has acknowledged."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT file_path, mtime_ns, size FROM push_state WHERE server_url = ?",
+        (server_url,),
+    ).fetchall()
+    return {row[0]: (row[1], row[2]) for row in rows}
+
+
+def save_push_state(
+    server_url: str, acknowledged: list[tuple[str, int, int]], now: float,
+) -> None:
+    """Record what the server said it stored.
+
+    Called with the accepted and skipped files of one response and nothing
+    else: a rejected file must stay unrecorded so the next run retries it.
+    """
+    if not acknowledged:
+        return
+    conn = get_connection()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.executemany(
+            "INSERT INTO push_state (server_url, file_path, mtime_ns, size, pushed_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(server_url, file_path) DO UPDATE SET "
+            "mtime_ns = excluded.mtime_ns, size = excluded.size, pushed_at = excluded.pushed_at",
+            [(server_url, path, mtime_ns, size, now) for path, mtime_ns, size in acknowledged],
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        _rollback_if_open(conn)
+        raise
+
+
+def clear_push_state(server_url: str) -> None:
+    """Forget what *server_url* holds, so the next push offers every file.
+
+    Half of what `ccreport push --full` and a policy change do; the other half
+    is telling the server to store those files even though their fingerprints
+    have not moved. Together they repair the server's copy rather than only
+    rebuilding the local record of it.
+    """
+    conn = get_connection()
+    conn.execute("DELETE FROM push_state WHERE server_url = ?", (server_url,))
+    conn.commit()
+
+
+_PUSH_NEXT_KEY = "push_next_at"
+"""When the status line may spawn the pusher again, as one epoch.
+
+One key rather than a scan of the per-server ones: the render path reads it and
+must not learn how many servers there are, how the interval widens, or how to
+parse push.toml. push.py writes it after every run, so the widening stays in
+the one module that decides it.
+"""
+
+
+def read_push_next_attempt() -> float:
+    """The epoch the next push may start at. 0.0 when nothing has run yet."""
+    conn = get_connection()
+    raw = _get_meta(conn, _PUSH_NEXT_KEY)
+    try:
+        return float(raw) if raw else 0.0
+    except ValueError:
+        return 0.0
+
+
+def write_push_next_attempt(when: float) -> None:
+    """Set when the next push may start. Written on every outcome, failures too."""
+    conn = get_connection()
+    _set_meta(conn, _PUSH_NEXT_KEY, repr(when))
+    conn.commit()
+
+
+def read_push_policy(server_url: str) -> str:
+    """The redaction policy the stored watermark was built under, or "".
+
+    Kept beside the watermark rather than in push.toml: the question it answers
+    is "does what this server holds still match what we would send", and only
+    the machine that pushed knows that.
+    """
+    conn = get_connection()
+    return _get_meta(conn, _push_meta_key("policy", server_url)) or ""
+
+
+def write_push_policy(server_url: str, policy: str) -> None:
+    """Record the policy a completed push was built under."""
+    conn = get_connection()
+    _set_meta(conn, _push_meta_key("policy", server_url), policy)
+    conn.commit()
+
+
+def read_push_attempt(server_url: str) -> tuple[float, int, bool]:
+    """(last attempt, consecutive failures, stopped) for one server.
+
+    *stopped* is the terminal state a 401 puts the machine in: a revoked token
+    is not a transient failure, and retrying it every interval forever is how a
+    revoked laptop keeps knocking for a week.
+    """
+    conn = get_connection()
+    keys = tuple(_push_meta_key(name, server_url) for name in ("attempt", "failures", "stopped"))
+    vals = _get_meta_many(conn, keys)
+    try:
+        attempt = float(vals.get(keys[0], "0") or 0)
+    except ValueError:
+        attempt = 0.0
+    try:
+        failures = int(vals.get(keys[1], "0") or 0)
+    except ValueError:
+        failures = 0
+    return attempt, failures, vals.get(keys[2]) == "1"
+
+
+def write_push_attempt(
+    server_url: str, now: float, failures: int, *, stopped: bool = False,
+) -> None:
+    """Stamp an attempt, whatever its outcome.
+
+    Every outcome, failures included — the stamp is what bounds the spawn rate,
+    so an unreachable server that never wrote one would be probed once per
+    render instead of once per interval.
+    """
+    conn = get_connection()
+    _set_meta(conn, _push_meta_key("attempt", server_url), repr(now))
+    _set_meta(conn, _push_meta_key("failures", server_url), str(failures))
+    _set_meta(conn, _push_meta_key("stopped", server_url), "1" if stopped else "0")
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------

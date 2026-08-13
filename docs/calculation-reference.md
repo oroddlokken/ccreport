@@ -988,7 +988,11 @@ ago_m = (now - last_updated) / 60
 <= 0: "just now", == 1: "1 minute ago", else: "{ago_m} minutes ago"
 ```
 
-### 8.3 Report Tables (ccreport.py)
+### 8.3 Report Tables (aggregate.py, ccreport.py)
+
+Which rows a report has is `aggregate.py`; what they look like is
+`ccreport.py`. The server aggregates through the same functions with no
+terminal to render to.
 
 **Aggregation buckets:**
 

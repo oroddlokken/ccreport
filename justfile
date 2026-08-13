@@ -39,6 +39,10 @@ banners:
 bench:
     uv run python tools/benchmark_statusline_energy.py
 
+# serve the merged-records server with reload, one worker
+serve:
+    uv run python -m ccreport.server.fastapi_server --reload
+
 # run tests
 test:
     uv run pytest --timeout 30 -n 8 tests

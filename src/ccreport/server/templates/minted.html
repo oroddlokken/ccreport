@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Token for {{ machine_id }} — ccreport{% endblock %}
+{% block content %}
+<h1>Token for {{ machine_id }}</h1>
+
+<p>Run this on that machine. It is the only time the token is shown.</p>
+<pre class="command">{{ command }}</pre>
+
+<p class="dim">
+  Only a hash is stored, so this page cannot be reopened. Lose the token and
+  mint another; revoking the old one stops it on that machine's next push.
+</p>
+
+<p><a href="/machines/{{ machine_id }}">Back to {{ machine_id }}</a></p>
+{% endblock %}

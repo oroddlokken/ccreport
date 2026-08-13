@@ -17,7 +17,7 @@ import pytest
 from _narrow import present
 from rich.console import Console
 
-from ccreport import cache_db
+from ccreport import aggregate, cache_db
 from ccreport import ccreport as ccr
 
 UTC = dt.UTC
@@ -1837,6 +1837,64 @@ class TestRollupParity:
         # Live records derive theirs; carrying one would be the wrong answer
         # the moment the record cache was written in another zone.
         assert all(r.count == 1 for r in served if r.oslo_date is None)
+
+
+class TestRollupParityOfRows:
+    """The two load paths must agree on the rows, not only on the rendering.
+
+    A golden fixture exercises one path, which is exactly where a split like
+    this diverges: the rollup path hands the same aggregation one record per
+    day-and-session instead of one per API call.
+    """
+
+    def _rows(self, records, nok):
+        return {
+            "daily": aggregate.daily_rows(records, nok, breakdown=True),
+            "monthly": aggregate.monthly_rows(records, nok),
+            "project": aggregate.project_rows(records, nok, limit=None),
+            "account": aggregate.account_rows(records, nok),
+            "session": aggregate.session_rows(records, nok, limit=None),
+        }
+
+    def _comparable(self, report) -> list:
+        """Rows as plain numbers, since the two paths build different objects."""
+        return [
+            (
+                row.key, row.project,
+                round(row.agg.cost, 9), round(row.agg.cost_nok, 6),
+                row.agg.count, row.agg.tokens.total,
+                sorted((m, round(c, 9)) for m, c in row.agg.models.items()),
+                [(sub.key, round(sub.agg.cost, 9)) for sub in row.breakdown],
+            )
+            for row in report.rows
+        ]
+
+    def test_both_paths_return_the_same_rows(self, rollup_corpus):
+        full = ccr.load_all_records()
+        rates = _rates_for(full)
+        expected = {name: self._comparable(r) for name, r in self._rows(full, rates).items()}
+
+        ccr.load_all_records(use_rollups=True)  # builds the rollups
+        served = ccr.load_all_records(use_rollups=True)
+        assert len(served) < len(full), "nothing came from a rollup"
+
+        got = {name: self._comparable(r) for name, r in self._rows(served, rates).items()}
+        assert got == expected
+
+    def test_the_session_last_activity_survives_the_rollup(self, rollup_corpus):
+        """A rollup row carries its group's newest timestamp, which is that column."""
+        full = ccr.load_all_records()
+        rates = _rates_for(full)
+        ccr.load_all_records(use_rollups=True)
+        served = ccr.load_all_records(use_rollups=True)
+
+        def last_by_session(records):
+            return {
+                row.key: row.last
+                for row in aggregate.session_rows(records, rates, limit=None).rows
+            }
+
+        assert last_by_session(served) == last_by_session(full)
 
 
 class TestRollupFingerprint:

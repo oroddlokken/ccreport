@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}{{ label }} — ccreport{% endblock %}
+{% block content %}
+<h1>{{ label }}</h1>
+<p class="dim mono">{{ machine_id }} · {{ "{:,}".format(records) }} records</p>
+
+<h2>Tokens</h2>
+{% if tokens %}
+<table>
+  <thead>
+    <tr><th>Hash</th><th>Minted</th><th>Last used</th><th>State</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for t in tokens %}
+    <tr>
+      <td class="mono dim">{{ t.token_hash[:12] }}…</td>
+      <td>{{ t.created_at | when }}</td>
+      <td>{{ t.last_used_at | when }}</td>
+      <td>
+        {% if t.revoked_at %}<span class="off">revoked {{ t.revoked_at | when }}</span>
+        {% else %}<span class="ok">active</span>{% endif %}
+      </td>
+      <td>
+        {% if not t.revoked_at %}
+        <form method="post" action="/tokens/{{ t.token_hash }}/revoke">
+          <button type="submit" class="danger">Revoke</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="dim">This machine has no token.</p>
+{% endif %}
+
+<h2>Mint another</h2>
+<form method="post" action="/machines/mint">
+  <input type="hidden" name="machine_id" value="{{ machine_id }}">
+  <input type="hidden" name="label" value="{{ label }}">
+  <button type="submit">Mint</button>
+</form>
+{% endblock %}

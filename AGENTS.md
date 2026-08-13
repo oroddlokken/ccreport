@@ -11,10 +11,23 @@ Two tools over one SQLite cache at `~/.cache/ccreport/cache.db`:
 - `src/ccreport/ccu.py` — the quota dashboard. Runs `usage_api` as a subprocess
   and draws bars, reset countdowns and a weekly pace line from what it printed.
 
-`pricing.py`, `cache_db.py`, `exchange.py`, `project_identity.py` and
-`usage_api.py` are shared by both. `update_check.py` is spawned by the status
-line alone. `bin/` holds the wrappers that Claude Code's settings.json and a
-PATH entry point at.
+`src/ccreport/server/` is the merged database the machines push to: a FastAPI
+app over its own SQLite file, run by Granian (`just serve`), configured by
+`CCREPORT_SERVER_*` environment variables alone. `ingest.py` is the write side,
+`pages.py` the server-rendered UI that mints the tokens it checks, and
+`report_api.py` the merged reports `ccreport --server URL` renders.
+`dashboard.py` is the merged spend page it serves at `/`.
+`src/ccreport/push.py` is the other end: it sends this machine's records, run
+by `ccreport push` or by a detached spawn from the status line.
+
+`burn.py` projects a rate-limit window to exhaustion and `forecast.py` projects
+spend to a ceiling. Both are pure and stdlib-light, because `ccu` and the
+status line read them.
+
+`pricing.py`, `cache_db.py`, `exchange.py`, `aggregate.py`,
+`project_identity.py` and `usage_api.py` are shared. `update_check.py` is
+spawned by the status line alone. `bin/` holds the wrappers that Claude Code's
+settings.json and a PATH entry point at.
 
 The status line renders on every frame, which is why it imports nothing outside
 the stdlib and defers `cache_db` (and with it sqlite3) into the functions that
@@ -60,6 +73,61 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   master is the release and the unit is a commit. `ccreport update` asks the
   same question inline, with no spawn and no interval, and writes its answer
   through the same keys
+- Which rows a report has is `aggregate.py`; what they look like is
+  `ccreport.py`. The row builders there are the one place the rollup path and
+  the full record path meet, and the server folds records through the same
+  functions, so nothing in `aggregate.py` may import rich. `tests/golden/`
+  holds the pre-split rendering of every report — a diff there means the split
+  changed output
+- The server prices every record at ingest with its own `pricing.py` and stores
+  the client's cost, if the log carried one, in a separate column. A model it
+  has no price for fails that whole file with a reason in the response — never
+  a stored zero, which is a week of money that looks like an idle week. Only
+  the `<...>` pseudo-models cost a known zero
+- Ingest sits outside the web UI's network allowlist and the UI sits inside it,
+  wired in `factory.py`: a machine pushes from wherever it is and its token is
+  what admits it, while the pages are reachable from home and nowhere else.
+  `/static` is behind the gate with the pages it styles
+- The client resolves before it sends: the account from `account_events`
+  (`accounts.py`, shared with the CLI so a detached push needs no rich) and the
+  project name through this machine's own override rules. The server holds no
+  merge rules and treats the pushed name as final. Each record also carries the
+  machine's UTC offset at that instant, which is what makes `server_records.day`
+  the machine's calendar day rather than the server's
+- `~/.config/ccreport/push.toml` is the machine's whole push policy — server,
+  token, `restricted`, `allow`, `salt`, `networks` — written by
+  `ccreport server connect` at mode 0600, one `[server."URL"]` table each.
+  There are no environment variables for any of it. A `.restricted` marker
+  sits beside it and wins: a push.toml that lost its `restricted = true` to an
+  edit or an old backup redacts everything rather than reading as open
+- A restricted machine sends every record's counts and strips the identity of
+  any project outside `allow`: project and session become salted pseudonyms so
+  the server can still group them, cwd and repo become null. The salt never
+  leaves the machine. Changing `restricted`, `allow` or the local merge rules
+  moves `policy_hash`, which clears the watermark *and* sets `replace` on every
+  file — the server's skip is keyed on (mtime_ns, size), and the logs that
+  carried the old names are closed and will never change again
+- The network gate is `on_allowed_network`: a connected UDP socket per CIDR,
+  which picks a route without sending a packet, so a VPN handing out an address
+  in range counts as being on the network. Every CIDR is parsed before any is
+  probed, since a machine that matched the first one would otherwise never
+  reach the typo in the second. A blocked push writes no watermark and still
+  stamps the attempt
+- The push watermark is `push_state` in cache.db, written from the server's
+  response and never from having sent it, so a rejected file is retried. The
+  status line spawns `ccreport.push` but never imports it: its gate is one meta
+  key, `push_next_at`, that the child writes on every outcome. How far the
+  interval widens after a failure and which servers are due live in `push.py`,
+  and a 401 is terminal — a revoked token stops the machine rather than
+  knocking every interval
+- The dashboard's chart library is vendored under
+  `server/static/vendor/`, not fetched from a CDN, so the page draws with no
+  internet. Nothing updates it: a new version is a deliberate copy plus an edit
+  to that directory's README, and `tests/test_dashboard.py` fails if any
+  template or asset grows a remote origin
+- `exchange.py` keeps the Norges Bank walk-back and the negative cache; where
+  the rows land is swappable through `use_rate_store`, which is how the server
+  converts against its own `exchange_rates` table instead of a client cache
 - All pricing data lives in `pricing.py` — update only this file when prices
   change. Source: the LiteLLM pricing database; update `LAST_CHECKED` after
   verifying

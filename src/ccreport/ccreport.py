@@ -7,7 +7,6 @@ update that document to match.
 
 import argparse
 import bisect
-import calendar
 import hashlib
 import json
 import os
@@ -15,13 +14,12 @@ import re
 import subprocess
 import sys
 import time
-from collections import defaultdict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from functools import cache
 from pathlib import Path
-from typing import Any, Self
+from typing import Any
 
 import orjson
 from rich import box
@@ -29,7 +27,21 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from ccreport import cache_db, exchange, pricing, project_identity
+from ccreport import accounts, aggregate, cache_db, exchange, pricing, project_identity
+from ccreport.accounts import AccountTimeline
+from ccreport.aggregate import (
+    UNKNOWN_ACCOUNT,
+    AggBucket,
+    NokCtx,
+    ReportRows,
+    TokenCounts,
+    UsageRecord,
+    accounts_worth_showing,
+    by_cost_desc,
+    record_cost,
+    record_cost_nok,
+    short_model,
+)
 from ccreport.cache_db import (
     _ACCOUNT_IDENTITY_COLS,
     _ACCOUNT_TIER_COLS,
@@ -40,7 +52,6 @@ from ccreport.cache_db import (
     clear_adopted_account,
     count_ccreport_records_without_signals,
     delete_project_override,
-    effective_limit_tier,
     get_project_overrides,
     init_ccreport_meta,
     invalidate_ccreport,
@@ -58,8 +69,19 @@ from ccreport.cache_db import (
     save_ccreport_rollups,
     set_adopted_account,
 )
-from ccreport.exchange import RateFetch, get_rate, load_rates, to_oslo_date
-from ccreport.pricing import _local_tz, calc_cost, dedup_identity, extract_assistant_fields
+from ccreport.exchange import RateFetch, get_rate, load_rates
+from ccreport.pricing import _local_tz, dedup_identity, extract_assistant_fields
+
+# The record model and every report's aggregation live in aggregate.py, which
+# imports no rich, so the server can fold the same records with no terminal to
+# draw on. These two names stay reachable here because that is where the CLI
+# and its tests have always found them.
+_bucket_by = aggregate.bucket_by
+_accounts_worth_showing = accounts_worth_showing
+record_oslo_date = aggregate.record_oslo_date
+# The account timeline moved to accounts.py so the detached push client could
+# read it without importing rich; it answers here where it always has.
+_account_labels = accounts._account_labels  # noqa: SLF001 - the move kept the name
 
 # Project naming and the merge/override rules are shared with pricing.py, which
 # scopes the statusline's per-project costs by them; see project_identity.
@@ -218,34 +240,6 @@ def _deserialize_records(raw: list[dict]) -> list:
 
 # --- Account attribution ---
 
-UNKNOWN_ACCOUNT = "unknown"
-
-
-def _account_labels(events: list[dict]) -> list[str]:
-    """The display label for each event, in the order given.
-
-    An email is the label, because that is what the person recognizes. The same
-    address can bill through more than one organization — a work login and a
-    personal one — and those are separate accounts that must not share a
-    bucket, so an email seen under more than one organization carries the
-    organization name too. An event with no email falls back to its uuid, which
-    is the only field guaranteed to be there.
-    """
-    orgs: dict[str, set[str]] = defaultdict(set)
-    for e in events:
-        if e["email"]:
-            orgs[e["email"]].add(e["organization_name"] or "")
-    labels = []
-    for e in events:
-        email = e["email"]
-        if not email:
-            labels.append(e["account_uuid"])
-        elif len(orgs[email]) > 1 and e["organization_name"]:
-            labels.append(f"{email} ({e['organization_name']})")
-        else:
-            labels.append(email)
-    return labels
-
 
 def _account_description(identity: dict) -> str:
     """One account identity on a line, for a prompt rather than a table cell.
@@ -272,264 +266,6 @@ def _same_account(a: dict, b: dict) -> bool:
     return all(a[col] == b[col] for col in _ACCOUNT_IDENTITY_COLS)
 
 
-class AccountTimeline:
-    """Which Claude account was signed in at a given moment, and on which tier.
-
-    Built from the append-only account_events log the statusline writes. The
-    log holds wall-clock capture times as epoch seconds, and a record's
-    timestamp is timezone-aware, so both sides of the lookup compare as epochs
-    and neither depends on the local zone.
-    """
-
-    def __init__(self, events: list[dict]) -> None:
-        self._ts = [e["ts"] for e in events]
-        self._labels = _account_labels(events)
-        # Resolved once here rather than per lookup: both answers come off the
-        # same event, so the two getters differ only in which list they index.
-        self._tiers = [effective_limit_tier(e) for e in events]
-
-    def _index_at(self, when: datetime) -> int:
-        """Position of the event in force at *when*, or -1 when none is.
-
-        A moment older than the first captured event has no event: the log
-        starts when capture was switched on, and what ran before it is
-        genuinely not recorded anywhere.
-        """
-        return bisect.bisect_right(self._ts, when.timestamp()) - 1
-
-    def label_at(self, when: datetime) -> str:
-        """The account in force at *when*, "unknown" before the first event."""
-        i = self._index_at(when)
-        return self._labels[i] if i >= 0 else UNKNOWN_ACCOUNT
-
-    def tier_at(self, when: datetime) -> str | None:
-        """The effective rate-limit tier at *when*, None where it is unrecorded.
-
-        None covers both "no event yet" and "an event that predates the tier
-        columns" — neither is a tier reading, and a report has to show them as
-        absent rather than as a change to something.
-        """
-        i = self._index_at(when)
-        return self._tiers[i] if i >= 0 else None
-
-
-@dataclass
-class TokenCounts:
-    input: int = 0
-    output: int = 0
-    cache_create: int = 0
-    cache_read: int = 0
-
-    @property
-    def total(self) -> int:
-        return self.input + self.output + self.cache_create + self.cache_read
-
-    def __iadd__(self, other: "TokenCounts") -> Self:
-        self.input += other.input
-        self.output += other.output
-        self.cache_create += other.cache_create
-        self.cache_read += other.cache_read
-        return self
-
-
-@dataclass
-class UsageRecord:
-    message_id: str
-    model: str
-    tokens: TokenCounts
-    timestamp: datetime
-    session_id: str
-    project: str
-    cost_usd: float | None = None  # pre-calculated cost from Claude Code
-    dedup_key: str | None = None  # message_id:request_id for deduplication
-    cwd: str | None = None  # original cwd from JSONL; lets future migrations re-derive project
-    repo: str | None = None  # normalized git remote captured at parse time (durable identity)
-    account: str = UNKNOWN_ACCOUNT
-    """Which Claude account this was billed to, assigned by _keep from the
-    account_events timeline. Attribution is read-time on purpose: it is not
-    parsed from the log (which never names an account) and not written to the
-    record cache, so a change log that grows a missing event fixes every past
-    report on the next run instead of needing a re-parse."""
-    count: int = 1
-    """How many API calls this stands for. One, except for the records a rollup
-    row deserializes to, which stand for a whole day of a session's calls — the
-    Calls column adds this rather than counting records."""
-    oslo_date: date | None = None
-    """The FX date to convert this record's cost under, when it cannot be
-    derived from `timestamp`. A rollup record's timestamp is the newest in its
-    group, and a local day can straddle two Oslo dates, so the date the group
-    was actually rolled up under travels with it. None everywhere else, where
-    to_oslo_date(timestamp) is the answer by construction."""
-    _cost: float | None = field(default=None, repr=False, compare=False)
-    """Memo for cost(). Deliberately not cost_usd: that field means 'the log gave
-    us this' and is what _serialize_records writes to the SQLite cache, so a
-    computed value landing there would persist as if it had been logged."""
-    _local: datetime | None = field(default=None, repr=False, compare=False)
-    _day: str | None = field(default=None, repr=False, compare=False)
-    _fx_date: date | None = field(default=None, repr=False, compare=False)
-    """Memos for the three date derivations below, on the same reasoning as
-    _cost: a default run buckets the same records five to seven times, and
-    every pass re-ran the same zone conversion per record. `timestamp` is set
-    at construction and never assigned again, so none of these can go stale."""
-
-    def cost(self) -> float:
-        """USD cost: the log's own costUSD when present, else computed from tokens.
-
-        Memoized — a default report aggregates the same records six times over,
-        and the pricing lookup is the most expensive thing in the run.
-        """
-        if self._cost is None:
-            self._cost = self.cost_usd if self.cost_usd is not None else calc_cost(
-                self.tokens.input, self.tokens.output,
-                self.tokens.cache_create, self.tokens.cache_read,
-                self.model, self.timestamp,
-            )
-        return self._cost
-
-    def local(self) -> datetime:
-        """The timestamp in the machine's zone, which is how days are bucketed."""
-        if self._local is None:
-            self._local = self.timestamp.astimezone()
-        return self._local
-
-    def day_key(self) -> str:
-        """Local calendar day as YYYY-MM-DD — the daily report's bucket."""
-        if self._day is None:
-            self._day = self.local().strftime("%Y-%m-%d")
-        return self._day
-
-    def month_key(self) -> str:
-        """Local month as YYYY-MM. A prefix of the day, so it costs no second format."""
-        return self.day_key()[:7]
-
-    def fx_date(self) -> date:
-        """The FX date this converts under: its own, else its timestamp's.
-
-        A rollup record carries the date it was aggregated under, which is the
-        only correct answer for it — re-deriving from its timestamp would move
-        the whole group onto whichever Oslo date the newest call in it fell on.
-        """
-        if self._fx_date is None:
-            self._fx_date = (
-                self.oslo_date if self.oslo_date is not None
-                else to_oslo_date(self.timestamp)
-            )
-        return self._fx_date
-
-
-@dataclass
-class AggBucket:
-    tokens: TokenCounts = field(default_factory=TokenCounts)
-    cost: float = 0.0
-    cost_nok: float = 0.0
-    nok_estimated: bool = False
-    models: dict[str, float] = field(default_factory=dict)
-    """Model name → its USD cost within this bucket; the Models column shows both."""
-    count: int = 0
-
-    def __iadd__(self, other: "AggBucket") -> Self:
-        """Fold another bucket in — how every report builds its TOTAL row."""
-        self.tokens += other.tokens
-        self.cost += other.cost
-        self.cost_nok += other.cost_nok
-        self.nok_estimated = self.nok_estimated or other.nok_estimated
-        for model, cost in other.models.items():
-            self.models[model] = self.models.get(model, 0.0) + cost
-        self.count += other.count
-        return self
-
-
-def record_cost(rec: UsageRecord) -> float:
-    """Return cost for a record: use pre-calculated costUSD if available, else compute."""
-    return rec.cost()
-
-
-@dataclass(frozen=True)
-class NokCtx:
-    """Everything the NOK column needs, as one value instead of four parameters.
-
-    ``enabled`` is derived rather than stored: a separate has_nok flag could
-    disagree with the rates it is supposed to describe.
-    """
-
-    rates: dict[str, float] = field(default_factory=dict)
-    max_rate_date: str | None = None
-    mva: bool = True
-    _rate_memo: dict[date, tuple[float | None, bool]] = field(
-        default_factory=dict, repr=False, compare=False,
-    )
-    """Oslo date → get_rate result. A corpus of any size spans only a few hundred
-    Oslo dates, and get_rate walks back over weekends and holidays on every miss."""
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self.rates)
-
-    @property
-    def label(self) -> str:
-        return "NOK+MVA" if self.mva else "NOK"
-
-    def rate_for(self, oslo_date: date) -> tuple[float | None, bool]:
-        """(rate, estimated) for an Oslo date, memoized across the whole run."""
-        hit = self._rate_memo.get(oslo_date)
-        if hit is None:
-            hit = self._rate_memo[oslo_date] = get_rate(
-                self.rates, oslo_date, _max_date=self.max_rate_date,
-            )
-        return hit
-
-
-def record_oslo_date(rec: UsageRecord) -> date:
-    """The FX date a record converts under; see UsageRecord.fx_date."""
-    return rec.fx_date()
-
-
-def record_cost_nok(rec: UsageRecord, cost_usd: float, nok: NokCtx) -> tuple[float | None, bool]:
-    """Convert a record's USD cost to NOK using its day's exchange rate.
-
-    With nok.mva (the default), applies 25% Norwegian VAT (MVA) on top.
-    Returns (nok_amount, estimated) where estimated is True only at the
-    trailing edge of rate data (the true rate is not yet known).
-    """
-    rate, estimated = nok.rate_for(record_oslo_date(rec))
-    if rate is None:
-        return None, False
-    multiplier = 1.25 if nok.mva else 1.0
-    return cost_usd * rate * multiplier, estimated
-
-
-def _accum_nok(bucket: "AggBucket", rec: UsageRecord, cost_usd: float, nok: NokCtx) -> None:
-    amount, estimated = record_cost_nok(rec, cost_usd, nok)
-    if amount is not None:
-        bucket.cost_nok += amount
-        if estimated:
-            bucket.nok_estimated = True
-
-
-def _bucket_by(
-    records: list[UsageRecord],
-    key_fn: "Callable[[UsageRecord], Any]",
-    nok: NokCtx,
-) -> dict[Any, AggBucket]:
-    """Aggregate *records* into buckets keyed by ``key_fn(rec)``.
-
-    Every report differs only in that key: a date, a month, a project, a
-    session, or a (date, model) pair for the breakdown rows.
-    """
-    buckets: dict[Any, AggBucket] = defaultdict(AggBucket)
-    for rec in records:
-        b = buckets[key_fn(rec)]
-        b.tokens += rec.tokens
-        cost = record_cost(rec)
-        b.cost += cost
-        if nok.enabled:
-            _accum_nok(b, rec, cost, nok)
-        if rec.model != "<synthetic>":
-            b.models[rec.model] = b.models.get(rec.model, 0.0) + cost
-        b.count += rec.count
-    return buckets
-
-
 def load_rates_for_records(
     records: list[UsageRecord], *, mva: bool = True, prefetch: RateFetch | None = None,
 ) -> tuple[NokCtx, bool]:
@@ -537,6 +273,11 @@ def load_rates_for_records(
 
     Returns (nok_context, has_full_coverage). The context is empty — and so
     reports as disabled — when no rates could be loaded.
+
+    Stayed here when the aggregation moved to aggregate.py: it is how the CLI
+    fills a NokCtx from a corpus it has just read off this machine's disk. The
+    server holds the same rates in its own table and builds its NokCtx from
+    those, so it needs the context type and not this.
 
     *prefetch* is an in-flight request main() started before loading the corpus;
     load_rates joins it, so the API call and the corpus load overlap.
@@ -1191,14 +932,6 @@ def cost_style(c: float) -> str:
     return "dim green"
 
 
-def short_model(model: str) -> str:
-    m = model.replace("claude-", "")
-    # Strip -YYYYMMDD date suffix
-    if len(m) > 9 and m[-9] == "-" and m[-8:].isdigit():
-        m = m[:-9]
-    return m
-
-
 MODELS_MIN_WIDTH = 12
 """Below this a Models column shows nothing but an ellipsis, so drop it."""
 
@@ -1214,14 +947,9 @@ def _flex_cell(text: str) -> Text:
     return Text(text, no_wrap=True, overflow="ellipsis")
 
 
-def _by_cost_desc(model: str, cost: float) -> tuple[float, str]:
-    """Sort key: priciest model first, name breaking ties so output is stable."""
-    return (-cost, short_model(model))
-
-
 def _models_cell(models: dict[str, float]) -> Text:
     """Render a bucket's models, each with its cost, as one truncatable cell."""
-    ordered = sorted(models.items(), key=lambda kv: _by_cost_desc(*kv))
+    ordered = sorted(models.items(), key=lambda kv: by_cost_desc(*kv))
     return _flex_cell(", ".join(f"{short_model(m)} ({fmt_cost(c)})" for m, c in ordered))
 
 
@@ -1367,6 +1095,13 @@ def _token_row(
 # --- Reports ---
 
 
+def _shown_label(report: ReportRows, limit: int | None) -> str:
+    """What a title says it is showing: "top 20 of 340", or just "340"."""
+    if limit and report.n_all > limit:
+        return f"top {limit} of {report.n_all}"
+    return str(report.n_all)
+
+
 def _summary_row(
     table: Table,
     label: str,
@@ -1428,148 +1163,133 @@ def _add_summary_rows(
 
 
 def report_daily(records: list[UsageRecord], breakdown: bool = False, *, nok: NokCtx) -> None:
+    render_daily(aggregate.daily_rows(records, nok, breakdown=breakdown), nok=nok)
+
+
+def render_daily(report: ReportRows, *, nok: NokCtx) -> None:
+    """Draw the daily table from rows that are already aggregated.
+
+    Split from report_daily so `ccreport --server` can render rows the server
+    folded: a merged report then goes through the same builder as a local one
+    and looks like one.
+    """
     narrow = _is_narrow()
 
-    buckets = _bucket_by(records, UsageRecord.day_key, nok)
-    # Breakdown rows are the same aggregation one level finer, so they come from
-    # the same helper keyed by (day, model) rather than a nested copy of it.
-    model_buckets = (
-        _bucket_by(records, lambda r: (r.day_key(), r.model), nok)
-        if breakdown else {}
-    )
-    models_per_day: dict[str, list[str]] = defaultdict(list)
-    for day, model in model_buckets:
-        models_per_day[day].append(model)
+    table = _make_report_table(f"Daily Usage ({report.n_all} days)", "Date", narrow=narrow, nok=nok)
 
-    table = _make_report_table(f"Daily Usage ({len(buckets)} days)", "Date", narrow=narrow, nok=nok)
-
-    total_cost = sum(b.cost for b in buckets.values())
-    total_agg = AggBucket()
-    for day in sorted(buckets):
-        b = buckets[day]
-        row = [day, *_token_row(b, total_cost, narrow=narrow, nok=nok)]
+    total_cost = report.total.cost
+    for row in report.rows:
+        cells = [row.key, *_token_row(row.agg, total_cost, narrow=narrow, nok=nok)]
         if not narrow:
-            row.append(_models_cell(b.models))
-        table.add_row(*row)
-        total_agg += b
+            cells.append(_models_cell(row.agg.models))
+        table.add_row(*cells)
 
-        day_models = [(m, model_buckets[day, m]) for m in models_per_day[day]]
-        for model, mb in sorted(day_models, key=lambda pair: _by_cost_desc(pair[0], pair[1].cost)):
-            brow = [f"  [dim]{short_model(model)}[/dim]", *_token_row(mb, total_cost, narrow=narrow, nok=nok)]
+        for sub in row.breakdown:
+            brow = [
+                f"  [dim]{short_model(sub.key)}[/dim]",
+                *_token_row(sub.agg, total_cost, narrow=narrow, nok=nok),
+            ]
             if not narrow:
                 brow.append("")
             table.add_row(*brow)
 
-    _add_summary_rows(table, total_agg, len(buckets), narrow=narrow, avg_label="per day", nok=nok)
+    _add_summary_rows(table, report.total, report.n_all, narrow=narrow, avg_label="per day", nok=nok)
 
     _print_report(table)
 
 
 def report_monthly(records: list[UsageRecord], *, nok: NokCtx) -> None:
+    report = aggregate.monthly_rows(records, nok)
+    render_monthly(report, aggregate.month_projection(records, report, nok), nok=nok)
+
+
+def render_monthly(
+    report: ReportRows, projection: "aggregate.MonthProjection | None", *, nok: NokCtx,
+) -> None:
+    """Draw the monthly table, projection block included.
+
+    The projection arrives separately because it needs the record stream, not
+    the rows: its trailing figure averages a window the monthly buckets have
+    already aggregated away.
+    """
     narrow = _is_narrow()
-    buckets = _bucket_by(records, UsageRecord.month_key, nok)
 
-    table = _make_report_table(f"Monthly Usage ({len(buckets)} months)", "Month", narrow=narrow, nok=nok)
+    table = _make_report_table(f"Monthly Usage ({report.n_all} months)", "Month", narrow=narrow, nok=nok)
 
-    total_cost = sum(b.cost for b in buckets.values())
-    total_agg = AggBucket()
-    for month in sorted(buckets):
-        b = buckets[month]
-        row = [month, *_token_row(b, total_cost, narrow=narrow, nok=nok)]
+    total_cost = report.total.cost
+    for row in report.rows:
+        cells = [row.key, *_token_row(row.agg, total_cost, narrow=narrow, nok=nok)]
         if not narrow:
-            row.append(_models_cell(b.models))
-        table.add_row(*row)
-        total_agg += b
+            cells.append(_models_cell(row.agg.models))
+        table.add_row(*cells)
 
-    _add_summary_rows(table, total_agg, len(buckets), narrow=narrow, avg_label="per month", nok=nok)
+    _add_summary_rows(table, report.total, report.n_all, narrow=narrow, avg_label="per month", nok=nok)
 
-    # Projected cost for the current (latest) partial month
-    latest_month = max(buckets)
-    today = datetime.now().astimezone()
-    current_month_key = today.strftime("%Y-%m")
-    latest_est = buckets[latest_month].nok_estimated if nok.enabled else False
-    if latest_month == current_month_key:
+    if projection:
         table.add_section()
-        days_elapsed = today.day
-        days_in_month = calendar.monthrange(today.year, today.month)[1]
-        if days_elapsed < days_in_month:
-            projected = buckets[latest_month].cost / days_elapsed * days_in_month
-            projected_nok = (
-                buckets[latest_month].cost_nok / days_elapsed * days_in_month if nok.enabled else 0.0
-            )
-            _summary_row(
-                table, "PROJ" if narrow else "PROJECTED", projected,
-                narrow=narrow, nok=nok,
-                nok_cost=projected_nok, nok_estimated=latest_est,
-                note=f"({days_elapsed}/{days_in_month} days in {today.strftime('%B')})",
-                label_style="dim bold italic",
-            )
-
-            # Projected based on trailing 14-day daily average.
-            #
-            # start_14d is _rollup_cutoff() computed the same way, so this
-            # window sits entirely on the live-record side of it: a rollup
-            # record, which stands for a whole day, is never in `recent` and
-            # never has to be split across the boundary. Widening the window
-            # past ROLLUP_WINDOW_DAYS would break that.
-            window = ROLLUP_WINDOW_DAYS
-            end_14d = today.replace(hour=0, minute=0, second=0, microsecond=0)
-            start_14d = end_14d - timedelta(days=window)
-            recent = [r for r in records if start_14d <= r.local() < end_14d]
-            b14 = _bucket_by(recent, lambda _r: "14d", nok)
-            agg_14d = b14.get("14d", AggBucket())
-            if agg_14d.cost > 0:
-                projected_14d = agg_14d.cost / window * days_in_month
-                projected_14d_nok = (agg_14d.cost_nok / window) * days_in_month if nok.enabled else 0.0
-                _summary_row(
-                    table, f"PROJ {window}d" if narrow else "PROJECTED", projected_14d,
-                    narrow=narrow, nok=nok,
-                    nok_cost=projected_14d_nok, nok_estimated=agg_14d.nok_estimated,
-                    note=_flex_cell(f"Last {window} days avg"),
-                    label_style="dim bold italic",
-                )
+        _add_projection_rows(table, projection, narrow=narrow, nok=nok)
 
     _print_report(table)
 
 
-def report_project(records: list[UsageRecord], limit: int | None = 20, *, nok: NokCtx) -> None:
-    narrow = _is_narrow()
-    buckets = _bucket_by(records, lambda r: r.project, nok)
+def _add_projection_rows(
+    table: Table, proj: "aggregate.MonthProjection", *, narrow: bool, nok: NokCtx,
+) -> None:
+    """Append the monthly report's two PROJECTED lines.
 
-    sorted_projects = sorted(buckets, key=lambda p: buckets[p].cost, reverse=True)
-    if limit and len(sorted_projects) > limit:
-        shown = f"top {limit} of {len(sorted_projects)}"
-        sorted_projects = sorted_projects[:limit]
-    else:
-        shown = str(len(sorted_projects))
+    Both are absent on the last day of the month, where the section separator
+    above is all that is left of the block.
+    """
+    if proj.month_to_date is None:
+        return
+    _summary_row(
+        table, "PROJ" if narrow else "PROJECTED", proj.month_to_date.cost,
+        narrow=narrow, nok=nok,
+        nok_cost=proj.month_to_date.cost_nok, nok_estimated=proj.month_to_date.nok_estimated,
+        note=f"({proj.days_elapsed}/{proj.days_in_month} days in {proj.month_name})",
+        label_style="dim bold italic",
+    )
+    if proj.trailing is not None:
+        _summary_row(
+            table, f"PROJ {proj.window_days}d" if narrow else "PROJECTED", proj.trailing.cost,
+            narrow=narrow, nok=nok,
+            nok_cost=proj.trailing.cost_nok, nok_estimated=proj.trailing.nok_estimated,
+            note=_flex_cell(f"Last {proj.window_days} days avg"),
+            label_style="dim bold italic",
+        )
+
+
+def report_project(records: list[UsageRecord], limit: int | None = 20, *, nok: NokCtx) -> None:
+    render_project(aggregate.project_rows(records, nok, limit=limit), limit, nok=nok)
+
+
+def render_project(report: ReportRows, limit: int | None = 20, *, nok: NokCtx) -> None:
+    """Draw the project table. *limit* only decides what the title claims."""
+    narrow = _is_narrow()
 
     table = _make_report_table(
-        f"Projects ({shown})", "Project",
+        f"Projects ({_shown_label(report, limit)})", "Project",
         narrow=narrow, compact=True, label_style="magenta", nok=nok,
     )
 
-    total_cost = sum(buckets[p].cost for p in sorted_projects)
-    total_agg = AggBucket()
-    for proj in sorted_projects:
-        b = buckets[proj]
-        row = [proj, *_token_row(b, total_cost, compact=True, narrow=narrow, nok=nok)]
+    total_cost = report.total.cost
+    for row in report.rows:
+        cells = [row.key, *_token_row(row.agg, total_cost, compact=True, narrow=narrow, nok=nok)]
         if not narrow:
-            row.append(_models_cell(b.models))
-        table.add_row(*row)
-        total_agg += b
+            cells.append(_models_cell(row.agg.models))
+        table.add_row(*cells)
 
-    _add_summary_rows(table, total_agg, len(sorted_projects), narrow=narrow, compact=True,
-                      avg_label=f"per project (top {len(sorted_projects)})", nok=nok)
+    _add_summary_rows(table, report.total, len(report.rows), narrow=narrow, compact=True,
+                      avg_label=f"per project (top {len(report.rows)})", nok=nok)
     # Average across ALL projects
-    all_n = len(buckets)
-    all_any_est = any(b.nok_estimated for b in buckets.values()) if nok.enabled else False
+    all_n = report.n_all
+    all_any_est = report.all_total.nok_estimated if nok.enabled else False
     if all_n > 1:
-        all_cost = sum(b.cost for b in buckets.values())
-        all_nok = sum(b.cost_nok for b in buckets.values())
         _summary_row(
-            table, "AVG" if narrow else "AVERAGE", all_cost / all_n,
+            table, "AVG" if narrow else "AVERAGE", report.all_total.cost / all_n,
             narrow=narrow, nok=nok,
-            nok_cost=all_nok / all_n if nok.enabled else 0.0, nok_estimated=all_any_est,
+            nok_cost=report.all_total.cost_nok / all_n if nok.enabled else 0.0,
+            nok_estimated=all_any_est,
             after=(f"all {all_n}", "") if narrow else ("", ""),
             note=_flex_cell(f"per project (all {all_n})"),
         )
@@ -1583,67 +1303,39 @@ def report_account(records: list[UsageRecord], *, nok: NokCtx) -> None:
     No --limit knob, unlike the project report: an account is a login, so a
     machine has two or three and there is nothing to cut off.
     """
+    render_account(aggregate.account_rows(records, nok), nok=nok)
+
+
+def render_account(report: ReportRows, *, nok: NokCtx) -> None:
+    """Draw the account table from rows that are already aggregated."""
     narrow = _is_narrow()
-    buckets = _bucket_by(records, lambda r: r.account, nok)
-    sorted_accounts = sorted(buckets, key=lambda a: buckets[a].cost, reverse=True)
 
     table = _make_report_table(
-        f"Accounts ({len(sorted_accounts)})", "Account",
+        f"Accounts ({report.n_all})", "Account",
         narrow=narrow, compact=True, label_style="green", nok=nok,
     )
 
-    total_cost = sum(buckets[a].cost for a in sorted_accounts)
-    total_agg = AggBucket()
-    for account in sorted_accounts:
-        b = buckets[account]
-        row = [account, *_token_row(b, total_cost, compact=True, narrow=narrow, nok=nok)]
+    total_cost = report.total.cost
+    for row in report.rows:
+        cells = [row.key, *_token_row(row.agg, total_cost, compact=True, narrow=narrow, nok=nok)]
         if not narrow:
-            row.append(_models_cell(b.models))
-        table.add_row(*row)
-        total_agg += b
+            cells.append(_models_cell(row.agg.models))
+        table.add_row(*cells)
 
-    _add_summary_rows(table, total_agg, len(sorted_accounts), narrow=narrow,
+    _add_summary_rows(table, report.total, report.n_all, narrow=narrow,
                       compact=True, avg_label="per account", nok=nok)
 
     _print_report(table)
 
 
-def _accounts_worth_showing(records: list[UsageRecord]) -> bool:
-    """Whether the default run should append the per-account table.
-
-    Two or more real accounts means the split says something no other table
-    does. One says only what the TOTAL row of every other table already said,
-    and none says less than that. UNKNOWN_ACCOUNT does not count towards the
-    two: a single account beside its own pre-capture history is one account's
-    costs drawn twice, and `ccreport adopt` exists to merge exactly that pair.
-
-    Only about what an unasked-for run volunteers — `ccreport account` prints
-    regardless, which is where someone goes to see the unknown split.
-    """
-    return len({r.account for r in records if r.account != UNKNOWN_ACCOUNT}) > 1
-
-
 def report_session(records: list[UsageRecord], limit: int | None = 20, *, nok: NokCtx) -> None:
+    render_session(aggregate.session_rows(records, nok, limit=limit), limit, nok=nok)
+
+
+def render_session(report: ReportRows, limit: int | None = 20, *, nok: NokCtx) -> None:
+    """Draw the session table. *limit* only decides what the title claims."""
     narrow = _is_narrow()
-    buckets = _bucket_by(records, lambda r: r.session_id, nok)
-    session_meta: dict[str, dict] = {}
-
-    for rec in records:
-        sid = rec.session_id
-        meta = session_meta.setdefault(
-            sid, {"project": rec.project, "first": rec.timestamp, "last": rec.timestamp},
-        )
-        meta["first"] = min(meta["first"], rec.timestamp)
-        meta["last"] = max(meta["last"], rec.timestamp)
-
-    sorted_sessions = sorted(buckets, key=lambda s: buckets[s].cost, reverse=True)
-    if limit:
-        sorted_sessions = sorted_sessions[:limit]
-
-    if limit and len(buckets) > limit:
-        shown = f"top {limit} of {len(buckets)}"
-    else:
-        shown = str(len(buckets))
+    shown = _shown_label(report, limit)
 
     table = Table(
         title=f"Sessions ({shown})", title_style="bold", box=box.ROUNDED,
@@ -1661,16 +1353,16 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, *, nok: N
         _add_token_columns(table, compact=True, nok=nok)
         table.add_column("Models", style="dim")
 
-    total_cost = sum(buckets[s].cost for s in sorted_sessions)
-    total_agg = AggBucket()
-    for sid in sorted_sessions:
-        b = buckets[sid]
-        meta = session_meta[sid]
+    total_cost = report.total.cost
+    total_agg = report.total
+    for row in report.rows:
+        sid, b, last = row.key, row.agg, row.last
+        assert last is not None  # noqa: S101 - session_rows sets it for every row
         cost_text = Text(fmt_cost(b.cost), style=cost_style(b.cost))
         if narrow:
             cells = [
-                meta["project"],
-                meta["last"].astimezone().strftime("%m-%d %H:%M"),
+                row.project,
+                last.astimezone().strftime("%m-%d %H:%M"),
                 cost_text,
             ]
             if nok.enabled:
@@ -1682,8 +1374,8 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, *, nok: N
             models_str = _models_cell(b.models)
             cells = [
                 short_sid,
-                meta["project"],
-                meta["last"].astimezone().strftime("%Y-%m-%d %H:%M"),
+                row.project,
+                last.astimezone().strftime("%Y-%m-%d %H:%M"),
                 fmt_tokens(b.tokens.input),
                 fmt_tokens(b.tokens.output),
                 fmt_tokens(b.tokens.total),
@@ -1697,7 +1389,6 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, *, nok: N
                 models_str,
             ]
             table.add_row(*cells)
-        total_agg += b
 
     table.add_section()
     total_cost_text = Text(fmt_cost(total_agg.cost), style=cost_style(total_agg.cost))
@@ -1725,7 +1416,7 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, *, nok: N
             cells.append(Text(fmt_nok(total_agg.cost_nok, total_agg.nok_estimated), style="bold cyan"))
         cells += ["", str(total_agg.count), ""]
         table.add_row(*cells, style="bold")
-    n = len(sorted_sessions)
+    n = len(report.rows)
     if n > 1:
         _summary_row(
             table, "AVG" if narrow else "AVERAGE", total_agg.cost / n,
@@ -1735,15 +1426,14 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, *, nok: N
             lead=("",), note=_flex_cell(f"per session (top {n})"),
         )
     # Average across ALL sessions
-    all_n = len(buckets)
-    all_any_est = any(b.nok_estimated for b in buckets.values()) if nok.enabled else False
+    all_n = report.n_all
+    all_any_est = report.all_total.nok_estimated if nok.enabled else False
     if all_n > 1:
-        all_cost = sum(b.cost for b in buckets.values())
-        all_nok = sum(b.cost_nok for b in buckets.values())
         _summary_row(
-            table, "AVG" if narrow else "AVERAGE", all_cost / all_n,
+            table, "AVG" if narrow else "AVERAGE", report.all_total.cost / all_n,
             narrow=narrow, nok=nok,
-            nok_cost=all_nok / all_n if nok.enabled else 0.0, nok_estimated=all_any_est,
+            nok_cost=report.all_total.cost_nok / all_n if nok.enabled else 0.0,
+            nok_estimated=all_any_est,
             lead=(f"all {all_n}",) if narrow else ("",),
             note=_flex_cell(f"per session (all {all_n})"),
         )
@@ -1794,6 +1484,342 @@ def report_json(records: list[UsageRecord], *, nok: NokCtx) -> None:
         out.write(",\n" if i else "\n")
         out.write("  " + json.dumps(_json_entry(rec, nok), indent=2).replace("\n", "\n  "))
     out.write("\n]\n" if records else "]\n")
+
+
+_REMOTE_KINDS = {
+    "daily": "day", "monthly": "month",
+    "project": "project", "session": "session", "account": "account",
+}
+"""Subcommand name → the report kind the server answers under."""
+
+
+def _remote_filters(args) -> dict:
+    """The query a merged report is asked with, from the flags already parsed."""
+    return {
+        "since": getattr(args, "since", None),
+        "until": getattr(args, "until", None),
+        "project": getattr(args, "project", None),
+        "account": getattr(args, "account", None),
+        "machine": getattr(args, "machine", None),
+    }
+
+
+def _render_remote_report(payload: dict, kind: str, limit: int | None) -> None:
+    """Draw one server-computed report through the local builders."""
+    report = aggregate.rows_from_json(payload)
+    nok = aggregate.display_nok(
+        enabled=payload.get("nok", {}).get("enabled", False),
+        mva=payload.get("nok", {}).get("label") != "NOK",
+    )
+    if kind == "day":
+        render_daily(report, nok=nok)
+    elif kind == "month":
+        render_monthly(
+            report, aggregate.month_projection_from_json(payload.get("projection")), nok=nok,
+        )
+    elif kind == "project":
+        render_project(report, limit, nok=nok)
+    elif kind == "session":
+        render_session(report, limit, nok=nok)
+    else:
+        render_account(report, nok=nok)
+
+
+def cmd_server_report(args) -> None:
+    """Render `ccreport --server URL <report>` and nothing from the local cache.
+
+    An unreachable server exits non-zero after printing the URL it tried. It
+    deliberately does not fall back: a merged report and a single-machine
+    report differ by exactly the thing being asked for, so the quiet answer
+    would be the wrong one.
+    """
+    from ccreport.remote import RemoteError, fetch_report
+
+    kinds = ([_REMOTE_KINDS[args.command]] if args.command in _REMOTE_KINDS
+             else ["day", "month", "project", "session", "account"])
+    limit = getattr(args, "limit", None) or None
+    filters = _remote_filters(args)
+    try:
+        payloads = [
+            fetch_report(
+                args.server, kind, **filters,
+                limit=limit if kind in ("project", "session") else None,
+                breakdown=getattr(args, "breakdown", False) or getattr(args, "models", False),
+            )
+            for kind in kinds
+        ]
+    except RemoteError as exc:
+        print(f"ccreport: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if getattr(args, "json", False):
+        print(json.dumps(payloads if len(payloads) > 1 else payloads[0], indent=2))
+        return
+    for kind, payload in zip(kinds, payloads, strict=True):
+        _render_remote_report(payload, kind, limit)
+
+
+def _forecast_row(label: str, projection) -> str:
+    """One horizon as a line: what it ends at, and against what.
+
+    Display only. An account with no ceiling shows the projection alone, which
+    is the whole answer for someone who never set one.
+    """
+    body = f"  {label:<14} {fmt_cost(projection.projected)}"
+    body += f" projected, {fmt_cost(projection.spent)} so far"
+    body += f" ({projection.elapsed:.0f}/{projection.total:.0f} days)"
+    if projection.ceiling:
+        share = (projection.share or 0) * 100
+        body += f" — {share:.0f}% of {fmt_cost(projection.ceiling)}"
+    return body
+
+
+def cmd_budget(args) -> None:
+    """Set, clear or list the per-account spend ceilings, with the projections.
+
+    Personal and work are separate money, so the ceiling is per account rather
+    than per machine. Nothing here notifies or changes colour: the number is
+    what was asked for.
+    """
+    from ccreport import forecast
+
+    now_local = datetime.now().astimezone()
+    if getattr(args, "budget_command", None) == "set":
+        cache_db.save_budget(args.account, args.amount, args.renewal_day, time.time())
+        console.print(f"Budget for [bold]{args.account}[/bold] saved.")
+        return
+    if getattr(args, "budget_command", None) == "clear":
+        if not cache_db.clear_budget(args.account):
+            print(f"ccreport: no budget set for {args.account!r}.", file=sys.stderr)
+            sys.exit(1)
+        console.print(f"Budget for [bold]{args.account}[/bold] cleared.")
+        return
+
+    budgets = cache_db.load_budgets()
+    # Two months back, so the billing period the renewal day anchors is whole
+    # however late in the month it falls. Through load_all_records like every
+    # report, so the dedup, the merge rules and the account stamping are the
+    # ones the tables already agree on.
+    by_account = forecast.daily_costs(
+        load_all_records(since=now_local - timedelta(days=70)),
+    )
+    if not by_account:
+        console.print("No records in the last 70 days to project from.")
+        return
+    for account in sorted(by_account, key=lambda a: -sum(by_account[a].values())):
+        ceiling, renewal_day = budgets.get(account, (None, None))
+        console.print(f"[bold green]{account}[/bold green]")
+        costs = by_account[account]
+        month = forecast.month_forecast(costs, now_local, ceiling)
+        console.print(_forecast_row("calendar month", month) if month
+                      else "  calendar month  too few active days to project")
+        if renewal_day:
+            billing = forecast.billing_forecast(costs, now_local, renewal_day, ceiling)
+            console.print(_forecast_row(f"billing (d{renewal_day})", billing) if billing
+                          else f"  billing (d{renewal_day})  too few active days to project")
+        for line in _window_forecast_lines():
+            console.print(line)
+
+
+def _window_forecast_lines() -> list[str]:
+    """The session and week windows as projected cost, from the usage row.
+
+    Read from the cached usage row rather than recomputed: the status line has
+    already priced both windows against the bounds it tracks, and pricing them
+    a second time here could only disagree with the line on screen.
+    """
+    from ccreport import forecast
+    from ccreport.pricing import SESSION_WINDOW_S, WEEK_WINDOW_S, window_start_epoch
+
+    row = cache_db.read_usage_cache() or {}
+    now = time.time()
+    lines = []
+    for name, cost_key, reset_key, span in (
+        ("session window", "session_window_cost", "session_reset", SESSION_WINDOW_S),
+        ("week window", "week_cost", "week_reset", WEEK_WINDOW_S),
+    ):
+        start = window_start_epoch(str(row.get(reset_key) or ""), span, now)
+        if start is None:
+            continue
+        projection = forecast.window_forecast(
+            name, float(row.get(cost_key) or 0.0), start, span, now,
+        )
+        if projection:
+            lines.append(
+                f"  {name:<14} {fmt_cost(projection.projected)} projected, "
+                f"{fmt_cost(projection.spent)} so far",
+            )
+    return lines
+
+
+def _resolved_projects(names: Sequence[str]) -> list[str]:
+    """Project names as this machine's merge rules group them.
+
+    An alias in --opt-in-repos has to match the name a record actually carries
+    after `ccreport merge` has had its say, or a project would be opted in
+    under a name no record ever uses and quietly stay redacted.
+    """
+    override = _build_override_fn()
+    return sorted({override(None, None, name.strip()) if override else name.strip()
+                   for name in names if name.strip()})
+
+
+def _config_dir_is_shared(path: Path) -> bool:
+    """Whether anyone but the owner can write the directory holding the token."""
+    parent = path.parent
+    if not parent.exists():
+        return False
+    return bool(parent.stat().st_mode & 0o022)
+
+
+def cmd_server_connect(args) -> None:
+    """Write this machine's entry for one server, after proving the token works.
+
+    The token is checked against /v1/health first, so a mistyped one fails here
+    rather than silently at a background push half an hour later.
+    """
+    from ccreport import push
+    from ccreport.remote import RemoteError, fetch_health
+
+    path = Path(args.config or push.CONFIG_PATH)
+    if _config_dir_is_shared(path):
+        print(f"ccreport: {path.parent} is group- or world-writable; "
+              f"chmod 700 it before storing a token there.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        health = fetch_health(args.url, args.token)
+    except RemoteError as exc:
+        print(f"ccreport: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    existing = push.read_raw(path).get(args.url, {})
+    fields: dict[str, Any] = {
+        "token": args.token,
+        "label": health.get("label") or os.uname().nodename,
+        "machine_id": health.get("machine_id") or "",
+    }
+    if args.opt_in_repos is not None:
+        fields["restricted"] = True
+        fields["allow"] = _resolved_projects(args.opt_in_repos.split(","))
+        # Generated once and kept: regenerating it would re-pseudonymize every
+        # project already on the server, so the old rows would never merge with
+        # the new ones.
+        fields["salt"] = existing.get("salt") or push.new_salt()
+    if args.only_on_network is not None:
+        fields["networks"] = [
+            cidr.strip() for cidr in args.only_on_network.split(",") if cidr.strip()
+        ]
+    push.write_server(path, args.url, fields)
+    console.print(
+        f"Connected to [bold]{args.url}[/bold] as "
+        f"[bold]{fields['label']}[/bold] ({fields['machine_id']}).",
+    )
+    console.print(f"Wrote {path} (mode 0600).")
+    if fields.get("restricted"):
+        allowed = ", ".join(fields["allow"]) or "nothing"
+        console.print(f"Restricted: only {allowed} will be identified by name.")
+
+
+def cmd_server_allow(args) -> None:
+    """Add or remove a project from a server's allow list, and force the re-push.
+
+    The re-push is not optional: the files that named a project are closed logs
+    that will never change again, so nothing else would take the name back off
+    the server.
+    """
+    from ccreport import push
+
+    path = Path(args.config or push.CONFIG_PATH)
+    entries = push.read_raw(path)
+    if args.url not in entries:
+        print(f"ccreport: {args.url} is not in {path}.", file=sys.stderr)
+        sys.exit(1)
+    current = list(entries[args.url].get("allow") or ())
+    resolved = _resolved_projects([args.project])
+    if args.command == "allow":
+        updated = sorted(set(current) | set(resolved))
+    else:
+        updated = sorted(set(current) - set(resolved))
+    push.write_server(path, args.url, {"allow": updated})
+    cache_db.clear_push_state(args.url)
+    console.print(f"{args.url}: now identifying {', '.join(updated) or 'nothing'}.")
+    console.print("The watermark was cleared; the next push re-sends everything.")
+
+
+def cmd_server_status(args) -> None:
+    """Print what each configured server knows this machine as, and under what policy."""
+    from ccreport import push
+    from ccreport.remote import RemoteError, fetch_health
+
+    path = Path(args.config or push.CONFIG_PATH)
+    servers = push.load_config(path)
+    if not servers:
+        console.print(f"No {path} — run `ccreport server connect <url> --token ...` first.")
+        return
+    for server in servers:
+        console.print(f"[bold]{server.url}[/bold]")
+        try:
+            health = fetch_health(server.url, server.token)
+            known_as = f"{health.get('label')} ({health.get('machine_id')})"
+            holding = f"{health.get('records', 0)} records"
+        except RemoteError as exc:
+            known_as, holding = "unreachable", str(exc)
+        console.print(f"  known as     {known_as}")
+        console.print(f"  holding      {holding}")
+        console.print(f"  restricted   {'yes' if server.restricted else 'no'}")
+        if server.restricted:
+            console.print(f"  identifying  {', '.join(server.allow) or 'nothing'}")
+        console.print(f"  network gate {', '.join(server.networks) or 'none'}")
+        if server.networks and not push.on_allowed_network(server.networks):
+            console.print("               [yellow]off-network: pushes are held[/yellow]")
+        attempt, failures, stopped = cache_db.read_push_attempt(server.url)
+        if stopped:
+            console.print("  last push    [red]stopped: the token was refused[/red]")
+        elif attempt:
+            console.print(f"  last push    {_fmt_epoch(attempt)}"
+                          f"{f', {failures} failures since' if failures else ''}")
+        else:
+            console.print("  last push    never")
+
+
+def cmd_push(args) -> None:
+    """Send this machine's records to every configured server, and say what happened.
+
+    Manual, so it ignores the interval the detached spawn respects — someone
+    who typed this is watching, and waiting out a backoff they cannot see is
+    the one thing that would make the command look broken.
+    """
+    from ccreport import push
+
+    if not push.configured():
+        print(f"No {push.CONFIG_PATH} — run `ccreport server connect <url> --token ...` first.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    results = push.run_once(full=args.full, only=args.server, force=True)
+    if not results:
+        print(f"No server matched {args.server!r}.", file=sys.stderr)
+        sys.exit(1)
+    failed = False
+    for result in results:
+        if result.blocked:
+            # Named, not silent: a work laptop that pushes nothing all week
+            # looks broken unless it says which network it was waiting for.
+            console.print(
+                f"[bold]{result.server}[/bold]: skipped, this machine holds no address in "
+                f"{', '.join(result.blocked_by)}",
+            )
+            continue
+        console.print(
+            f"[bold]{result.server}[/bold]: {len(result.accepted)} sent, "
+            f"{len(result.skipped)} unchanged, {len(result.rejected)} rejected "
+            f"({result.records} records)",
+        )
+        for path, detail in result.rejected:
+            failed = True
+            console.print(f"  [red]rejected[/red] {path or '(the request)'}: {detail}")
+    if failed:
+        sys.exit(1)
 
 
 def parse_date(s: str) -> datetime:
@@ -2862,7 +2888,12 @@ def main() -> None:
                "  ccreport adopt            # claim pre-capture history\n"
                "  ccreport limits -w session\n"
                "  ccreport update           # is master ahead of this checkout?\n"
-               "  ccreport migrate --dry-run\n",
+               "  ccreport migrate --dry-run\n"
+               "  ccreport --server https://ccreport.example.net monthly\n"
+               "  ccreport push            # send this machine's records\n"
+               "  ccreport server connect https://ccreport.example.net --token ...\n"
+               "  ccreport server status\n"
+               "  ccreport budget          # spend forecast per account\n",
     )
     sub = parser.add_subparsers(dest="command", help="Report type")
 
@@ -2875,6 +2906,14 @@ def main() -> None:
         p.add_argument("--account", "-a", help="Filter by account email (substring match)")
         p.add_argument("--json", "-j", action="store_true", help="Output as JSON")
         p.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
+        # SUPPRESS, not None: a subparser argument with a default overwrites
+        # whatever the top-level parser already put on the namespace, so
+        # `ccreport --server URL daily` would lose the URL to this line's
+        # default. Suppressed, the attribute is only set when the flag is given.
+        p.add_argument("--server", default=argparse.SUPPRESS,
+                       help="Render the merged report from this ccreport server")
+        p.add_argument("--machine", default=argparse.SUPPRESS,
+                       help="With --server: only this machine's records")
         if name == "daily":
             p.add_argument("--breakdown", "-b", "-m", action="store_true",
                            help="Show per-model breakdown")
@@ -2915,6 +2954,46 @@ def main() -> None:
     pup.add_argument("--pull", action="store_true",
                      help="Fast-forward the checkout when it is behind")
 
+    # Per-account spend ceilings, and the projections measured against them.
+    pb = sub.add_parser("budget", help="Per-account spend ceilings and the spend forecast")
+    budget_sub = pb.add_subparsers(dest="budget_command")
+    pbs = budget_sub.add_parser("set", help="Set an account's ceiling or renewal day")
+    pbs.add_argument("account", help="The account label, as the reports spell it")
+    pbs.add_argument("amount", type=float, nargs="?", help="Ceiling in USD")
+    pbs.add_argument("--renewal-day", type=int,
+                     help="Day of month the subscription renews; the usage API carries none")
+    pbc = budget_sub.add_parser("clear", help="Forget an account's ceiling")
+    pbc.add_argument("account", help="The account label")
+
+    # Configuring which servers this machine pushes to, and under what policy.
+    ps = sub.add_parser("server", help="Configure the ccreport servers this machine pushes to")
+    server_sub = ps.add_subparsers(dest="server_command")
+    for name, helptext in (
+        ("connect", "Set up this machine against a server"),
+        ("allow", "Identify one more project by name"),
+        ("deny", "Stop identifying a project by name"),
+        ("status", "What each server knows this machine as"),
+    ):
+        sp = server_sub.add_parser(name, help=helptext)
+        sp.add_argument("--config", help="Write somewhere other than ~/.config/ccreport/push.toml")
+        if name == "connect":
+            sp.add_argument("url", help="The server's base URL")
+            sp.add_argument("--token", required=True, help="The token the web UI minted")
+            sp.add_argument("--opt-in-repos", metavar="NAMES",
+                            help="Comma-separated projects to identify by name; sets restricted. "
+                                 "An empty list identifies nothing, which is a work-laptop state")
+            sp.add_argument("--only-on-network", metavar="CIDRS",
+                            help="Comma-separated CIDRs this machine must be inside to push")
+        if name in ("allow", "deny"):
+            sp.add_argument("url", help="The server URL, as push.toml spells it")
+            sp.add_argument("project", help="The project name, before or after a merge rule")
+
+    # Send this machine's records to the servers push.toml names.
+    pp = sub.add_parser("push", help="Push this machine's records to a ccreport server")
+    pp.add_argument("--server", help="Only this server URL, as push.toml spells it")
+    pp.add_argument("--full", action="store_true",
+                    help="Forget the watermark and offer every file again")
+
     # Rate-limit utilization history, from the statusline's samples.
     pl = sub.add_parser("limits", help="Rate-limit window utilization history")
     pl.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
@@ -2932,6 +3011,8 @@ def main() -> None:
     parser.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
     parser.add_argument("--models", "-m", action="store_true",
                         help="Show per-model breakdown rows in the daily table")
+    parser.add_argument("--server", help="Render the merged reports from this ccreport server")
+    parser.add_argument("--machine", help="With --server: only this machine's records")
 
     args = parser.parse_args()
 
@@ -2961,6 +3042,31 @@ def main() -> None:
     # to the report path, which would want a report to print.
     if args.command == "adopt":
         cmd_adopt(args)
+        return
+    # Reads the record cache and the usage row; it prints no report table.
+    if args.command == "budget":
+        cmd_budget(args)
+        return
+    # Reads the cache and writes only a watermark; it has no report to print.
+    if args.command == "push":
+        cmd_push(args)
+        return
+    # Config only: writes push.toml and, for allow and deny, clears a watermark.
+    if args.command == "server":
+        if args.server_command == "connect":
+            cmd_server_connect(args)
+        elif args.server_command in ("allow", "deny"):
+            args.command = args.server_command
+            cmd_server_allow(args)
+        else:
+            cmd_server_status(args)
+        return
+
+    # Every branch below reads this machine's cache. --server reads somebody
+    # else's merged one instead and never touches ours, so it turns off here
+    # rather than inside the report path.
+    if getattr(args, "server", None):
+        cmd_server_report(args)
         return
 
     mva = not args.no_mva

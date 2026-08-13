@@ -15,10 +15,36 @@ import threading
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from ccreport import cache_db
+
+
+class RateStore(Protocol):
+    """Where fetched rates are kept: two calls, both keyed by ISO date."""
+
+    def get_exchange_rates(self, since_date: str) -> dict[str, float]: ...
+
+    def save_exchange_rates(self, rates: dict[str, float]) -> None: ...
+
+
+_store: RateStore = cache_db
+"""The client cache, until a server says otherwise.
+
+The walk-back, the plausibility band and the negative cache below are the same
+wherever the rows land, and the ccreport server converts every client's records
+to NOK against its own database rather than against whichever client cache the
+operator's machine happens to hold. One indirection here is what keeps that
+from becoming a second copy of this module.
+"""
+
+
+def use_rate_store(store: RateStore) -> None:
+    """Point the cache at *store* for the rest of this process."""
+    global _store
+    _store = store
+
 
 OSLO_TZ = ZoneInfo("Europe/Oslo")
 # How far get_rate may walk back from a record's date for a rate, and with it
@@ -144,10 +170,22 @@ def _read_cached(since: date) -> tuple[dict[str, float], set[str]]:
     everything downstream wants them apart, and nothing but this function may
     hand a _NO_OBSERVATION row on as if it were a rate.
     """
-    rows = cache_db.get_exchange_rates(since.isoformat())
+    rows = _store.get_exchange_rates(since.isoformat())
     rates = {d: r for d, r in rows.items() if r != _NO_OBSERVATION}
     gaps = {d for d, r in rows.items() if r == _NO_OBSERVATION}
     return rates, gaps
+
+
+def read_rates_since(since: date) -> dict[str, float]:
+    """Every usable cached rate a lookup from *since* on could reach.
+
+    For a reader that converts out of the store without fetching — the server,
+    which has the rates its pushes warmed and no business calling Norges Bank
+    while rendering someone's report. The walk-back allowance is included, so a
+    date at the start of the range still resolves back to the Friday before it.
+    """
+    rates, _gaps = _read_cached(since - timedelta(days=_MAX_WALKBACK_DAYS))
+    return rates
 
 
 def _load_cached_rates(dates: set[date]) -> tuple[dict[str, float], set[str]]:
@@ -190,7 +228,7 @@ def _record_fetch(
         if _is_business_day(d) and key not in rates and key not in rejected:
             gaps[key] = _NO_OBSERVATION
         d += timedelta(days=1)
-    cache_db.save_exchange_rates({**rates, **gaps})
+    _store.save_exchange_rates({**rates, **gaps})
     return rates, set(gaps)
 
 

@@ -986,6 +986,82 @@ def _render_update(now: float) -> str:
             f"{SUBDUED} 'ccreport update --pull' {RST}\033[0;33mto update{RST}")
 
 
+def _render_burn(now: float) -> str:
+    """Where the session and week windows land at the rate they are filling.
+
+    Off by default: it is a second opinion on the same two bars the line
+    already carries, and most renders have nothing to say — the samples come
+    from this file's own slow path, so a window nobody has worked through has
+    no slope to fit.
+
+    Slow path only, and no fetch: it reads the snapshots this render is about
+    to append to. burn.py is imported here rather than at module level, on the
+    same terms as everything else a render only sometimes needs.
+    """
+    if not _on("BURN", default=False):
+        return ""
+    try:
+        from ccreport import burn, cache_db
+
+        samples = cache_db.load_rate_limit_snapshots()
+    except Exception:  # noqa: BLE001 — a busy database costs the segment, not the render
+        return ""
+    parts = []
+    for window, label in (("session", "S"), ("week", "W")):
+        projection = burn.project(burn.current_instance(samples, window, now), now)
+        if projection is None or projection.exhausts_at is None:
+            continue
+        left = burn.span(projection.exhausts_at - now)
+        parts.append(f"{label} full in {left}")
+    return f"{SUBDUED}{' · '.join(parts)}{RST}" if parts else ""
+
+
+_PUSH_CONFIG = Path.home() / ".config" / "ccreport" / "push.toml"
+"""Where `ccreport server connect` writes the machine's servers and tokens.
+
+Spelled here rather than imported from push.py, which imports sqlite3 and the
+account timeline: this file's whole job on the render path is one stat.
+"""
+
+
+def _spawn_push(now: float) -> None:
+    """Start the detached push, if the machine has a server and is due one.
+
+    Two gates before anything is spawned. No push.toml means the machine has
+    not opted in and nothing runs at all — one stat, on the slow path only. And
+    one meta key says when the next attempt is allowed, which the child writes
+    on every outcome, failure included: an unreachable server then costs one
+    process per interval rather than one per render.
+
+    That key is the whole of what this knows. How far the interval widens after
+    a failure, and which servers are due, are push.py's business — and push.py
+    is deliberately not imported here, since it brings sqlite3, the account
+    timeline and the override rules with it.
+    """
+    if not _on("PUSH") or not _PUSH_CONFIG.exists():
+        return
+    try:
+        from ccreport import cache_db
+
+        if now < cache_db.read_push_next_attempt():
+            return
+    except Exception:  # noqa: BLE001 — a busy database costs the push, not the render
+        return
+
+    import subprocess
+
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "ccreport.push"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=_refresh_env(),
+        )
+    except OSError:
+        pass
+
+
 # --- Rate limit history capture ---
 
 
@@ -2021,6 +2097,7 @@ def _layout_and_print(
     now_epoch: float,
     _t_start: float,
     force_red: bool = False,
+    burn: str = "",
 ) -> None:
     """Assemble rendered sections into adaptive layout and print."""
     # Show failure/stale indicator when usage is empty or outdated
@@ -2097,7 +2174,9 @@ def _layout_and_print(
             lines.append(DOT.join(rest))
 
     # One insertion point for both layouts: the cost windows close whichever
-    # line they are on in each, so this lands directly under them either way.
+    # line they are on in each, so these land directly under them either way.
+    if burn:
+        lines.append(burn)
     if update:
         lines.append(update)
 
@@ -2133,10 +2212,11 @@ class _Fetched(NamedTuple):
     sessions: str          # rendered badge — a tail of ~/.claude/history.jsonl
     account: str           # rendered segment — the newest account_events row
     update: str            # rendered segment — the stored update check, plus its respawn
+    burn: str = ""         # rendered segment — where the live windows are heading, off by default
 
 # Cache-file layout guard: bump when _Fetched gains, loses or retypes a field,
 # so a render never rebuilds a NamedTuple from a stale shape.
-_FAST_CACHE_SCHEMA = 6
+_FAST_CACHE_SCHEMA = 7
 
 
 def _session_state_path(session_id: str, suffix: str = "") -> Path:
@@ -2234,6 +2314,7 @@ def _load_fetched(session_id: str, cwd: str, now: float) -> tuple[_Fetched, floa
             sessions=f["sessions"],
             account=f["account"],
             update=f["update"],
+            burn=f.get("burn", ""),
         ), ts
     except Exception:  # noqa: BLE001
         return None
@@ -2269,6 +2350,7 @@ def _save_fetched(session_id: str, cwd: str, ts: float, fetched: _Fetched) -> No
                 "sessions": fetched.sessions,
                 "account": fetched.account,
                 "update": fetched.update,
+                "burn": fetched.burn,
             },
         }
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -2351,6 +2433,10 @@ def _fetch_all(
         _snapshot_rate_limits(data, usage_data, now_epoch, test_mode=test_mode)
         sessions_str = _render_sessions(inp.cwd, now_epoch)
         update_str = _render_update(now_epoch)
+        burn_str = _render_burn(now_epoch)
+        # Renders nothing: the merged view is read with `ccreport --server`,
+        # not from here. It rides the slow path for the interval gate alone.
+        _spawn_push(now_epoch)
 
         # Cache stats and the session cost. Neither depends on a git result, so
         # both belong on this side of the join: the render costs the longer of
@@ -2414,6 +2500,7 @@ def _fetch_all(
         sessions=sessions_str,
         account=account_str,
         update=update_str,
+        burn=burn_str,
     )
 
 
@@ -2535,6 +2622,7 @@ def main() -> None:
         top, session, usage_session_rl, usage_rl, usage_cost,
         usage_data, fetched.account, battery_str, fetched.sessions, fetched.update,
         now_epoch, _t_start,
+        burn=fetched.burn,
         force_red=_on("RED", default=False)
         or (_on("HAIKU_RED") and "haiku" in inp.model.lower()),
     )
