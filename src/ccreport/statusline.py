@@ -986,36 +986,6 @@ def _render_update(now: float) -> str:
             f"{SUBDUED} 'ccreport update --pull' {RST}\033[0;33mto update{RST}")
 
 
-def _render_burn(now: float) -> str:
-    """Where the session and week windows land at the rate they are filling.
-
-    Off by default: it is a second opinion on the same two bars the line
-    already carries, and most renders have nothing to say — the samples come
-    from this file's own slow path, so a window nobody has worked through has
-    no slope to fit.
-
-    Slow path only, and no fetch: it reads the snapshots this render is about
-    to append to. burn.py is imported here rather than at module level, on the
-    same terms as everything else a render only sometimes needs.
-    """
-    if not _on("BURN", default=False):
-        return ""
-    try:
-        from ccreport import burn, cache_db
-
-        samples = cache_db.load_rate_limit_snapshots()
-    except Exception:  # noqa: BLE001 — a busy database costs the segment, not the render
-        return ""
-    parts = []
-    for window, label in (("session", "S"), ("week", "W")):
-        projection = burn.project(burn.current_instance(samples, window, now), now)
-        if projection is None or projection.exhausts_at is None:
-            continue
-        left = burn.span(projection.exhausts_at - now)
-        parts.append(f"{label} full in {left}")
-    return f"{SUBDUED}{' · '.join(parts)}{RST}" if parts else ""
-
-
 _PUSH_CONFIG = Path.home() / ".config" / "ccreport" / "push.toml"
 """Where `ccreport server connect` writes the machine's servers and tokens.
 
@@ -2097,7 +2067,6 @@ def _layout_and_print(
     now_epoch: float,
     _t_start: float,
     force_red: bool = False,
-    burn: str = "",
 ) -> None:
     """Assemble rendered sections into adaptive layout and print."""
     # Show failure/stale indicator when usage is empty or outdated
@@ -2174,9 +2143,7 @@ def _layout_and_print(
             lines.append(DOT.join(rest))
 
     # One insertion point for both layouts: the cost windows close whichever
-    # line they are on in each, so these land directly under them either way.
-    if burn:
-        lines.append(burn)
+    # line they are on in each, so this lands directly under them either way.
     if update:
         lines.append(update)
 
@@ -2212,11 +2179,10 @@ class _Fetched(NamedTuple):
     sessions: str          # rendered badge — a tail of ~/.claude/history.jsonl
     account: str           # rendered segment — the newest account_events row
     update: str            # rendered segment — the stored update check, plus its respawn
-    burn: str = ""         # rendered segment — where the live windows are heading, off by default
 
 # Cache-file layout guard: bump when _Fetched gains, loses or retypes a field,
 # so a render never rebuilds a NamedTuple from a stale shape.
-_FAST_CACHE_SCHEMA = 7
+_FAST_CACHE_SCHEMA = 8
 
 
 def _session_state_path(session_id: str, suffix: str = "") -> Path:
@@ -2314,7 +2280,6 @@ def _load_fetched(session_id: str, cwd: str, now: float) -> tuple[_Fetched, floa
             sessions=f["sessions"],
             account=f["account"],
             update=f["update"],
-            burn=f.get("burn", ""),
         ), ts
     except Exception:  # noqa: BLE001
         return None
@@ -2350,7 +2315,6 @@ def _save_fetched(session_id: str, cwd: str, ts: float, fetched: _Fetched) -> No
                 "sessions": fetched.sessions,
                 "account": fetched.account,
                 "update": fetched.update,
-                "burn": fetched.burn,
             },
         }
         tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -2433,7 +2397,6 @@ def _fetch_all(
         _snapshot_rate_limits(data, usage_data, now_epoch, test_mode=test_mode)
         sessions_str = _render_sessions(inp.cwd, now_epoch)
         update_str = _render_update(now_epoch)
-        burn_str = _render_burn(now_epoch)
         # Renders nothing: the merged view is read with `ccreport --server`,
         # not from here. It rides the slow path for the interval gate alone.
         _spawn_push(now_epoch)
@@ -2500,7 +2463,6 @@ def _fetch_all(
         sessions=sessions_str,
         account=account_str,
         update=update_str,
-        burn=burn_str,
     )
 
 
@@ -2622,7 +2584,6 @@ def main() -> None:
         top, session, usage_session_rl, usage_rl, usage_cost,
         usage_data, fetched.account, battery_str, fetched.sessions, fetched.update,
         now_epoch, _t_start,
-        burn=fetched.burn,
         force_red=_on("RED", default=False)
         or (_on("HAIKU_RED") and "haiku" in inp.model.lower()),
     )

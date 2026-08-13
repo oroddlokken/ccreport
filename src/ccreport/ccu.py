@@ -244,31 +244,6 @@ def pace_line(actual: float, reset_iso: str, now: float) -> str:
     )
 
 
-def burn_line(window: str, now: float, model: str | None = None) -> str:
-    """When this window runs out at the rate it is filling, or nothing.
-
-    Nothing is the common case and the right one: the answer comes from the
-    status line's own samples, so a window nobody worked through has no history
-    to fit, and a flat rate projects to no exhaustion at all.
-    """
-    from ccreport import burn
-    from ccreport.cache_db import load_rate_limit_snapshots
-
-    try:
-        samples = load_rate_limit_snapshots()
-    except Exception:  # noqa: BLE001 - a busy database costs the line, not the run
-        return ""
-    instance = burn.current_instance(samples, window, now, model)
-    projection = burn.project(instance, now)
-    if projection is None:
-        return ""
-    return f"{DIM}{burn.describe(projection, now, lambda ts: _clock(_local(ts)))}{RESET}"
-
-
-def _local(epoch: float) -> datetime:
-    return datetime.fromtimestamp(epoch)  # noqa: DTZ006 - local by design, as reset_line is
-
-
 def section(
     title: str, pct: float, reset_iso: str, now: float, zone: str, extra: str = "",
 ) -> list[str]:
@@ -322,9 +297,6 @@ def render(data: dict[str, Any], now: float, zone: str) -> list[str]:
         "Current session", _num(data, "session_percent") or 0.0,
         _str(data, "session_reset"), now, zone,
     )
-    session_burn = burn_line("session", now)
-    if session_burn:
-        lines.append(session_burn)
 
     week = _num(data, "week_percent")
     if week is not None:
@@ -334,11 +306,6 @@ def render(data: dict[str, Any], now: float, zone: str) -> list[str]:
         pace = pace_line(week, week_reset, now)
         if pace:
             lines.append(pace)
-        # Under the pace line, in the same section as the bar it describes: one
-        # says how the week compares with the clock, the other where it lands.
-        week_burn = burn_line("week", now)
-        if week_burn:
-            lines.append(week_burn)
 
     sonnet = _num(data, "sonnet_percent")
     if sonnet is not None:

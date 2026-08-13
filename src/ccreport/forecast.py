@@ -179,10 +179,6 @@ def window_forecast(
 ) -> WindowForecast | None:
     """Project one rolling window's cost to its reset.
 
-    The money counterpart of burn.py, which projects the quota percentage. The
-    two answer different questions and neither replaces the other: a window can
-    fill on cheap calls or on expensive ones.
-
     None until the window has run long enough to have a rate — a window two
     minutes old projects its first call across five hours.
     """
