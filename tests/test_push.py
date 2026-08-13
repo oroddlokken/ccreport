@@ -264,6 +264,26 @@ class TestWatermarkState:
         cache_db.write_push_attempt(url, 500.0, 3, stopped=True)
         assert cache_db.read_push_attempt(url) == (500.0, 3, True)
 
+    def test_the_outcome_round_trips(self):
+        url = "https://ccr.example.net"
+        assert cache_db.read_push_outcome(url) == (0.0, "")
+        cache_db.write_push_attempt(url, 500.0, 0, succeeded=True)
+        assert cache_db.read_push_outcome(url) == (500.0, "")
+        cache_db.write_push_attempt(url, 900.0, 1, reason="refused")
+        assert cache_db.read_push_outcome(url) == (500.0, "refused")
+
+    def test_a_success_clears_the_previous_reason(self):
+        url = "https://ccr.example.net"
+        cache_db.write_push_attempt(url, 500.0, 1, reason="refused")
+        cache_db.write_push_attempt(url, 900.0, 0, succeeded=True)
+        assert cache_db.read_push_outcome(url) == (900.0, "")
+
+    def test_an_off_network_run_does_not_date_a_push(self):
+        """It sent nothing, so it clears the count without claiming a success."""
+        url = "https://ccr.example.net"
+        cache_db.write_push_attempt(url, 500.0, 0)
+        assert cache_db.read_push_outcome(url)[0] == 0.0
+
 
 class TestAgainstAServer:
     """The whole path, against the real ingest endpoint."""
@@ -384,6 +404,15 @@ class TestRunOnce:
         assert failures == 1
         assert not stopped
 
+    def test_a_failure_keeps_its_reason(self, config_path, monkeypatch):
+        """A count alone cannot tell connection-refused from a 500."""
+        def boom(server, full=False, db_path=None):
+            raise push.PushError("https://ccr.example.net: refused")
+
+        monkeypatch.setattr(push, "push_to", boom)
+        push.run_once(config_path=config_path, force=True)
+        assert cache_db.read_push_outcome("https://ccr.example.net")[1].endswith("refused")
+
     def test_consecutive_failures_accumulate(self, config_path, monkeypatch):
         monkeypatch.setattr(
             push, "push_to",
@@ -402,6 +431,7 @@ class TestRunOnce:
         )
         push.run_once(config_path=config_path, force=True)
         assert cache_db.read_push_attempt(url)[1] == 0
+        assert cache_db.read_push_outcome(url)[0] > 0, "the success is what dates the last push"
 
     def test_a_401_stops_further_attempts(self, config_path, monkeypatch):
         url = "https://ccr.example.net"

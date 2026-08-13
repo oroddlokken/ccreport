@@ -520,6 +520,25 @@ class TestStatusCommand:
         out = self._run(monkeypatch, ["server", "status", "--config", str(path)])
         assert "the token was refused" in out
 
+    def test_a_failed_attempt_is_not_shown_as_a_push(self, tmp_path, monkeypatch, reachable):
+        """The stamp moves on every outcome, so it must not sit under 'last push'."""
+        path = _write_config(tmp_path)
+        cache_db.write_push_attempt(
+            "https://ccr.example.net", 500.0, 1, reason="refused: nothing is listening",
+        )
+        out = self._run(monkeypatch, ["server", "status", "--config", str(path)])
+        assert "last push    never" in out
+        assert "last attempt failed" in out
+        assert "refused: nothing is listening" in out
+
+    def test_a_success_is_what_dates_the_last_push(self, tmp_path, monkeypatch, reachable):
+        path = _write_config(tmp_path)
+        cache_db.write_push_attempt("https://ccr.example.net", 500.0, 0, succeeded=True)
+        cache_db.write_push_attempt("https://ccr.example.net", 900.0, 1, reason="gone")
+        out = self._run(monkeypatch, ["server", "status", "--config", str(path)])
+        assert ccr._fmt_epoch(500.0) in out, "the last push is the last one that stored records"
+        assert ccr._fmt_epoch(900.0) in out, "the failed attempt keeps its own timestamp"
+
     def test_a_bare_server_command_reads_the_default_config(
         self, tmp_path, monkeypatch, reachable,
     ):
@@ -528,6 +547,26 @@ class TestStatusCommand:
         monkeypatch.setattr(push, "CONFIG_PATH", path)
         out = self._run(monkeypatch, ["server"])
         assert "laptop-1" in out
+
+    def test_server_push_sends_and_reports(self, tmp_path, monkeypatch):
+        path = _write_config(tmp_path)
+        monkeypatch.setattr(
+            push, "push_to",
+            lambda server, full=False, db_path=None: push.PushResult(
+                server=server.url, accepted=["/p/a.jsonl"], records=7,
+            ),
+        )
+        out = self._run(monkeypatch, ["server", "push", "--config", str(path)])
+        assert "1 sent" in out
+        assert "7 records" in out
+
+    def test_server_push_reads_the_config_it_was_given(self, tmp_path, monkeypatch):
+        """Not the default one: the flag is what makes the subcommand testable."""
+        with pytest.raises(SystemExit) as exit_info:
+            self._run(monkeypatch, [
+                "server", "push", "--config", str(tmp_path / "absent.toml"),
+            ])
+        assert exit_info.value.code == 1
 
     def test_an_unreachable_server_is_reported_not_raised(self, tmp_path, monkeypatch):
         from ccreport.remote import RemoteError

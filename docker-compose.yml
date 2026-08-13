@@ -21,9 +21,8 @@ services:
       # reloader has to poll.
       WATCHFILES_FORCE_POLLING: "true"
     ports:
-      # Loopback only: the pages have no authentication of their own, and the
-      # allowlist above is wide enough to admit any host on the LAN.
-      - "127.0.0.1:8787:8787"
+      # Every interface, so another machine on the LAN can push and read.
+      - "8787:8787"
     volumes:
       - ccreport-data:/data
       # An edit on the host restarts the server; read-only so the container

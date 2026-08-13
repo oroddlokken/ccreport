@@ -3315,19 +3315,45 @@ def read_push_attempt(server_url: str) -> tuple[float, int, bool]:
     return attempt, failures, vals.get(keys[2]) == "1"
 
 
+def read_push_outcome(server_url: str) -> tuple[float, str]:
+    """(last success, why the last attempt failed) for one server.
+
+    The attempt stamp beside these moves on every outcome, because it is what
+    bounds the spawn rate. On its own it therefore cannot say whether anything
+    was ever stored, and a failure count cannot tell connection-refused from a
+    500 — which are somebody else's problem in opposite directions.
+    """
+    conn = get_connection()
+    keys = tuple(_push_meta_key(name, server_url) for name in ("success", "reason"))
+    vals = _get_meta_many(conn, keys)
+    try:
+        success = float(vals.get(keys[0], "0") or 0)
+    except ValueError:
+        success = 0.0
+    return success, vals.get(keys[1]) or ""
+
+
 def write_push_attempt(
     server_url: str, now: float, failures: int, *, stopped: bool = False,
+    reason: str = "", succeeded: bool = False,
 ) -> None:
     """Stamp an attempt, whatever its outcome.
 
     Every outcome, failures included — the stamp is what bounds the spawn rate,
     so an unreachable server that never wrote one would be probed once per
     render instead of once per interval.
+
+    *reason* is cleared by every outcome that is not a failure, so it always
+    describes the attempt the stamp beside it names. *succeeded* is narrower
+    than `failures == 0`: an off-network run sends nothing and clears the count.
     """
     conn = get_connection()
     _set_meta(conn, _push_meta_key("attempt", server_url), repr(now))
     _set_meta(conn, _push_meta_key("failures", server_url), str(failures))
     _set_meta(conn, _push_meta_key("stopped", server_url), "1" if stopped else "0")
+    _set_meta(conn, _push_meta_key("reason", server_url), reason)
+    if succeeded:
+        _set_meta(conn, _push_meta_key("success", server_url), repr(now))
     conn.commit()
 
 

@@ -1777,13 +1777,18 @@ def cmd_server_status(args) -> None:
         if server.networks and not push.on_allowed_network(server.networks):
             console.print("               [yellow]off-network: pushes are held[/yellow]")
         attempt, failures, stopped = cache_db.read_push_attempt(server.url)
+        success, reason = cache_db.read_push_outcome(server.url)
+        console.print(f"  last push    {_fmt_epoch(success) if success else 'never'}")
         if stopped:
-            console.print("  last push    [red]stopped: the token was refused[/red]")
-        elif attempt:
-            console.print(f"  last push    {_fmt_epoch(attempt)}"
-                          f"{f', {failures} failures since' if failures else ''}")
-        else:
-            console.print("  last push    never")
+            console.print("  last attempt [red]stopped: the token was refused[/red]")
+        elif failures and attempt:
+            # The failure and its reason, not a count beside the attempt stamp:
+            # the stamp moves whatever happened, so on its own it reads as a
+            # push that went through.
+            console.print(f"  last attempt [red]failed[/red] {_fmt_epoch(attempt)}, "
+                          f"{failures} in a row")
+            if reason:
+                console.print(f"               [red]{reason}[/red]")
 
 
 def cmd_push(args) -> None:
@@ -1795,12 +1800,13 @@ def cmd_push(args) -> None:
     """
     from ccreport import push
 
-    if not push.configured():
-        print(f"No {push.CONFIG_PATH} — run `ccreport server connect <url> --token ...` first.",
-              file=sys.stderr)
+    config = Path(args.config) if getattr(args, "config", None) else None
+    if not push.configured(config):
+        print(f"No {config or push.CONFIG_PATH} — "
+              "run `ccreport server connect <url> --token ...` first.", file=sys.stderr)
         sys.exit(1)
 
-    results = push.run_once(full=args.full, only=args.server, force=True)
+    results = push.run_once(full=args.full, only=args.server, config_path=config, force=True)
     if not results:
         print(f"No server matched {args.server!r}.", file=sys.stderr)
         sys.exit(1)
@@ -2977,9 +2983,12 @@ def main() -> None:
         ("allow", "Identify one more project by name"),
         ("deny", "Stop identifying a project by name"),
         ("status", "What each server knows this machine as"),
+        ("push", "Push this machine's records to a ccreport server"),
     ):
         sp = server_sub.add_parser(name, help=helptext)
-        sp.add_argument("--config", help="Write somewhere other than ~/.config/ccreport/push.toml")
+        verb = "Read" if name in ("status", "push") else "Write"
+        sp.add_argument("--config",
+                        help=f"{verb} somewhere other than ~/.config/ccreport/push.toml")
         if name == "connect":
             sp.add_argument("url", help="The server's base URL")
             sp.add_argument("--token", required=True, help="The token the web UI minted")
@@ -2991,9 +3000,15 @@ def main() -> None:
         if name in ("allow", "deny"):
             sp.add_argument("url", help="The server URL, as push.toml spells it")
             sp.add_argument("project", help="The project name, before or after a merge rule")
+        if name == "push":
+            sp.add_argument("--server", help="Only this server URL, as push.toml spells it")
+            sp.add_argument("--full", action="store_true",
+                            help="Forget the watermark and offer every file again")
 
-    # Send this machine's records to the servers push.toml names.
+    # The same push, spelled the way it was before `server push` existed. The
+    # status line spawns the module rather than either, so both are for people.
     pp = sub.add_parser("push", help="Push this machine's records to a ccreport server")
+    pp.add_argument("--config", help="Read somewhere other than ~/.config/ccreport/push.toml")
     pp.add_argument("--server", help="Only this server URL, as push.toml spells it")
     pp.add_argument("--full", action="store_true",
                     help="Forget the watermark and offer every file again")
@@ -3055,13 +3070,15 @@ def main() -> None:
     if args.command == "push":
         cmd_push(args)
         return
-    # Config only: writes push.toml and, for allow and deny, clears a watermark.
+    # Reads push.toml and, apart from `server push`, writes it back.
     if args.command == "server":
         if args.server_command == "connect":
             cmd_server_connect(args)
         elif args.server_command in ("allow", "deny"):
             args.command = args.server_command
             cmd_server_allow(args)
+        elif args.server_command == "push":
+            cmd_push(args)
         else:
             cmd_server_status(args)
         return

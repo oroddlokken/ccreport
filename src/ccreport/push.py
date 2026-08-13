@@ -595,11 +595,11 @@ def run_once(*, full: bool = False, only: str | None = None,
             # Stamped on every outcome, failures included: without it an
             # unreachable server would be probed once per render.
             cache_db.write_push_attempt(
-                server.url, now, failures + 1, stopped=exc.terminal,
+                server.url, now, failures + 1, stopped=exc.terminal, reason=str(exc),
             )
             results.append(PushResult(server=server.url, rejected=[("", str(exc))]))
             continue
-        cache_db.write_push_attempt(server.url, now, 0)
+        cache_db.write_push_attempt(server.url, now, 0, succeeded=True)
         results.append(result)
     return results
 

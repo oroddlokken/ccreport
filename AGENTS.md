@@ -18,7 +18,8 @@ app over its own SQLite file, run by Granian (`just serve`), configured by
 `report_api.py` the merged reports `ccreport --server URL` renders.
 `dashboard.py` is the merged spend page it serves at `/`.
 `src/ccreport/push.py` is the other end: it sends this machine's records, run
-by `ccreport push` or by a detached spawn from the status line.
+by `ccreport server push` (or its older spelling `ccreport push`) or by a
+detached spawn from the status line.
 
 `burn.py` projects a rate-limit window to exhaustion and `forecast.py` projects
 spend to a ceiling. Both are pure and stdlib-light, because `ccu` and the
@@ -120,6 +121,11 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   interval widens after a failure and which servers are due live in `push.py`,
   and a 401 is terminal — a revoked token stops the machine rather than
   knocking every interval
+- The attempt stamp moves on every outcome, so it cannot date a push. What
+  `ccreport server status` prints as `last push` is the separate `success`
+  stamp `write_push_attempt(succeeded=True)` writes on the success path alone,
+  and a failed attempt renders as itself with the `reason` stored beside it —
+  a count of failures cannot tell connection-refused from a 500
 - The dashboard's chart library is vendored under
   `server/static/vendor/`, not fetched from a CDN, so the page draws with no
   internet. Nothing updates it: a new version is a deliberate copy plus an edit
