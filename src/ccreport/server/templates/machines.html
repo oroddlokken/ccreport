@@ -34,8 +34,10 @@
 <h2>Mint a token</h2>
 {% if error %}<p class="off">{{ error }}</p>{% endif %}
 <form method="post" action="/machines/mint" class="mint">
-  <label>Machine ID <input name="machine_id" required autocomplete="off"></label>
-  <label>Label <input name="label" autocomplete="off"></label>
+  <div class="fields">
+    <label>Machine ID <input name="machine_id" required autocomplete="off"></label>
+    <label>Label <input name="label" autocomplete="off"></label>
+  </div>
   {% include "_policy_fields.html" %}
   <button type="submit">Mint</button>
 </form>

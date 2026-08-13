@@ -85,10 +85,25 @@ button {
 }
 button.danger { background: transparent; color: var(--off); border: 1px solid var(--off); font-weight: 500; }
 
-form.mint label:not(.check) input { min-width: 12rem; }
-label.check { flex-direction: row; align-items: center; gap: .4rem; padding-bottom: .5rem; }
-label.check input { accent-color: var(--accent); }
-.hint { flex-basis: 100%; max-width: 62ch; margin: .25rem 0 0; font-size: .8rem; line-height: 1.5; }
+form.mint { display: block; max-width: 30rem; }
+form.mint .fields { display: flex; gap: .75rem; flex-wrap: wrap; }
+form.mint .fields label { flex: 1 1 10rem; }
+form.mint input:not([type="checkbox"]) { width: 100%; }
+
+fieldset.policy {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: .5rem 1rem 1rem;
+  margin: 1rem 0;
+}
+fieldset.policy legend { padding: 0 .4rem; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); }
+label.check { flex-direction: row; align-items: center; gap: .5rem; margin-top: 1rem; color: var(--text); }
+label.check input { accent-color: var(--accent); margin: 0; }
+
+.dependent { margin: .5rem 0 0 1.1rem; padding-left: .9rem; border-left: 1px solid var(--line); }
+label.check:not(:has(:checked)) + .dependent { opacity: .45; }
+
+.hint { color: var(--dim); font-size: .75rem; line-height: 1.45; margin: .35rem 0 0; }
 
 pre.command {
   background: var(--panel);
