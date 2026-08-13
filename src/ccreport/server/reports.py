@@ -9,7 +9,7 @@ which account each row came from.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 
 from ccreport import aggregate, exchange
@@ -40,29 +40,36 @@ class MergedRecord:
 _SELECT = ", ".join(REC_COLS)
 
 
-def _where(filters: Filters) -> tuple[str, list]:
-    """The filter clause and its parameters, or an empty clause.
+def _clauses(filters: Filters, alias: str = "") -> tuple[list[str], list]:
+    """One condition per set filter, qualified by *alias*, and their parameters.
 
     ts bounds rather than day bounds: `day` is the machine's own calendar day
     and two machines can disagree about which day an instant falls in, so a
     range that means the same thing to both has to be stated in instants.
     """
+    at = f"{alias}." if alias else ""
     clauses, params = [], []
     if filters.since is not None:
-        clauses.append("ts >= ?")
+        clauses.append(f"{at}ts >= ?")
         params.append(filters.since.timestamp())
     if filters.until is not None:
-        clauses.append("ts < ?")
+        clauses.append(f"{at}ts < ?")
         params.append(filters.until.timestamp())
     if filters.project is not None:
-        clauses.append("project = ?")
+        clauses.append(f"{at}project = ?")
         params.append(filters.project)
     if filters.account is not None:
-        clauses.append("(account_label = ? OR account_uuid = ?)")
+        clauses.append(f"({at}account_label = ? OR {at}account_uuid = ?)")
         params += [filters.account, filters.account]
     if filters.machine is not None:
-        clauses.append("machine_id = ?")
+        clauses.append(f"{at}machine_id = ?")
         params.append(filters.machine)
+    return clauses, params
+
+
+def _where(filters: Filters) -> tuple[str, list]:
+    """The filter clause and its parameters, or an empty clause."""
+    clauses, params = _clauses(filters)
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
 
@@ -130,6 +137,99 @@ def _as_merged(rec: dict, machine_label: str) -> MergedRecord:
     # server's midnight.
     record._day = rec["day"]  # noqa: SLF001 - the memo is the point
     return MergedRecord(record=record, machine=machine_label, account=account)
+
+
+GROUP_COLS = ("machine_id", "account_uuid", "account_label", "project", "model", "day", "oslo_date")
+"""What one grouped row stands for. Every column a merged report groups on
+except the session, which no page folding these rows breaks down by."""
+
+def _dedup_clause(filters: Filters) -> tuple[str, list]:
+    """load()'s dedup, stated in SQL, and the parameters it binds.
+
+    The lowest id per (account, dedup key) wins and a record with no key is
+    kept as it stands.
+
+    One grouped pass over idx_srec_account_dk rather than a correlated subquery
+    per row — the same answer in a third of the time on a corpus of half a
+    million.
+
+    The subquery repeats every filter but the date bounds, because load()
+    dedups within the set its filters admitted and which copy survives depends
+    on which are in that set. `machine` is the one this is visible through: ask
+    for the desk alone and the desk's copy of a synced call wins, where over
+    both machines the laptop's did. The date bounds are left off because they
+    cannot split a pair — two copies of one call carry the ts their log gave
+    them — and repeating them doubles what the all-time range costs.
+    """
+    clauses, params = _clauses(replace(filters, since=None, until=None))
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    inner = f"SELECT MIN(id) FROM server_records{where} GROUP BY account_uuid, dk"  # noqa: S608
+    return f"(a.dk IS NULL OR a.dk = '' OR a.id IN ({inner}))", params
+
+
+_GROUP_LIST = ", ".join(f"a.{name}" for name in GROUP_COLS)
+_GROUPED_SQL = f"""
+    SELECT {_GROUP_LIST}, MIN(a.ts), SUM(a.cost), COUNT(*),
+           SUM(a.input_tokens), SUM(a.output_tokens), SUM(a.cache_create), SUM(a.cache_read)
+      FROM server_records a
+     WHERE %s
+     GROUP BY {_GROUP_LIST}
+"""  # noqa: S608 - GROUP_COLS is a literal tuple; every filter binds a parameter
+
+
+def load_grouped(conn: sqlite3.Connection, filters: Filters | None = None) -> list[MergedRecord]:
+    """The same records load() returns, pre-folded by SQL to one per GROUP_COLS.
+
+    A page that only ever sums cannot tell these from the records they stand
+    for: each carries its group's summed tokens and cost, its call count in
+    `count`, and the day and Oslo date every row in it shares. It is the same
+    trick the CLI's rollup table plays, and the aggregation is the same code.
+
+    What it buys is the corpus never reaching Python: a merged history of half
+    a million calls is a few thousand groups.
+
+    Not for a session report or anything else keyed on a record's identity —
+    session_id and message_id are empty here, so every row would collapse into
+    one bucket rather than raise.
+    """
+    filters = filters or Filters()
+    dedup, dedup_params = _dedup_clause(filters)
+    clauses, params = _clauses(filters, alias="a")
+    rows = conn.execute(
+        _GROUPED_SQL % " AND ".join([dedup, *clauses]), dedup_params + params,
+    ).fetchall()
+
+    labels = dict(conn.execute("SELECT machine_id, label FROM machines").fetchall())
+    merged = [_as_grouped(row, labels) for row in rows]
+    merged.sort(key=lambda m: m.record.timestamp)
+    return merged
+
+
+def _as_grouped(row: tuple, labels: dict) -> MergedRecord:
+    """One grouped row as the record the aggregation understands."""
+    machine_id: str = row[0]
+    account_uuid, account_label, project, model, day, oslo_date = row[1:len(GROUP_COLS)]
+    first_ts, cost, calls, tokens_in, tokens_out, cache_create, cache_read = row[len(GROUP_COLS):]
+    account = account_label or account_uuid
+    record = UsageRecord(
+        message_id="",
+        model=model,
+        tokens=aggregate.TokenCounts(
+            input=tokens_in, output=tokens_out, cache_create=cache_create, cache_read=cache_read,
+        ),
+        # The group's earliest instant. Every row in it shares a model and a
+        # day, so it prices the group exactly where a per-record timestamp
+        # would — and the dashboard's savings tile asks for nothing else.
+        timestamp=datetime.fromtimestamp(first_ts, tz=UTC),
+        session_id="",
+        project=project or "(redacted)",
+        cost_usd=cost,
+        count=calls,
+        account=account,
+        oslo_date=date.fromisoformat(oslo_date),
+    )
+    record._day = day  # noqa: SLF001 - the memo is the point; see _as_merged
+    return MergedRecord(record=record, machine=labels.get(machine_id, machine_id), account=account)
 
 
 def nok_context(merged: list[MergedRecord], *, mva: bool = True) -> NokCtx:

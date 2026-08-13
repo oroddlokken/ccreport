@@ -40,7 +40,7 @@ templates.env.filters["when"] = _when
 @router.get("/", response_class=HTMLResponse)
 def index(request: Request, days: int = Query(default=dashboard.DEFAULT_RANGE)):
     """The merged spend dashboard."""
-    view = dashboard.build(request.app.state.db.connect(), days)
+    view = dashboard.cached_build(request.app.state.db, days)
     return templates.TemplateResponse(request, "dashboard.html", {
         "view": view,
         "ranges": dashboard.RANGES,

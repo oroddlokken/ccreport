@@ -2,14 +2,19 @@
 {% block title %}Token for {{ machine_id }} — ccreport{% endblock %}
 {% block content %}
 <h1>Token for {{ machine_id }}</h1>
+<p class="dim">Shown here and nowhere else. Only its hash is stored, so a lost token is re-minted rather than recovered.</p>
 
-<p>Run this on that machine. The token is shown here and nowhere else.</p>
+<div class="command-box">
+  <div class="command-head">
+    <span class="dim">Run on <span class="mono">{{ machine_id }}</span></span>
+    <button type="button" class="ghost copy">Copy</button>
+  </div>
 <pre class="command">{{ command }}</pre>
+</div>
 
-<p class="dim">
-  Only its hash is stored. A lost token is re-minted, never recovered, and
-  revoking one stops it at that machine's next push.
-</p>
+<p class="hint">It writes the push policy into that machine's config. Revoking this token stops the machine at its next push.</p>
 
-<p><a href="/machines/{{ machine_id }}">Back to {{ machine_id }}</a></p>
+<p><a href="/machines/{{ machine_id }}">← Back to {{ machine_id }}</a></p>
+
+<script src="/static/copy.js"></script>
 {% endblock %}

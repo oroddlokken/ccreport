@@ -255,6 +255,62 @@ class TestRedactedProjects:
         assert rows[0]["tokens"] > 0
 
 
+class TestCachedBuild:
+    """One build per range per push. The page is otherwise the corpus, folded
+    again, on every render."""
+
+    def _push(self, app, days_ago=5):
+        client = TestClient(app)
+        token = sf.mint_for(app, "laptop-1", "Laptop")
+        resp = client.post(
+            "/v1/ingest",
+            json=sf.batch([_rec(days_ago, "work", project="projC")],
+                          path=f"/p/extra{days_ago}.jsonl", label="Laptop"),
+            headers=sf.auth(token),
+        )
+        assert resp.json()["files"][0]["status"] == "accepted", resp.json()
+
+    def test_a_second_render_of_the_same_database_reuses_the_first(self, app):
+        first = dashboard.cached_build(app.state.db, 30, NOW)
+        assert dashboard.cached_build(app.state.db, 30, NOW) is first
+
+    def test_a_push_invalidates_it(self, app):
+        first = dashboard.cached_build(app.state.db, 30, NOW)
+        self._push(app)
+        second = dashboard.cached_build(app.state.db, 30, NOW)
+        assert second is not first
+        assert second.total_cost > first.total_cost
+
+    def test_a_new_day_invalidates_it(self, app):
+        """The ranges end at the next midnight, so yesterday's axis is wrong."""
+        first = dashboard.cached_build(app.state.db, 30, NOW)
+        second = dashboard.cached_build(app.state.db, 30, NOW + timedelta(days=1))
+        assert second is not first
+        assert second.chart_days[-1] != first.chart_days[-1]
+
+    def test_each_range_is_cached_apart(self, app):
+        week = dashboard.cached_build(app.state.db, 7, NOW)
+        month = dashboard.cached_build(app.state.db, 30, NOW)
+        assert week is not month
+        assert dashboard.cached_build(app.state.db, 7, NOW) is week
+
+    def test_an_unknown_range_shares_the_default_entry(self, app):
+        assert dashboard.cached_build(app.state.db, 999, NOW) is dashboard.cached_build(
+            app.state.db, dashboard.DEFAULT_RANGE, NOW,
+        )
+
+    def test_two_databases_do_not_share_an_entry(self, app, tmp_path):
+        """Two empty ones stamp identically, so the path has to be in the key."""
+        other = create_app(sf.config(tmp_path / "other"))
+        assert dashboard.cached_build(other.state.db, 30, NOW).total_cost == 0.0
+        assert dashboard.cached_build(app.state.db, 30, NOW).total_cost > 0.0
+
+    def test_the_page_serves_the_cached_view(self, app):
+        view = dashboard.cached_build(app.state.db, 30, NOW)
+        TestClient(app).get("/?days=30")
+        assert dashboard.cached_build(app.state.db, 30, NOW) is view
+
+
 class TestPage:
     def test_it_renders_the_headline_and_the_footnote(self, client):
         body = client.get("/").text

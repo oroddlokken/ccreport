@@ -129,6 +129,16 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   stamp `write_push_attempt(succeeded=True)` writes on the success path alone,
   and a failed attempt renders as itself with the `reason` stored beside it —
   a count of failures cannot tell connection-refused from a 500
+- The dashboard folds grouped rows, never records: `reports.load_grouped` asks
+  SQL for one row per (machine, account, project, model, day) and hands back a
+  `UsageRecord` per group carrying its summed tokens, its summed cost and its
+  call count in `count` — the rollup trick the CLI plays, through the same
+  `aggregate.py`. Half a million calls reach Python as a few thousand groups.
+  The dedup repeats every filter but the date bounds: which copy of a synced
+  call survives depends on the set being deduped, and no ts bound can split a
+  pair. `dashboard.cached_build` then holds one view per range toggle against
+  `db.content_stamp` and the render's local date, so a page is rebuilt when a
+  push moved the records or the day rolled over, and not per request
 - The dashboard's chart library is vendored under
   `server/static/vendor/`, not fetched from a CDN, so the page draws with no
   internet. Nothing updates it: a new version is a deliberate copy plus an edit

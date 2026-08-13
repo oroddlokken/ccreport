@@ -134,6 +134,81 @@ class TestLoading:
         assert {m.record.day_key() for m in merged} == {"2026-03-02", "2026-03-03"}
 
 
+def _totals(merged):
+    """What a grouped load has to agree with load() about, to the cent."""
+    return (
+        round(sum(m.record.cost() for m in merged), 9),
+        sum(m.record.tokens.total for m in merged),
+        sum(m.record.count for m in merged),
+        sorted({(m.machine, m.account, m.record.day_key()) for m in merged}),
+    )
+
+
+class TestGroupedLoading:
+    """The dashboard's loader: SQL folds the corpus, and the sums must not move."""
+
+    def test_it_totals_what_the_record_loader_does(self, app):
+        conn = app.state.db.connect()
+        assert _totals(reports.load_grouped(conn)) == _totals(reports.load(conn))
+
+    def test_a_synced_log_stored_twice_counts_once(self, app):
+        """The same collapse load() does, stated in SQL instead of Python."""
+        merged = reports.load_grouped(app.state.db.connect())
+        assert sum(m.record.count for m in merged) == 3
+
+    def test_the_surviving_copy_is_the_machine_that_reported_it_first(self, app):
+        merged = reports.load_grouped(app.state.db.connect())
+        assert {m.machine for m in merged if m.record.project == "projA"} == {"Laptop"}
+
+    def test_a_record_with_no_dedup_key_is_kept(self, tmp_path):
+        app = create_app(sf.config(tmp_path))
+        client = TestClient(app)
+        token = sf.mint_for(app)
+        client.post(
+            "/v1/ingest",
+            json=sf.batch([sf.record(mid="x1", dk=None), sf.record(mid="x2", dk=None)]),
+            headers=sf.auth(token),
+        )
+        merged = reports.load_grouped(app.state.db.connect())
+        assert sum(m.record.count for m in merged) == 2
+
+    def test_one_group_carries_every_call_in_it(self, app):
+        """projA is two calls on two days and two models, so nothing may merge."""
+        merged = reports.load_grouped(app.state.db.connect(), reports.Filters(project="projA"))
+        assert sorted(m.record.count for m in merged) == [1, 1]
+
+    @pytest.mark.parametrize(
+        ("field", "value", "calls"),
+        [("project", "projA", 2), ("account", "me@home.example", 1), ("machine", "desk-1", 2)],
+    )
+    def test_each_filter_narrows_to_what_it_names(self, app, field, value, calls):
+        """machine=desk-1 keeps its own copy of the synced call: the dedup
+        subquery repeats the filter, so the laptop's copy is not in the set
+        whose lowest id wins."""
+        merged = reports.load_grouped(app.state.db.connect(), reports.Filters(**{field: value}))
+        assert sum(m.record.count for m in merged) == calls
+
+    def test_a_date_range_is_bounded_in_instants(self, app):
+        merged = reports.load_grouped(app.state.db.connect(), reports.Filters(
+            since=datetime(2026, 3, 3, tzinfo=UTC),
+        ))
+        assert sum(m.record.count for m in merged) == 2
+
+    def test_groups_come_back_oldest_first(self, app):
+        merged = reports.load_grouped(app.state.db.connect())
+        assert [m.record.timestamp for m in merged] == sorted(m.record.timestamp for m in merged)
+
+    def test_the_machines_calendar_day_travels_with_the_group(self, app):
+        merged = reports.load_grouped(app.state.db.connect())
+        assert {m.record.day_key() for m in merged} == {"2026-03-02", "2026-03-03"}
+
+    def test_a_group_prices_at_its_earliest_instant(self, app):
+        """What the savings tile reads. A group is one model on one day, so the
+        first call's instant prices every call in it."""
+        merged = reports.load_grouped(app.state.db.connect(), reports.Filters(project="projB"))
+        assert [m.record.timestamp for m in merged] == [datetime(2026, 3, 3, 12, tzinfo=UTC)]
+
+
 class TestEndpoints:
     def test_the_daily_report_merges_both_machines(self, client):
         body = _report(client, "day")

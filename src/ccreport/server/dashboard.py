@@ -10,6 +10,7 @@ with its real cost and token counts.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -230,6 +231,42 @@ def _breakdown(merged: list[reports.MergedRecord], dimension: str,
     ]
 
 
+_CACHE: dict[tuple, tuple[tuple, Dashboard]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def cached_build(database: db.Database, days: int, now: datetime | None = None) -> Dashboard:
+    """build(), reusing the last one until a push or a new day invalidates it.
+
+    One entry per (database, range toggle), so the whole cache is as many
+    entries as RANGES has per server. Each is held against `db.content_stamp`
+    and the local date the render fell on: the stamp covers what was pushed,
+    the date covers the ranges that end at the next midnight and would
+    otherwise keep yesterday's axis.
+
+    Keyed on the database path and not on the range alone, because a process
+    can hold more than one — every server test does — and two empty databases
+    have the same stamp.
+
+    Two threads can miss on the same range at once and both build. That costs a
+    duplicate query and nothing else, which is cheaper than holding the lock
+    across a build and serializing every other range behind it.
+    """
+    conn = database.connect()
+    now = now or datetime.now(tz=UTC).astimezone()
+    days = days if days in RANGES else DEFAULT_RANGE
+    key = (str(database.path), days)
+    stamp = (db.content_stamp(conn), now.strftime("%Y-%m-%d"))
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    view = build(conn, days, now)
+    with _CACHE_LOCK:
+        _CACHE[key] = (stamp, view)
+    return view
+
+
 def build(conn, days: int, now: datetime | None = None) -> Dashboard:
     """Everything the page shows, for one range toggle."""
     now = now or datetime.now(tz=UTC).astimezone()
@@ -239,7 +276,7 @@ def build(conn, days: int, now: datetime | None = None) -> Dashboard:
     else:
         start, end = range_bounds(days, now)
     span = (end - start).days
-    merged = reports.load(conn, reports.Filters(since=start, until=end))
+    merged = reports.load_grouped(conn, reports.Filters(since=start, until=end))
     nok = reports.nok_context(merged)
 
     account_report = reports.build(merged, "account", nok)

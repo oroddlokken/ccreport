@@ -19,3 +19,4 @@ seeded_*
 *.db-wal
 export/
 .claude-cache/
+.playwright-mcp

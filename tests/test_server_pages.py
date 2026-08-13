@@ -163,6 +163,21 @@ class TestMintedPolicy:
         assert args[-2:] == ["--opt-in-repos", "ccreport"]
 
 
+class TestMintedPage:
+    def test_the_form_says_where_the_policy_lives(self, client):
+        """It is the machine's file, so the page has to point at where to edit it."""
+        for route in ("/machines", "/machines/laptop-1"):
+            body = client.get(route).text
+            assert "push.toml" in body
+            assert "ccreport server allow" in body
+
+    def test_the_command_has_a_copy_control(self, client):
+        page = _mint(client).text
+        assert 'class="command-box"' in page
+        assert 'class="ghost copy"' in page
+        assert "/static/copy.js" in page
+
+
 class TestConnectCommand:
     def test_a_shell_character_in_a_name_is_quoted(self):
         """The command is pasted into a shell, which would otherwise read it."""

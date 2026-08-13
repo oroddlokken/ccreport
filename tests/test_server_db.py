@@ -62,6 +62,28 @@ class TestSchema:
         assert second.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
         second.close()
 
+    def test_a_range_query_has_an_index_to_use(self, conn):
+        """Without it the 7-day toggle scans every row the all-time one does."""
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM server_records WHERE ts >= ? AND ts < ?", (0, 1),
+        ).fetchall()
+        assert any("idx_srec_ts" in str(step) for step in plan), plan
+
+    def test_an_older_database_picks_up_a_new_index(self, tmp_path):
+        """The version stamp is the only thing that re-runs the DDL, so a bump
+        is what a database written before the index needs."""
+        path = tmp_path / "server.db"
+        first = db.connect(path)
+        first.execute("DROP INDEX idx_srec_ts")
+        first.execute("PRAGMA user_version = 1")
+        first.close()
+        second = db.connect(path)
+        names = [row[0] for row in second.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'server_records'",
+        )]
+        second.close()
+        assert "idx_srec_ts" in names
+
     def test_a_record_cannot_name_a_machine_that_does_not_exist(self, conn):
         """Foreign keys are on, which is what keeps orphan rows out of a merge."""
         with pytest.raises(sqlite3.IntegrityError):
@@ -168,6 +190,44 @@ class TestWholeFileIngest:
 
     def test_an_unpushed_file_has_no_fingerprint(self, conn):
         assert db.file_fingerprint(conn, "m1", "/p/never.jsonl") is None
+
+
+class TestContentStamp:
+    """What the dashboard holds a cached page against."""
+
+    def _push(self, conn, rows, *, path="/p/a.jsonl", mtime_ns=1, size=10, now=500.0):
+        db.replace_file_records(conn, "m1", path, mtime_ns, size, rows, now)
+
+    def test_an_empty_database_stamps_without_raising(self, conn):
+        assert db.content_stamp(conn) == (0, 0, 0)
+
+    def test_reading_it_twice_gives_the_same_answer(self, conn):
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        self._push(conn, [db.record_to_row(_record())])
+        assert db.content_stamp(conn) == db.content_stamp(conn)
+
+    def test_a_new_file_moves_it(self, conn):
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        self._push(conn, [db.record_to_row(_record())])
+        before = db.content_stamp(conn)
+        self._push(conn, [db.record_to_row(_record(mid="msg_2"))], path="/p/b.jsonl", now=600.0)
+        assert db.content_stamp(conn) != before
+
+    def test_a_re_push_of_the_same_file_moves_it(self, conn):
+        """Same file, same count, different content: only updated_at is left."""
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        self._push(conn, [db.record_to_row(_record())])
+        before = db.content_stamp(conn)
+        self._push(conn, [db.record_to_row(_record(mid="msg_9"))], mtime_ns=2, size=20, now=600.0)
+        assert db.content_stamp(conn) != before
+
+    def test_a_file_that_shrank_moves_it(self, conn):
+        """The record total is what catches a re-push that lost rows."""
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        self._push(conn, [db.record_to_row(_record()), db.record_to_row(_record(mid="msg_2"))])
+        before = db.content_stamp(conn)
+        self._push(conn, [db.record_to_row(_record())], mtime_ns=2, size=20, now=500.0)
+        assert db.content_stamp(conn) != before
 
 
 class TestRateStore:

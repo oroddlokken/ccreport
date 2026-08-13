@@ -17,7 +17,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 """Stamped into PRAGMA user_version once the schema below has been applied.
 
 BUMP THIS on any change to _SCHEMA_SQL — an existing database is otherwise
@@ -100,6 +100,10 @@ CREATE INDEX IF NOT EXISTS idx_srec_account_dk ON server_records(account_uuid, d
 -- Every ingest deletes one file's rows before inserting them again, and the
 -- machine leads because a file path is only unique within a machine.
 CREATE INDEX IF NOT EXISTS idx_srec_file ON server_records(machine_id, file_path);
+-- Every report and every dashboard range bounds itself in instants, and a
+-- range narrower than the history is the common case. Without this the 7-day
+-- toggle scans the same rows the all-time one does.
+CREATE INDEX IF NOT EXISTS idx_srec_ts ON server_records(ts);
 
 -- What each machine has already pushed, so a re-push of an unchanged file is a
 -- no-op and a re-push of a grown file replaces that file's rows. A request
@@ -319,6 +323,25 @@ def oldest_record_ts(conn: sqlite3.Connection) -> float | None:
     Where the dashboard's all-time range starts.
     """
     return conn.execute("SELECT MIN(ts) FROM server_records").fetchone()[0]
+
+
+def content_stamp(conn: sqlite3.Connection) -> tuple:
+    """A value that moves whenever a push changed what the records hold.
+
+    Read from ingest_files rather than from server_records: every write path
+    goes through replace_file_records, which stamps a row here in the same
+    transaction, and this table is thousands of rows where that one is
+    hundreds of thousands. Three parts, because no single one covers every
+    edit — a re-push of one file moves updated_at, a machine dropped by a
+    cascade moves the count, and a file that shrank moves the record total.
+
+    A rate arriving in exchange_rates is deliberately not in it: nothing here
+    would notice a rate updated in place, and the NOK column it moves is
+    re-derived on the next push or the next day anyway.
+    """
+    return conn.execute(
+        "SELECT COUNT(*), COALESCE(MAX(updated_at), 0), COALESCE(SUM(n_records), 0) FROM ingest_files",
+    ).fetchone()
 
 
 def machine_label(conn: sqlite3.Connection, machine_id: str) -> str | None:
