@@ -1,0 +1,15 @@
+<label>Networks
+  <input name="networks" autocomplete="off" placeholder="10.0.0.0/8, 192.168.1.0/24">
+</label>
+<label class="check">
+  <input type="checkbox" name="restricted" value="1">
+  Restrict this machine
+</label>
+<label>Identify these projects
+  <input name="allow" autocomplete="off" placeholder="ccreport, kantine">
+</label>
+<p class="dim hint">
+  Networks gate the push: the machine sends only while it holds an address
+  inside one of them. Restricted strips project, cwd and repo from everything
+  outside the list, counts and cost included. An empty list identifies nothing.
+</p>

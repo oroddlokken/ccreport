@@ -85,6 +85,11 @@ button {
 }
 button.danger { background: transparent; color: var(--off); border: 1px solid var(--off); font-weight: 500; }
 
+form.mint label:not(.check) input { min-width: 12rem; }
+label.check { flex-direction: row; align-items: center; gap: .4rem; padding-bottom: .5rem; }
+label.check input { accent-color: var(--accent); }
+.hint { flex-basis: 100%; max-width: 62ch; margin: .25rem 0 0; font-size: .8rem; line-height: 1.5; }
+
 pre.command {
   background: var(--panel);
   border: 1px solid var(--line);

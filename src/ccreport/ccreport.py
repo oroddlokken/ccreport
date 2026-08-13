@@ -1813,7 +1813,7 @@ def cmd_push(args) -> None:
     failed = False
     for result in results:
         if result.blocked:
-            # Named, not silent: a work laptop that pushes nothing all week
+            # Named, not silent: a gated machine that pushes nothing all week
             # looks broken unless it says which network it was waiting for.
             console.print(
                 f"[bold]{result.server}[/bold]: skipped, this machine holds no address in "
@@ -2992,9 +2992,9 @@ def main() -> None:
         if name == "connect":
             sp.add_argument("url", help="The server's base URL")
             sp.add_argument("--token", required=True, help="The token the web UI minted")
-            sp.add_argument("--opt-in-repos", metavar="NAMES",
+            sp.add_argument("--opt-in-repos", metavar="NAMES", nargs="?", const="",
                             help="Comma-separated projects to identify by name; sets restricted. "
-                                 "An empty list identifies nothing, which is a work-laptop state")
+                                 "The flag with no names sets restricted and identifies nothing")
             sp.add_argument("--only-on-network", metavar="CIDRS",
                             help="Comma-separated CIDRs this machine must be inside to push")
         if name in ("allow", "deny"):

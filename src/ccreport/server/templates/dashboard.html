@@ -6,7 +6,7 @@
   <span class="dim">{{ view.start }} — {{ view.end }}</span>
   <span class="toggles">
     {% for days in ranges %}
-    <a class="toggle {% if days == view.days %}on{% endif %}" href="/?days={{ days }}">{{ days }}d</a>
+    <a class="toggle {% if days == view.days %}on{% endif %}" href="/?days={{ days }}">{{ range_labels[days] }}</a>
     {% endfor %}
     <a class="toggle" href="/?days={{ view.days }}">Refresh</a>
   </span>

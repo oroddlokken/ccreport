@@ -32,10 +32,12 @@
 {% endif %}
 
 <h2>Mint a token</h2>
-<form method="post" action="/machines/mint">
+{% if error %}<p class="off">{{ error }}</p>{% endif %}
+<form method="post" action="/machines/mint" class="mint">
   <label>Machine ID <input name="machine_id" required autocomplete="off"></label>
   <label>Label <input name="label" autocomplete="off"></label>
+  {% include "_policy_fields.html" %}
   <button type="submit">Mint</button>
 </form>
-<p class="dim">The token is shown once.</p>
+<p class="dim">The token is shown once. The policy goes into the command, not into this server.</p>
 {% endblock %}

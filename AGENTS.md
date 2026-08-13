@@ -98,7 +98,10 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
 - `~/.config/ccreport/push.toml` is the machine's whole push policy — server,
   token, `restricted`, `allow`, `salt`, `networks` — written by
   `ccreport server connect` at mode 0600, one `[server."URL"]` table each.
-  There are no environment variables for any of it. A `.restricted` marker
+  There are no environment variables for any of it. The mint page types the
+  networks and the opt-in list into the connect command it prints and stores
+  neither: the server never holds a machine's policy, only the line that sets
+  it. A `.restricted` marker
   sits beside it and wins: a push.toml that lost its `restricted = true` to an
   edit or an old backup redacts everything rather than reading as open
 - A restricted machine sends every record's counts and strips the identity of

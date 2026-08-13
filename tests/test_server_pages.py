@@ -38,7 +38,13 @@ def _mint(client, machine_id="laptop-1", label="Laptop"):
 def _token_from(page: str) -> str:
     """The token out of the rendered connect command."""
     line = next(ln for ln in page.splitlines() if "--token" in ln)
-    return line.split("--token")[1].strip().removesuffix("</pre>").strip()
+    return line.split("--token", 1)[1].split()[0].removesuffix("</pre>")
+
+
+def _command_from(page: str) -> str:
+    """The whole connect command, policy flags included."""
+    line = next(ln for ln in page.splitlines() if "--token" in ln)
+    return line.split('<pre class="command">', 1)[-1].removesuffix("</pre>").strip()
 
 
 class TestMachinesPage:
@@ -102,6 +108,79 @@ class TestMinting:
     def test_a_label_left_blank_falls_back_to_the_machine_id(self, client):
         client.post("/machines/mint", data={"machine_id": "bare-1", "label": ""})
         assert "bare-1" in client.get("/machines").text
+
+
+class TestMintedPolicy:
+    """The push policy is typed here and lands in the command, not in the database."""
+
+    def _mint(self, client, **fields):
+        data = {"machine_id": "laptop-1", "label": "Laptop"}
+        data.update(fields)
+        return client.post("/machines/mint", data=data)
+
+    def test_both_mint_forms_carry_the_policy_fields(self, client):
+        _mint(client)
+        for route in ("/machines", "/machines/laptop-1"):
+            body = client.get(route).text
+            assert 'name="networks"' in body
+            assert 'name="restricted"' in body
+            assert 'name="allow"' in body
+
+    def test_a_plain_mint_carries_no_policy_flag(self, client):
+        command = _command_from(self._mint(client).text)
+        assert "--only-on-network" not in command
+        assert "--opt-in-repos" not in command
+
+    def test_the_networks_field_becomes_one_comma_list(self, client):
+        page = self._mint(client, networks="10.0.0.0/8, 192.168.1.0/24").text
+        assert "--only-on-network 10.0.0.0/8,192.168.1.0/24" in _command_from(page)
+
+    def test_the_checkbox_with_names_opts_those_projects_in(self, client):
+        page = self._mint(client, restricted="1", allow="ccreport, kantine").text
+        assert "--opt-in-repos ccreport,kantine" in _command_from(page)
+
+    def test_the_checkbox_with_no_names_restricts_and_identifies_nothing(self, client):
+        """The bare flag, which is what the CLI reads as restricted with an empty list."""
+        command = _command_from(self._mint(client, restricted="1").text)
+        assert command.endswith("--opt-in-repos")
+
+    def test_names_without_the_checkbox_send_nothing(self, client):
+        """Unchecked is an open machine, whatever is left in the names field."""
+        assert "--opt-in-repos" not in _command_from(self._mint(client, allow="ccreport").text)
+
+    def test_a_typo_in_a_cidr_refuses_to_mint(self, app, client):
+        resp = self._mint(client, networks="10.0.0.0/8, not-a-network")
+        assert resp.status_code == 400
+        assert "not-a-network is not a network." in resp.text
+        assert app.state.db.connect().execute(
+            "SELECT COUNT(*) FROM machine_tokens").fetchone()[0] == 0
+
+    def test_the_minted_command_is_one_the_client_parses(self, client):
+        page = self._mint(client, networks="10.0.0.0/8", restricted="1", allow="ccreport").text
+        args = _command_from(page).split()
+        assert args[:4] == ["ccreport", "server", "connect", "http://testserver"]
+        assert args[-4:-2] == ["--only-on-network", "10.0.0.0/8"]
+        assert args[-2:] == ["--opt-in-repos", "ccreport"]
+
+
+class TestConnectCommand:
+    def test_a_shell_character_in_a_name_is_quoted(self):
+        """The command is pasted into a shell, which would otherwise read it."""
+        command = tokens.connect_command(
+            "http://x/", "t", restricted=True, allow="a;rm -rf b",
+        )
+        assert command.endswith("--opt-in-repos 'a;rm,-rf,b'")
+
+    def test_the_bare_flag_goes_last(self):
+        """It takes an optional value, so anything after it would be swallowed."""
+        command = tokens.connect_command(
+            "http://x/", "t", networks="10.0.0.0/8", restricted=True,
+        )
+        assert command.endswith("--opt-in-repos")
+
+    def test_csv_list_takes_commas_or_spaces(self):
+        assert tokens.csv_list(" a, b  c,,d ") == "a,b,c,d"
+        assert tokens.csv_list("  ") == ""
 
 
 class TestRevoking:

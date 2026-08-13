@@ -14,10 +14,15 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from ccreport import aggregate, pricing
-from ccreport.server import reports
+from ccreport.server import db, reports
 
-RANGES = (7, 30, 90)
-"""The day counts the header toggles between."""
+ALL_TIME = 0
+"""The toggle that starts at the oldest stored record instead of a day count."""
+
+RANGES = (7, 30, 90, ALL_TIME)
+"""What the header toggles between, in the order it draws them."""
+
+RANGE_LABELS = {7: "7d", 30: "30d", 90: "90d", ALL_TIME: "All"}
 
 DEFAULT_RANGE = 30
 
@@ -33,6 +38,21 @@ def range_bounds(days: int, now: datetime) -> tuple[datetime, datetime]:
     """
     end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
     return end - timedelta(days=days), end
+
+
+def all_time_bounds(oldest: float | None, now: datetime) -> tuple[datetime, datetime]:
+    """The span from the oldest record's local day to the same next midnight.
+
+    A database with nothing in it falls back to the default range: a zero-day
+    axis has no columns to draw and reads as a broken chart rather than an
+    empty one.
+    """
+    end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    if oldest is None:
+        return range_bounds(DEFAULT_RANGE, now)
+    start = datetime.fromtimestamp(oldest, tz=now.tzinfo or UTC).astimezone(now.tzinfo)
+    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    return min(start, end - timedelta(days=1)), end
 
 
 @dataclass
@@ -214,14 +234,18 @@ def build(conn, days: int, now: datetime | None = None) -> Dashboard:
     """Everything the page shows, for one range toggle."""
     now = now or datetime.now(tz=UTC).astimezone()
     days = days if days in RANGES else DEFAULT_RANGE
-    start, end = range_bounds(days, now)
+    if days == ALL_TIME:
+        start, end = all_time_bounds(db.oldest_record_ts(conn), now)
+    else:
+        start, end = range_bounds(days, now)
+    span = (end - start).days
     merged = reports.load(conn, reports.Filters(since=start, until=end))
     nok = reports.nok_context(merged)
 
     account_report = reports.build(merged, "account", nok)
     total_cost = account_report.total.cost
     accounts = [row.key for row in account_report.rows]
-    axis, series = _chart(merged, start, days, accounts)
+    axis, series = _chart(merged, start, span, accounts)
 
     return Dashboard(
         days=days,

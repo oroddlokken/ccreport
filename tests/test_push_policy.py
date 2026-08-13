@@ -94,14 +94,14 @@ class TestRedaction:
         assert push.redact(_record(sid=None), _server())["sid"] is None
 
     def test_an_empty_allow_list_identifies_nothing(self):
-        """A valid work-laptop state: complete usage, no names at all."""
+        """A valid restricted state: complete usage, no names at all."""
         out = push.redact(_record(project="ccr-projA"), _server(allow=()))
         assert out["project"] != "ccr-projA"
 
 
 class TestFailClosed:
     def test_a_lost_restricted_flag_is_overruled_by_the_marker(self, tmp_path):
-        """An edit or a restored older copy must not unredact a work machine."""
+        """An edit or a restored older copy must not unredact a machine."""
         path = _write_config(tmp_path)
         push._marker_path(path).write_text("x")
         server = push.load_config(path)[0]
@@ -161,7 +161,7 @@ class TestNetworkGate:
         assert not push.on_allowed_network(("192.0.2.0/24",))
 
     def test_a_malformed_cidr_blocks_rather_than_being_skipped(self):
-        """A typo in a work laptop's config must not read as permission."""
+        """A typo in a machine's config must not read as permission."""
         assert not push.on_allowed_network(("10.0.0.0/8", "not-a-network"))
         assert not push.on_allowed_network(("not-a-network", "127.0.0.0/8"))
 
@@ -388,7 +388,8 @@ class TestConnectCommand:
         ])
         assert push.load_config(path)[0].allow == ("ccr-new",)
 
-    def test_an_empty_opt_in_list_is_a_valid_work_laptop(self, tmp_path, monkeypatch, health):
+    def test_an_empty_opt_in_list_restricts_and_identifies_nothing(self, tmp_path, monkeypatch,
+                                                                   health):
         path = tmp_path / "push.toml"
         self._run(monkeypatch, [
             "server", "connect", "https://ccr.example.net", "--token", "good",
@@ -397,6 +398,18 @@ class TestConnectCommand:
         server = push.load_config(path)[0]
         assert server.restricted
         assert server.allow == ()
+
+    def test_the_bare_flag_restricts_and_identifies_nothing(self, tmp_path, monkeypatch, health):
+        """`--opt-in-repos` with no value is opt-in with an empty list, not open."""
+        path = tmp_path / "push.toml"
+        self._run(monkeypatch, [
+            "server", "connect", "https://ccr.example.net", "--token", "good",
+            "--config", str(path), "--opt-in-repos",
+        ])
+        server = push.load_config(path)[0]
+        assert server.restricted
+        assert server.allow == ()
+        assert len(server.salt) == 32
 
     def test_the_salt_survives_a_reconnect(self, tmp_path, monkeypatch, health):
         """Regenerating it would re-pseudonymize everything already on the server."""

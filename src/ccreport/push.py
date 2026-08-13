@@ -71,8 +71,8 @@ class ServerConfig:
     """Whether a project has to be opted in by name to be identified at all.
 
     False is what the personal machines want: everything pushes under its real
-    name. True is the work laptop, where every project outside *allow* pushes
-    its token counts with its identity stripped."""
+    name. True means every project outside *allow* pushes its token counts with
+    its identity stripped."""
     allow: tuple[str, ...] = ()
     """Projects that keep their names, already resolved through this machine's
     merge rules so an alias matches the way a report groups it."""
@@ -114,8 +114,8 @@ def _marker_path(path: Path) -> Path:
     """Where "this machine has been restricted" is recorded.
 
     Beside push.toml rather than in cache.db, and read before the file it
-    guards: a wiped cache must not be able to unredact a work laptop, and a
-    push.toml that stopped parsing must not either.
+    guards: a wiped cache must not be able to unredact a restricted machine,
+    and a push.toml that stopped parsing must not either.
     """
     return path.parent / ".restricted"
 

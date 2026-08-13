@@ -313,6 +313,14 @@ def record_count(conn: sqlite3.Connection, machine_id: str) -> int:
     ).fetchone()[0]
 
 
+def oldest_record_ts(conn: sqlite3.Connection) -> float | None:
+    """When the earliest stored record was made, or None on an empty database.
+
+    Where the dashboard's all-time range starts.
+    """
+    return conn.execute("SELECT MIN(ts) FROM server_records").fetchone()[0]
+
+
 def machine_label(conn: sqlite3.Connection, machine_id: str) -> str | None:
     row = conn.execute(
         "SELECT label FROM machines WHERE machine_id = ?", (machine_id,),

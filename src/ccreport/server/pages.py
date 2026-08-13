@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import UTC, datetime
+from ipaddress import ip_network
 from pathlib import Path
 
 from fastapi import APIRouter, Form, Query, Request
@@ -43,6 +44,7 @@ def index(request: Request, days: int = Query(default=dashboard.DEFAULT_RANGE)):
     return templates.TemplateResponse(request, "dashboard.html", {
         "view": view,
         "ranges": dashboard.RANGES,
+        "range_labels": dashboard.RANGE_LABELS,
         "dimensions": dashboard.DIMENSIONS,
         "chart": json.dumps({
             "days": view.chart_days,
@@ -75,16 +77,47 @@ def machine(request: Request, machine_id: str):
     })
 
 
+def _bad_cidr(networks: str) -> str | None:
+    """The first CIDR that will not parse, or None.
+
+    Checked here rather than left to the machine: a typo blocks every push from
+    it and the server has nothing to notice the silence with.
+    """
+    for item in tokens.csv_list(networks).split(","):
+        if not item:
+            continue
+        try:
+            ip_network(item, strict=False)
+        except ValueError:
+            return item
+    return None
+
+
 @router.post("/machines/mint", response_class=HTMLResponse)
-def mint(request: Request, machine_id: str = Form(...), label: str = Form("")):
-    """Mint a token and show it once, with the command that consumes it."""
+def mint(request: Request, machine_id: str = Form(...), label: str = Form(""),
+         networks: str = Form(""), restricted: str = Form(""), allow: str = Form("")):
+    """Mint a token and show it once, with the command that consumes it.
+
+    The push policy is written into that command and stored nowhere: it lives
+    in the machine's own push.toml, and this is only where it gets typed.
+    """
     conn = request.app.state.db.connect()
+    bad = _bad_cidr(networks)
+    if bad:
+        return templates.TemplateResponse(
+            request, "machines.html",
+            {"machines": db.machine_overview(conn), "error": f"{bad} is not a network."},
+            status_code=400,
+        )
     token = tokens.mint(conn, machine_id.strip(), label.strip() or machine_id.strip(), time.time())
     conn.commit()
     return templates.TemplateResponse(request, "minted.html", {
         "machine_id": machine_id.strip(),
         "token": token,
-        "command": tokens.connect_command(str(request.base_url), token),
+        "command": tokens.connect_command(
+            str(request.base_url), token,
+            networks=networks, restricted=bool(restricted), allow=allow,
+        ),
     })
 
 

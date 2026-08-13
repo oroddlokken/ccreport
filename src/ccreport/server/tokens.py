@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import shlex
 import sqlite3
 
 TOKEN_BYTES = 32
@@ -60,11 +61,29 @@ def mint(conn: sqlite3.Connection, machine_id: str, label: str, now: float) -> s
     return token
 
 
-def connect_command(base_url: str, token: str) -> str:
+def connect_command(base_url: str, token: str, *, networks: str = "",
+                    restricted: bool = False, allow: str = "") -> str:
     """The line to paste on the new machine.
 
     Rendered on the mint page because that is the one moment both halves are
     known: the server knows its own URL and has just generated the token, and
-    the machine knows neither.
+    the machine knows neither. The policy flags are written into the same line
+    for the same reason the token is: whoever mints is deciding them, and a
+    flag left out here is a machine that pushes every project by name.
+
+    `--opt-in-repos` goes last and unquoted when *allow* is empty. It takes an
+    optional value, so a bare one earlier in the line would swallow whatever
+    followed it.
     """
-    return f"ccreport server connect {base_url.rstrip('/')} --token {token}"
+    parts = [f"ccreport server connect {base_url.rstrip('/')} --token {token}"]
+    if networks.strip():
+        parts.append(f"--only-on-network {shlex.quote(csv_list(networks))}")
+    if restricted:
+        names = csv_list(allow)
+        parts.append(f"--opt-in-repos {shlex.quote(names)}" if names else "--opt-in-repos")
+    return " ".join(parts)
+
+
+def csv_list(raw: str) -> str:
+    """A comma- or space-separated field as the comma list the CLI parses."""
+    return ",".join(item for item in raw.replace(",", " ").split() if item)

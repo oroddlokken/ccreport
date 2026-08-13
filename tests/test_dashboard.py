@@ -97,6 +97,44 @@ class TestRangeBounds:
         assert _view(app, 365).days == dashboard.DEFAULT_RANGE
 
 
+class TestAllTime:
+    def test_it_starts_at_the_oldest_record(self, app):
+        """60 days back, which the 90-day toggle also covers but 30 does not."""
+        view = _view(app, dashboard.ALL_TIME)
+        assert view.start == (NOW - timedelta(days=60)).strftime("%Y-%m-%d")
+        assert view.total_cost == pytest.approx(_view(app, 90).total_cost)
+
+    def test_the_chart_axis_spans_the_whole_history(self, app):
+        view = _view(app, dashboard.ALL_TIME)
+        assert len(view.chart_days) == 61
+        assert all(len(series.cost) == 61 for series in view.series)
+        assert sum(sum(s.cost) for s in view.series) == pytest.approx(view.total_cost)
+
+    def test_an_empty_database_falls_back_to_the_default_span(self, tmp_path):
+        """A zero-day axis has no columns and reads as a broken chart."""
+        app = create_app(sf.config(tmp_path))
+        view = dashboard.build(app.state.db.connect(), dashboard.ALL_TIME, NOW)
+        assert len(view.chart_days) == dashboard.DEFAULT_RANGE
+        assert view.total_cost == 0.0
+
+    def test_the_oldest_record_is_what_the_database_reports(self, app):
+        from ccreport.server import db
+
+        oldest = db.oldest_record_ts(app.state.db.connect())
+        assert oldest == pytest.approx(_ts(60))
+
+    def test_an_empty_database_has_no_oldest_record(self, tmp_path):
+        from ccreport.server import db
+
+        app = create_app(sf.config(tmp_path))
+        assert db.oldest_record_ts(app.state.db.connect()) is None
+
+    def test_the_toggle_reads_all_on_the_page(self, client):
+        body = client.get(f"/?days={dashboard.ALL_TIME}").text
+        assert ">All</a>" in body
+        assert f'href="/?days={dashboard.ALL_TIME}"' in body
+
+
 class TestTotals:
     def test_the_account_rows_total_to_the_headline(self, app):
         view = _view(app)
