@@ -368,7 +368,7 @@ new `CREATE TABLE` there gets a row here.
 | `ccreport_orphan_costs` | All-time cost of records whose JSONL is gone, pre-summed per `(dir_prefix, project, cwd, repo)`. Orphans are most of `ccreport_records` and none can ever change, but `all_time` has no window to bound the walk. Override rules are resolved at read time, so a `ccreport merge` re-groups with no rebuild. Valid only against `meta.ccreport_orphan_fp` | pricing.py |
 | `project_overrides` | Manual project-grouping rules (`name` / `remote` / `cwd_prefix` → target), applied by every reader | ccreport.py (write), project_identity.py (read) |
 | `project_scopes` | The resolved `(name, prefixes)` scope per cwd (§5.6). No fingerprint of its own — every writer of its two inputs clears it in the same transaction | pricing.py |
-| `extra_usage_snapshots` | `(ts, spent)` history of Extra usage spend, pruned at 31 days | usage_api.py (write), statusline.py (read) |
+| `extra_usage_snapshots` | `(ts, spent)` history of Extra usage spend, pruned at 31 days | usage_api.py (write), statusline.py (read), ccreport.py (read, §9.6) |
 | `exchange_rates` | Norges Bank USD→NOK daily spot rates, keyed by Oslo date | exchange.py |
 | `account_events` | Append-on-change log of the signed-in Claude account and its tiers (§9) | statusline.py (write), ccreport.py (read) |
 | `rate_limit_snapshots` | Utilization samples per rate-limit window, keyed by window instance (`resets_at`); a row only when the whole-percent reading moves. Never pruned (§9.6) | statusline.py (write), ccreport.py (read) |
@@ -1239,6 +1239,7 @@ Per instance:
 | pp/h | the rise (peak − **first reading taken**) over the fill span. Wall-clock, so an overnight gap between two renders counts as time the window took to fill — the rate to project a reset with, and the wrong one for "how fast does a working hour spend the quota". `None` (rendered `—`) for one sample or a window that never rose while it was watched, never 0, which would read as "not filling" |
 | Spend | deduplicated record cost over the **fill span**, so it describes the same stretch of time the rise and the rate do. Filtered to one model family for a scoped window (the model the sample names) and for the Sonnet window (scoped by definition); session and week count every model |
 | $/pp | Spend ÷ rise — an exchange rate, not an identity. The rate limit meters something Anthropic does not publish; this prices the points in the only unit this tool has. The footer's is the group's total spend over its total rise, not the mean of the rows: a window that rose one point would otherwise weigh as much as a week that rose forty |
+| Extra | real dollars billed as Extra usage while the window ran, from `extra_usage_snapshots`. Not gated on Hit, and measured over the window's whole span rather than over the fill — see below. `—` where no reading bounds the span, which is unknown and not $0.00; `$0.00` where readings bound it and it did not move. `--json` carries it as `extra_usd` |
 | Hit | `round(peak) >= 100`. Rounded to match the write gate, which only passes a whole-percent move — 99.6 is the last sample a full window can leave behind |
 | Account / Tier | attributed at the instance's **first** sample, via `AccountTimeline.label_at()` / `.tier_at()` — one bisect over the same events, so both answers come off the event in force when the window opened |
 
@@ -1248,6 +1249,40 @@ rows raw reported $510 against a stretch that had actually cost $231. A window
 that never rose prices as absent rather than as $0.00 — its fill span is a
 single instant, and the spend of an instant would read as "this window was
 free". So does every window when no corpus loaded at all.
+
+The Extra join is a different series over a different span (`_ExtraIndex`,
+`_instance_extra`): the window's own opening (`started_at`, or the first sample
+where the type has no derivable span) to its reset, or to now while it is still
+open. Deliberately not the fill span and deliberately not gated on Hit. Credits
+are billed by whichever limit ran out, which is rarely the window being priced —
+this machine's history has a session window filling while the week window it sat
+inside stood at 44%, and a session window sampled at 99.0% that billed $3.42,
+having run out between two renders. Both would read as $0.00 under a Hit gate.
+So the column answers "what was billed while this window ran", and the Hit
+beside it says whether this window is why.
+
+Windows of one type partition the period, so a table's Extra figures sum to what
+that period cost in credits — $6.70 on this machine, the exact cumulative total,
+in all three tables. Two types overlap, and each reports the same dollars.
+
+Reconciling the week against the sessions inside it needs one inference: a
+reading of $0.00 has nothing behind it, so where the series begins inside a
+window at zero, that reading is a baseline of its own. Without it the oldest
+window of every type reads `—` however much it billed, since the series can only
+have started after that window opened.
+
+The stored series is cumulative dollars within a billing month, so the span is
+walked reading by reading rather than subtracted end to end: a value below the
+one before it is the monthly reset, and the whole of that value is spend since
+it, which is what keeps a straddling window off a negative. Three things the
+number cannot say:
+
+- The baseline is the newest reading at or before the window opened and can
+  predate it by hours, which pulls spend from before the window into it
+- The series is written on slow renders alone and skipped by every costs-only
+  refresh, so a window can hold no reading at all. Without one at or before the
+  opening (or a $0.00 inside it) and one after that, the answer is `—`
+- 31 days of retention, so an older window is `—` however full it got
 
 Below each table, one caption line per **partial** window and then one per
 **open** window (`resets_at` in the
@@ -1265,7 +1300,9 @@ prints the same structures with raw floats and epochs and no local-time
 formatting.
 
 More columns than a terminal has room for, so `_fit_columns` drops Tier, then
-Account, then Samples until the table fits.
+Account, then Samples, then Extra until the table fits. Extra is in the list for
+the scoped table alone: its Model column is one the other three do not carry, and
+at 80 columns the first three drops leave it a character short.
 
 **Retention: nothing prunes this table**, decided together with the reader it
 feeds. The write gate holds one instance to ~100 rows, the report's questions are

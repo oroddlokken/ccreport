@@ -2342,6 +2342,54 @@ class _SpendIndex:
                 - cum[bisect.bisect_left(stamps, start)])
 
 
+class _ExtraIndex:
+    """Extra-usage spend over a time range, from the stored snapshot series.
+
+    The series is cumulative dollars within a billing month, sampled by the
+    status line on slow renders alone, so it is coarse and it restarts at 0
+    every month. A range is therefore walked rather than subtracted end to end:
+    a reading below the one before it is the monthly reset, and the whole of
+    that reading is spend since it.
+
+    *snapshots* are `(ts, spent)` in ts order, as cache_db.load_extra_snapshots
+    returns them.
+    """
+
+    def __init__(self, snapshots: list[tuple[float, float]]) -> None:
+        self._ts = [ts for ts, _spent in snapshots]
+        self._spent = [spent for _ts, spent in snapshots]
+
+    def spent_between(self, start: float, end: float) -> float | None:
+        """Dollars accrued in (*start*, *end*], or None where nothing bounds it.
+
+        Needs a reading at or before *start* to subtract from and one inside the
+        range to subtract it from. Missing either, the answer is unknown and not
+        $0.00 — the series is pruned at 31 days and skipped by every costs-only
+        refresh, so an absent reading says nothing about what was spent.
+
+        One exception, and it is what makes a week reconcile with the sessions
+        inside it: a reading of $0.00 has nothing behind it, so where the series
+        begins inside the range at zero it is a baseline of its own. Without it
+        the oldest window of every type is unknown however much it billed, since
+        the series can only start after it opened.
+        """
+        base = bisect.bisect_right(self._ts, start) - 1
+        last = bisect.bisect_right(self._ts, end)
+        if base < 0:
+            opening = bisect.bisect_left(self._ts, start)
+            if opening >= last or self._spent[opening] != 0.0:
+                return None
+            base = opening
+        if last <= base + 1:
+            return None
+        total = 0.0
+        prev = self._spent[base]
+        for spent in self._spent[base + 1:last]:
+            total += spent - prev if spent >= prev else spent
+            prev = spent
+        return total
+
+
 @dataclass(frozen=True)
 class WindowSpend:
     """What one window instance's observed rise cost, in API-priced dollars.
@@ -2354,6 +2402,9 @@ class WindowSpend:
     Measured over the fill span (first sample → peak), the same span
     WindowInstance.rise and .burn_pph are measured over, so the three describe
     one stretch of time and not three.
+
+    *extra_usd* is the exception, and the only real money here: dollars Anthropic
+    actually billed, over the window's whole life rather than over its fill span.
     """
 
     usd: float | None
@@ -2363,13 +2414,39 @@ class WindowSpend:
     headroom_usd: float | None
     """What the points left are worth at that rate; None for a closed window,
     whose points are gone rather than left."""
+    extra_usd: float | None = None
+    """Extra usage billed while the window ran; None where unknown."""
 
 
-_NO_SPEND = WindowSpend(None, None, None)
+def _instance_extra(
+    inst: WindowInstance, extra: _ExtraIndex, now: float,
+) -> float | None:
+    """Extra usage billed while *inst* ran, or None where nothing bounds it.
+
+    From the window opening to its reset, or to now while it is still open —
+    not from the moment it was seen full, and not gated on Hit. Credits are
+    billed by whichever limit ran out, which is rarely this one: a session
+    window filling bills against a week window that stands at 44%, and a window
+    sampled at 99% had run out too and the render that would have said so never
+    happened. Both are in this machine's history.
+
+    So the column answers "what was billed while this window ran", and the Hit
+    beside it says whether this window is why. Windows of one type partition
+    time, so a table's figures sum to what the period cost; two types overlap,
+    and each reports the same dollars.
+
+    The span is the window's own, not the sampled part of it: unwatched hours
+    bill like any other. Where its length is unknown the first sample has to
+    stand in, and the hours before it are missing from the figure.
+    """
+    return extra.spent_between(
+        inst.started_at if inst.started_at is not None else inst.first_ts,
+        min(inst.resets_at, now),
+    )
 
 
 def _instance_spend(
-    inst: WindowInstance, index: _SpendIndex, now: float,
+    inst: WindowInstance, index: _SpendIndex, extra: _ExtraIndex, now: float,
 ) -> WindowSpend:
     """Price *inst*'s rise, and what is left of it, against the record corpus.
 
@@ -2377,15 +2454,20 @@ def _instance_spend(
     rather than as $0.00: its fill span is a single instant, and the spend of
     an instant is a number nobody asked for wearing the answer to "was this
     window free".
+
+    Extra usage survives that early return: it is metered by the clock rather
+    than by the rise, so a window nobody watched rising still billed what it
+    billed.
     """
+    extra_usd = _instance_extra(inst, extra, now)
     if index.empty or inst.rise <= 0:
-        return _NO_SPEND
+        return WindowSpend(None, None, None, extra_usd)
     usd = index.total(inst.first_ts, inst.peak_ts, _window_family(inst))
     per_pp = usd / inst.rise
     headroom = (
         max(100.0 - inst.latest_pct, 0.0) * per_pp if inst.is_open(now) else None
     )
-    return WindowSpend(usd, per_pp, headroom)
+    return WindowSpend(usd, per_pp, headroom, extra_usd)
 
 
 def _load_instance_spend(
@@ -2401,13 +2483,17 @@ def _load_instance_spend(
     The full record path on purpose — dedup is what makes the number an answer.
     Summing the rows raw double-counts every message the log wrote twice, which
     on this machine reported $510 against a stretch that actually cost $231.
+
+    The Extra series is loaded whole: 31 days of slow renders, against a record
+    corpus that has to be filtered to stay affordable.
     """
     if not instances:
         return {}
     since = _as_local(min(i.first_ts for i in instances))
     until = _as_local(max(i.peak_ts for i in instances))
     index = _SpendIndex(load_all_records(since=since, until=until))
-    return {i.key: _instance_spend(i, index, now) for i in instances}
+    extra = _ExtraIndex(cache_db.load_extra_snapshots())
+    return {i.key: _instance_spend(i, index, extra, now) for i in instances}
 
 
 def _implausible_reset(sample: dict) -> bool:
@@ -2518,6 +2604,7 @@ def _limits_entry(
         "spend_usd": spend.usd,
         "usd_per_pp": spend.per_pp,
         "headroom_usd": spend.headroom_usd,
+        "extra_usd": spend.extra_usd,
         "hit_limit": inst.hit_limit,
         "partial": inst.partial,
         "window_start": inst.started_at,
@@ -2601,8 +2688,8 @@ def report_limits(
     the account the window opened under.
 
     *spends* is keyed by WindowInstance.key. Every instance must be in it, an
-    unpriceable one as _NO_SPEND: a missing key here would be a KeyError in the
-    middle of a rendered table.
+    unpriceable one as an all-None WindowSpend: a missing key here would be a
+    KeyError in the middle of a rendered table.
     """
     for window in _window_types(instances):
         group = [i for i in instances if i.window == window]
@@ -2623,6 +2710,7 @@ def report_limits(
         table.add_column("pp/h", justify="right", no_wrap=True)
         table.add_column("Spend", justify="right", no_wrap=True)
         table.add_column("$/pp", justify="right", no_wrap=True)
+        table.add_column("Extra", justify="right", no_wrap=True)
         table.add_column("Hit", justify="center", no_wrap=True)
         # The two wrappable columns, so Rich shaves width off these first.
         table.add_column("Account", style="green")
@@ -2632,7 +2720,7 @@ def report_limits(
             when = _as_local(inst.first_ts)
             tier = accounts.tier_at(when)
             spend = spends[inst.key]
-            row = [_fmt_epoch(inst.resets_at)]
+            row: list = [_fmt_epoch(inst.resets_at)]
             if scoped:
                 row.append(short_model(inst.model) if inst.model else _ABSENT)
             row += [
@@ -2645,6 +2733,7 @@ def report_limits(
                 _fmt_burn(inst.burn_pph),
                 Text(_fmt_money(spend.usd), style=cost_style(spend.usd or 0.0)),
                 _fmt_money(spend.per_pp),
+                Text(_fmt_money(spend.extra_usd), style=cost_style(spend.extra_usd or 0.0)),
                 Text("yes", style="bold red") if inst.hit_limit else "",
                 _flex_cell(accounts.label_at(when)),
                 _flex_cell(tier or _ABSENT),
@@ -2656,6 +2745,11 @@ def report_limits(
         priced: list[float] = [
             usd for i in group if (usd := spends[i.key].usd) is not None
         ]
+        # Windows of one type partition the period, so this totals what it cost
+        # in credits — short whatever the windows with no baseline billed.
+        extras: list[float] = [
+            usd for i in group if (usd := spends[i.key].extra_usd) is not None
+        ]
         summary: list = [Text(f"{len(group)} window(s)", style="dim bold")]
         if scoped:
             summary.append("")
@@ -2666,6 +2760,7 @@ def report_limits(
             "",
             _fmt_money(sum(priced) if priced else None),
             _fmt_money(_group_per_pp(group, spends)),
+            _fmt_money(sum(extras) if extras else None),
             f"{hits} hit",
             "", "",
         ]
@@ -2674,8 +2769,11 @@ def report_limits(
         # Which columns go when the terminal is too narrow for all of them.
         # Tier and account change rarely and are named in the row above the one
         # that changed them; the sample count is how the numbers were arrived
-        # at, not one of them.
-        _fit_columns(table, ("Tier", "Account", "Samples"))
+        # at, not one of them. Extra goes last and only to save the scoped
+        # table, which carries a Model column the other three do not: at 80
+        # columns dropping the first three still leaves it a character short,
+        # and Rich's answer to that is to ellipsize every column at once.
+        _fit_columns(table, ("Tier", "Account", "Samples", "Extra"))
         _print_report(table)
 
 

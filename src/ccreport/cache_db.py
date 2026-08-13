@@ -3019,6 +3019,20 @@ def load_rate_limit_snapshots() -> list[dict[str, Any]]:
     ]
 
 
+def load_extra_snapshots() -> list[tuple[float, float]]:
+    """Every stored `(ts, spent)` Extra-usage reading, oldest first.
+
+    Cumulative within a billing month and pruned to 31 days by
+    write_usage_cache, so a reader has to treat a drop as the monthly reset and
+    the missing days as unknown rather than as no spend.
+    """
+    conn = get_connection()
+    return [
+        (row[0], row[1])
+        for row in conn.execute("SELECT ts, spent FROM extra_usage_snapshots ORDER BY ts")
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Cost summary cache (written by compute_costs, read by statusline)
 # ---------------------------------------------------------------------------

@@ -2091,6 +2091,20 @@ def _seed_samples(
         )
 
 
+def _seed_extra(points):
+    """Write `(iso, spent)` readings straight into the Extra-spend series.
+
+    write_usage_cache stamps its own snapshot with time.time(), which puts every
+    reading in the present and none of them inside a window from 2026-06-15.
+    """
+    conn = cache_db.get_connection()
+    conn.executemany(
+        "INSERT OR REPLACE INTO extra_usage_snapshots (ts, spent) VALUES (?, ?)",
+        [(_local_epoch(iso), spent) for iso, spent in points],
+    )
+    conn.commit()
+
+
 def _instances():
     return sorted(
         ccr._window_instances(cache_db.load_rate_limit_snapshots()),
@@ -2332,7 +2346,7 @@ class TestWindowFamily:
 class TestInstanceSpend:
     """What a window's rise cost, and what the rest of it is worth."""
 
-    def _priced(self, pcts, *, now_iso="2026-06-15T10:00", records=None):
+    def _priced(self, pcts, *, now_iso="2026-06-15T10:00", records=None, extra=()):
         _seed_samples("session", _W1_RESET, _W1_START, pcts)
         index = ccr._SpendIndex(
             records
@@ -2342,7 +2356,9 @@ class TestInstanceSpend:
                 _spend_rec("2026-06-15T09:30", usd=5.0),
             ]
         )
-        return ccr._instance_spend(_instances()[0], index, _local_epoch(now_iso))
+        return ccr._instance_spend(
+            _instances()[0], index, ccr._ExtraIndex(list(extra)), _local_epoch(now_iso)
+        )
 
     def test_the_spend_is_what_the_fill_span_cost(self):
         """08:00 → 09:00 is the fill; the 09:30 record is after the peak."""
@@ -2367,10 +2383,105 @@ class TestInstanceSpend:
 
     def test_a_window_that_never_rose_prices_as_nothing_at_all(self):
         """$0.00 over an instant would read as a window that was free."""
-        assert self._priced([30.0]) == ccr._NO_SPEND
+        assert self._priced([30.0]) == ccr.WindowSpend(None, None, None)
 
     def test_a_missing_corpus_prices_as_nothing_at_all(self):
-        assert self._priced([10.0, 30.0], records=[]) == ccr._NO_SPEND
+        assert self._priced([10.0, 30.0], records=[]) == ccr.WindowSpend(None, None, None)
+
+
+class TestExtraIndex:
+    """Extra-usage dollars over a range, from a coarse cumulative series."""
+
+    def _spent(self, points, start_iso, end_iso):
+        index = ccr._ExtraIndex([(_local_epoch(i), v) for i, v in points])
+        return index.spent_between(_local_epoch(start_iso), _local_epoch(end_iso))
+
+    def test_the_range_is_the_rise_from_the_reading_before_it(self):
+        points = [("2026-06-15T08:30", 5.0), ("2026-06-15T09:30", 8.0),
+                  ("2026-06-15T12:00", 11.0)]
+        assert self._spent(points, "2026-06-15T09:00", "2026-06-15T13:00") == 6.0
+
+    def test_a_series_that_never_moved_reads_zero(self):
+        points = [("2026-06-15T08:30", 5.0), ("2026-06-15T09:30", 5.0)]
+        assert self._spent(points, "2026-06-15T09:00", "2026-06-15T13:00") == 0.0
+
+    def test_no_reading_before_the_range_is_unknown(self):
+        """$0.00 here would claim a window billed nothing nobody watched."""
+        points = [("2026-06-15T09:30", 8.0)]
+        assert self._spent(points, "2026-06-15T09:00", "2026-06-15T13:00") is None
+
+    def test_a_series_starting_at_zero_inside_the_range_is_its_own_baseline(self):
+        """Nothing can sit behind a cumulative $0.00."""
+        points = [("2026-06-15T09:30", 0.0), ("2026-06-15T12:00", 8.0)]
+        assert self._spent(points, "2026-06-15T09:00", "2026-06-15T13:00") == 8.0
+
+    def test_a_series_starting_at_zero_and_going_nowhere_reads_zero(self):
+        points = [("2026-06-15T09:30", 0.0), ("2026-06-15T12:00", 0.0)]
+        assert self._spent(points, "2026-06-15T09:00", "2026-06-15T13:00") == 0.0
+
+    def test_one_zero_inside_the_range_and_nothing_after_it_is_unknown(self):
+        """A baseline with nothing to subtract from it answers nothing."""
+        points = [("2026-06-15T09:30", 0.0)]
+        assert self._spent(points, "2026-06-15T09:00", "2026-06-15T13:00") is None
+
+    def test_no_reading_inside_the_range_is_unknown(self):
+        points = [("2026-06-15T08:30", 5.0)]
+        assert self._spent(points, "2026-06-15T09:00", "2026-06-15T13:00") is None
+
+    def test_a_billing_reset_counts_the_new_reading_and_not_a_negative(self):
+        """40 → 42 is 2, then the month rolls over and 0.5 → 1.5 is 1.5 more."""
+        points = [("2026-06-15T08:30", 40.0), ("2026-06-15T09:30", 42.0),
+                  ("2026-06-15T11:00", 0.5), ("2026-06-15T12:00", 1.5)]
+        assert self._spent(points, "2026-06-15T09:00", "2026-06-15T13:00") == 3.5
+
+    def test_an_empty_series_is_unknown(self):
+        assert self._spent([], "2026-06-15T09:00", "2026-06-15T13:00") is None
+
+
+class TestInstanceExtra:
+    """What one window billed in Extra credits over the span it ran."""
+
+    def _extra(self, pcts, points=(), *, now_iso="2026-06-15T14:00", window="session",
+               first="2026-06-15T08:00"):
+        _seed_samples(window, _W1_RESET, _local_epoch(first), pcts)
+        index = ccr._ExtraIndex([(_local_epoch(i), v) for i, v in points])
+        return ccr._instance_extra(_instances()[0], index, _local_epoch(now_iso))
+
+    # The window opens at 08:00 and resets at 13:00, so 07:30 is the baseline
+    # and the 13:30 reading is the next window's business.
+    _POINTS = [("2026-06-15T07:30", 5.0), ("2026-06-15T09:30", 8.0),
+               ("2026-06-15T12:00", 11.0), ("2026-06-15T13:30", 20.0)]
+
+    def test_a_window_bills_from_when_it_opened_to_its_reset(self):
+        assert self._extra([50.0, 100.0], self._POINTS) == 6.0
+
+    def test_a_window_that_never_filled_bills_what_ran_out_elsewhere(self):
+        """A session limit exhausting bills against a week window at 60%."""
+        assert self._extra([50.0, 60.0], self._POINTS) == 6.0
+
+    def test_an_open_window_bills_up_to_now(self):
+        assert self._extra([50.0, 100.0], self._POINTS, now_iso="2026-06-15T10:00") == 3.0
+
+    def test_the_span_is_the_window_and_not_the_part_that_was_sampled(self):
+        """The window opened at 08:00; the first render of it was at 10:00."""
+        points = [("2026-06-15T07:30", 5.0), ("2026-06-15T09:00", 9.0)]
+        assert self._extra([50.0], points, first="2026-06-15T10:00") == 4.0
+
+    def test_a_window_of_unknown_length_falls_back_to_its_first_sample(self):
+        """No span for opus_hourly, so 09:00 becomes the baseline instead."""
+        points = [("2026-06-15T07:30", 5.0), ("2026-06-15T09:00", 9.0),
+                  ("2026-06-15T11:00", 12.0)]
+        assert self._extra(
+            [50.0], points, window="opus_hourly", first="2026-06-15T10:00"
+        ) == 3.0
+
+    def test_a_window_with_no_baseline_is_unknown(self):
+        assert self._extra([50.0, 100.0], [("2026-06-15T09:30", 8.0)]) is None
+
+    def test_a_window_straddling_the_billing_reset_reports_what_accrued(self):
+        points = [("2026-06-15T07:30", 40.0), ("2026-06-15T09:30", 42.0),
+                  ("2026-06-15T11:00", 0.5)]
+        assert self._extra([50.0, 100.0], points) == 2.5
 
 
 class TestLimitsAttribution:
@@ -2513,6 +2624,7 @@ class TestCmdLimits:
                 "spend_usd": 8.0,
                 "usd_per_pp": 8.0 / 97.7,
                 "headroom_usd": None,
+                "extra_usd": None,
                 "hit_limit": True,
                 "partial": False,
                 "window_start": _W1_START,
@@ -2521,6 +2633,12 @@ class TestCmdLimits:
                 "limit_tier": "default_claude_max_5x",
             }
         ]
+
+    def test_the_json_carries_the_extra_usage_billed_while_the_window_ran(self, capsys):
+        self._corpus()
+        _seed_extra([("2026-06-15T07:30", 5.0), ("2026-06-15T12:00", 11.0)])
+        [entry] = self._json(capsys, window="session")
+        assert entry["extra_usd"] == 6.0
 
     def test_the_json_lists_every_window_in_the_printed_order(self, capsys):
         self._corpus()
@@ -2614,23 +2732,32 @@ class TestCmdLimits:
 class TestLimitsRendering:
     """The table's own decisions: the caption, and what a narrow terminal loses."""
 
-    def _render(self, monkeypatch, *, width=200, records=(), now=None):
+    def _render(self, monkeypatch, *, width=200, records=(), now=None, extra=()):
         buf = io.StringIO()
         monkeypatch.setattr(
             ccr, "console", Console(file=buf, width=width, no_color=True)
         )
         instances = _instances()
         stamp = _local_epoch(now) if now else _W1_START
+        index, extras = ccr._SpendIndex(list(records)), ccr._ExtraIndex(list(extra))
         spends = {
-            i.key: ccr._instance_spend(i, ccr._SpendIndex(list(records)), stamp)
-            for i in instances
+            i.key: ccr._instance_spend(i, index, extras, stamp) for i in instances
         }
         ccr.report_limits(instances, _timeline(), spends, stamp)
         return buf.getvalue()
 
+    def _reflowed(self, *args, **kw):
+        """The render with every run of whitespace collapsed to one space.
+
+        Rich wraps the caption to the table's width, so a phrase an assertion
+        names straddles a line break the moment a column is added or a number
+        gets wider.
+        """
+        return " ".join(self._render(*args, **kw).split())
+
     def test_an_open_window_is_read_out_under_its_table(self, monkeypatch):
         _seed_samples("session", _W1_RESET, _W1_START, [10.0, 30.0])
-        out = self._render(
+        out = self._reflowed(
             monkeypatch,
             now="2026-06-15T10:00",
             records=[
@@ -2652,7 +2779,7 @@ class TestLimitsRendering:
             model="claude-fable-5",
             source="api",
         )
-        assert "fable-5: open at 30.0%" in self._render(
+        assert "fable-5: open at 30.0%" in self._reflowed(
             monkeypatch, now="2026-06-15T10:00"
         )
 
@@ -2664,12 +2791,12 @@ class TestLimitsRendering:
         self, monkeypatch
     ):
         _seed_samples("session", _W1_RESET, _W1_START, [30.0])
-        out = self._render(monkeypatch, now="2026-06-15T10:00")
+        out = self._reflowed(monkeypatch, now="2026-06-15T10:00")
         assert "no rate to project from yet" in out
 
     def test_a_partial_window_is_starred_and_read_out(self, monkeypatch):
         _seed_samples("week", _W1_RESET, _W1_START, [77.0, 93.0])
-        out = self._render(monkeypatch, now="2026-06-15T13:01")
+        out = self._reflowed(monkeypatch, now="2026-06-15T13:01")
         assert "93.0%*" in out
         assert "first sampled at 77.0%" in out
         assert "Peak counts that rise" in out
@@ -2683,10 +2810,23 @@ class TestLimitsRendering:
         wide = self._render(monkeypatch, width=200)
         for header in ("Tier", "Account", "Samples"):
             assert header in wide
-        narrow = self._render(monkeypatch, width=80)
+        narrow = self._render(monkeypatch, width=88)
         assert "Tier" not in narrow
         assert "Account" not in narrow
         assert "Samples" in narrow
+
+    def test_the_scoped_table_drops_extra_rather_than_ellipsize_everything(
+        self, monkeypatch
+    ):
+        """Its Model column is one the other three do not carry."""
+        _seed_samples(
+            "scoped", _W1_RESET, _W1_START, [10.0, 30.0],
+            model="claude-fable-5", source="api",
+        )
+        narrow = self._render(monkeypatch, width=80)
+        assert "Extra" not in narrow
+        assert "Model" in narrow
+        assert "…" not in narrow
 
     def test_the_numbers_survive_a_terminal_too_narrow_for_the_words(self, monkeypatch):
         """Rich's own answer is to ellipsize every column, losing all of them."""
@@ -2700,3 +2840,21 @@ class TestLimitsRendering:
         )
         assert "20.0" in narrow
         assert "$0.5" in narrow
+
+    def test_the_extra_column_prices_a_window_that_never_hit(self, monkeypatch):
+        _seed_samples("session", _W1_RESET, _W1_START, [10.0, 30.0])
+        out = self._render(
+            monkeypatch,
+            now="2026-06-15T13:01",
+            extra=[(_local_epoch("2026-06-15T07:30"), 5.0),
+                   (_local_epoch("2026-06-15T12:00"), 11.0)],
+        )
+        assert "Extra" in out
+        assert "$6.00" in out
+
+    def test_a_window_with_no_baseline_reads_as_absent(self, monkeypatch):
+        """The heading is always there; unknown is a dash and not $0.00."""
+        _seed_samples("session", _W1_RESET, _W1_START, [50.0, 100.0])
+        out = self._render(monkeypatch, now="2026-06-15T13:01")
+        assert "Extra" in out
+        assert ccr._ABSENT in out
