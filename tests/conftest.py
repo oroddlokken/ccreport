@@ -4,9 +4,45 @@ from __future__ import annotations
 
 import pytest
 
+CONFIGURED_BY_ENV = (
+    "CF_BADGE",
+    "CLAUDE_CACHE_DB_TIMEOUT",
+    "CLAUDE_CACHE_SANITY_ABORT",
+    "CLAUDE_CACHE_SANITY_DISABLE",
+    "CLAUDE_CACHE_SNAPSHOT_DEFER",
+    "CLAUDE_CACHE_SNAPSHOT_DIR",
+    "CLAUDE_CACHE_SNAPSHOT_DISABLE",
+    "CLAUDE_CACHE_SNAPSHOT_KEEP",
+    "CLAUDE_CODE_PACE_DAYS",
+    "CLAUDE_STATUSLINE_TIMESTAMP_EPOCH",
+    "CLAUDE_STATUSLINE_TOTAL_TOKEN",
+    "CLAUDE_STATUSLINE_USAGE_JSON",
+)
+"""Every variable the code reads for configuration, as `just lint-all` sees them.
+
+TZ, TMPDIR, COLUMNS and XDG_CONFIG_HOME are read too and stay: Rich reads
+COLUMNS when the module-level console is built at import, before any fixture
+runs, and the date tests derive their expectations from the local zone rather
+than assuming one.
+"""
+
 
 @pytest.fixture(autouse=True)
-def isolate_cache_db(tmp_path, monkeypatch):
+def isolate_environment(monkeypatch):
+    """Keep the developer's own shell out of the suite.
+
+    Each of these changes what the code under test does, so a shell that
+    exports one fails tests that pass everywhere else — `CLAUDE_CODE_PACE_DAYS=5`
+    took five of the `ccu` pace tests with it. A test that wants one sets it
+    itself; isolate_cache_db asks for this fixture by name so its own
+    CLAUDE_CACHE_SNAPSHOT_DISABLE survives.
+    """
+    for name in CONFIGURED_BY_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def isolate_cache_db(tmp_path, monkeypatch, isolate_environment):
     """Keep every test off the real ~/.cache/ccreport/cache.db.
 
     The modules under test reach cache_db through helpers that open the
