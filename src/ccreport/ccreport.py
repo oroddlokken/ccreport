@@ -1747,11 +1747,15 @@ def cmd_server_allow(args) -> None:
 
 
 def cmd_server_status(args) -> None:
-    """Print what each configured server knows this machine as, and under what policy."""
+    """Print what each configured server knows this machine as, and under what policy.
+
+    A bare `ccreport server` lands here too, and it parsed no subparser, so
+    --config is absent from that namespace rather than None.
+    """
     from ccreport import push
     from ccreport.remote import RemoteError, fetch_health
 
-    path = Path(args.config or push.CONFIG_PATH)
+    path = Path(getattr(args, "config", None) or push.CONFIG_PATH)
     servers = push.load_config(path)
     if not servers:
         console.print(f"No {path} — run `ccreport server connect <url> --token ...` first.")

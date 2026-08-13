@@ -3,12 +3,12 @@
 {% block content %}
 <h1>Token for {{ machine_id }}</h1>
 
-<p>Run this on that machine. It is the only time the token is shown.</p>
+<p>Run this on that machine. The token is shown here and nowhere else.</p>
 <pre class="command">{{ command }}</pre>
 
 <p class="dim">
-  Only a hash is stored, so this page cannot be reopened. Lose the token and
-  mint another; revoking the old one stops it on that machine's next push.
+  Only its hash is stored. A lost token is re-minted, never recovered, and
+  revoking one stops it at that machine's next push.
 </p>
 
 <p><a href="/machines/{{ machine_id }}">Back to {{ machine_id }}</a></p>

@@ -1,0 +1,34 @@
+# The ccreport server for local development: one container, one SQLite file on
+# a named volume, the dashboard on http://127.0.0.1:8787/. Point a machine at
+# it with `ccreport server connect http://127.0.0.1:8787`, after minting a
+# token at /machines.
+
+services:
+  ccreport-server:
+    build:
+      context: .
+    image: ccreport:dev
+    container_name: ccreport-server
+    restart: unless-stopped
+    environment:
+      CCREPORT_SERVER_DB: /data/server.db
+      # A browser on the host reaches the container through the compose bridge,
+      # so the request arrives from the gateway address and the default
+      # loopback allowlist answers it 403. These are the private ranges a
+      # bridge is assigned from, plus loopback for a curl inside the container.
+      CCREPORT_SERVER_NETWORKS: 127.0.0.1/32 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+      # macOS does not forward inotify events across a bind mount, so the
+      # reloader has to poll.
+      WATCHFILES_FORCE_POLLING: "true"
+    ports:
+      # Loopback only: the pages have no authentication of their own, and the
+      # allowlist above is wide enough to admit any host on the LAN.
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ccreport-data:/data
+      # An edit on the host restarts the server; read-only so the container
+      # cannot write back into the checkout.
+      - ./src:/app/src:ro
+
+volumes:
+  ccreport-data:

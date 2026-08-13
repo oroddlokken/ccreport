@@ -520,6 +520,15 @@ class TestStatusCommand:
         out = self._run(monkeypatch, ["server", "status", "--config", str(path)])
         assert "the token was refused" in out
 
+    def test_a_bare_server_command_reads_the_default_config(
+        self, tmp_path, monkeypatch, reachable,
+    ):
+        """No subparser ran, so the namespace carries no --config to read."""
+        path = _write_config(tmp_path)
+        monkeypatch.setattr(push, "CONFIG_PATH", path)
+        out = self._run(monkeypatch, ["server"])
+        assert "laptop-1" in out
+
     def test_an_unreachable_server_is_reported_not_raised(self, tmp_path, monkeypatch):
         from ccreport.remote import RemoteError
 

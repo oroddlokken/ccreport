@@ -44,7 +44,7 @@ def _token_from(page: str) -> str:
 class TestMachinesPage:
     def test_an_empty_server_says_so(self, client):
         body = client.get("/machines").text
-        assert "No machine has been minted a token yet." in body
+        assert "No machine has a token yet." in body
 
     def test_a_minted_machine_shows_up_as_active(self, client):
         _mint(client)

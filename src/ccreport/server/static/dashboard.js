@@ -1,16 +1,14 @@
-// The dashboard's two toggles and the chart they drive.
-//
-// No framework and no build step: the page is server-rendered, and this file
-// only swaps which series uPlot draws and which breakdown table is visible.
+// The dashboard's two toggles and the chart they drive: which series uPlot
+// draws, and which breakdown table is visible. The page itself is
+// server-rendered.
 
 (function () {
   const payload = JSON.parse(document.getElementById("chart-data").textContent);
   const box = document.getElementById("chart");
   if (!box || !payload.days.length) return;
 
-  // A palette that stays legible on the dark background and keeps two accounts
-  // apart at a glance. More accounts than colours cycles rather than repeating
-  // a neighbour.
+  // Legible on the dark background, and apart from each other. More accounts
+  // than colours cycles.
   const COLORS = ["#7aa2f7", "#7bd88f", "#e0af68", "#bb9af7", "#f7768e", "#2ac3de"];
 
   const xs = payload.days.map((day) => Date.parse(day + "T00:00:00") / 1000);

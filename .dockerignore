@@ -1,0 +1,16 @@
+**/__pycache__
+**/.venv
+**/.vscode
+.ruff_cache
+.pytest_cache
+htmlcov
+.coverage*
+.testmondata*
+node_modules
+.env
+.git
+.dogcats
+.claude-cache
+*.db
+*.db-shm
+*.db-wal

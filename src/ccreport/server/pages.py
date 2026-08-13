@@ -4,9 +4,7 @@ Server-rendered HTML with no client framework and no build step. Every route
 here sits behind the network allowlist; ingest does not, because a machine
 pushes from wherever it is.
 
-Anyone on an allowed network can mint. That is the accepted trade: the pages
-are reachable from home and nowhere else, and a password on top of that would
-be one more thing to keep somewhere.
+Anyone on an allowed network can mint. There is no password.
 """
 
 from __future__ import annotations
@@ -40,7 +38,7 @@ templates.env.filters["when"] = _when
 
 @router.get("/", response_class=HTMLResponse)
 def index(request: Request, days: int = Query(default=dashboard.DEFAULT_RANGE)):
-    """The merged spend dashboard, which is what the server is opened for."""
+    """The merged spend dashboard."""
     view = dashboard.build(request.app.state.db.connect(), days)
     return templates.TemplateResponse(request, "dashboard.html", {
         "view": view,
@@ -58,7 +56,7 @@ def index(request: Request, days: int = Query(default=dashboard.DEFAULT_RANGE)):
 
 @router.get("/machines", response_class=HTMLResponse)
 def machines(request: Request):
-    """The machines table: is that laptop still reporting?"""
+    """Every machine, with its last push, record count and token state."""
     conn = request.app.state.db.connect()
     return templates.TemplateResponse(
         request, "machines.html", {"machines": db.machine_overview(conn)},

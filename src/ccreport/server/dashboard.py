@@ -1,12 +1,11 @@
 """What the merged spend page shows: a headline, five tiles, a chart, a table.
 
-Everything here folds the same records `ccreport --server` renders, through the
-same `aggregate.py`. What the page adds is the five stat tiles, which no CLI
-table carries, and the shapes uPlot wants.
+Folds the same records `ccreport --server` renders, through the same
+`aggregate.py`. What the page adds is the five stat tiles and the shapes uPlot
+wants.
 
-A project a restricted machine did not opt in to appears under its pseudonym
-with its real cost and token counts. That is the point of the redaction design,
-and the page does not special-case it away.
+A project a restricted machine did not opt in to appears under its pseudonym,
+with its real cost and token counts.
 """
 
 from __future__ import annotations
@@ -29,9 +28,8 @@ DIMENSIONS = ("model", "day", "project", "machine")
 def range_bounds(days: int, now: datetime) -> tuple[datetime, datetime]:
     """The half-open span a range toggle selects, ending at the next midnight.
 
-    Whole local days: a "7 days" that ended at the current minute would move
-    every row a little on every refresh, and the chart's last column would be a
-    part-day the eye reads as a collapse in usage.
+    Whole local days: a span ending at the current minute makes the chart's
+    last column a part-day that reads as a collapse in usage.
     """
     end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
     return end - timedelta(days=days), end
@@ -39,7 +37,7 @@ def range_bounds(days: int, now: datetime) -> tuple[datetime, datetime]:
 
 @dataclass
 class Tile:
-    """One stat tile: a number, and the derived line that makes it worth reading."""
+    """One stat tile: a number and the line derived under it."""
 
     label: str
     value: str
@@ -101,22 +99,17 @@ def _fmt_usd(value: float) -> str:
 
 
 def _uncached_input_rate(model: str, when: datetime) -> float:
-    """What one input token costs uncached, for the savings tile.
-
-    None of the pricing tables is consulted twice: this is the same
-    find_pricing every cost on the page went through.
-    """
+    """What one input token costs uncached, for the savings tile."""
     prices = pricing.find_pricing(model, when)
     return prices.get("input", 0.0) if prices else 0.0
 
 
 def _tiles(merged: list[reports.MergedRecord], total_cost: float) -> list[Tile]:
-    """The five tiles, each with the subline that makes the number mean something.
+    """The five tiles, each with the subline its number is read against.
 
-    Cache savings is the one worth explaining: it prices every cache read at
-    what that token would have cost as fresh input, which is what the read
-    replaced. Expressed as a multiple of what was actually paid, because "12x"
-    answers "is the caching working" and a dollar figure does not.
+    Cache savings prices every cache read as fresh input, then divides by what
+    was paid. The multiple answers "is the caching working"; a dollar figure
+    does not.
     """
     tokens = aggregate.TokenCounts()
     read_at_input_price = 0.0
@@ -164,7 +157,7 @@ def _chart(merged: list[reports.MergedRecord], start: datetime, days: int,
     """One series per account over a dense day axis.
 
     Dense, so a day nobody worked is a zero rather than a gap the line jumps
-    across — which would read as a straight climb through a quiet weekend.
+    across.
     """
     axis = [
         (start + timedelta(days=offset)).strftime("%Y-%m-%d")
@@ -188,17 +181,14 @@ _DIMENSION_KEYS = {
     "project": lambda item: item.record.project,
     "machine": lambda item: item.machine,
 }
-"""What each breakdown groups on. machine is the one no local report has, and
-the reason the merge exists at all."""
+"""What each breakdown groups on. machine is the one no local report has."""
 
 
 def _breakdown(merged: list[reports.MergedRecord], dimension: str,
                total_cost: float) -> list[dict]:
     """One dimension's rows: cost, share and tokens, priciest first.
 
-    Every dimension folds the same records, so all four total to the same
-    overall cost — which is what makes the toggle a change of view rather than
-    a change of subject.
+    Every dimension folds the same records, so all four total the same cost.
     """
     key_fn = _DIMENSION_KEYS[dimension]
     folded: dict[str, aggregate.AggBucket] = {}
