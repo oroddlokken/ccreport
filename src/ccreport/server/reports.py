@@ -219,7 +219,7 @@ def _as_grouped(row: tuple, labels: dict) -> MergedRecord:
         ),
         # The group's earliest instant. Every row in it shares a model and a
         # day, so it prices the group exactly where a per-record timestamp
-        # would — and the dashboard's savings tile asks for nothing else.
+        # would — and the dashboard's cache-reads tile asks for nothing else.
         timestamp=datetime.fromtimestamp(first_ts, tz=UTC),
         session_id="",
         project=project or "(redacted)",

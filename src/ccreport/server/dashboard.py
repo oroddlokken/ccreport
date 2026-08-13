@@ -120,7 +120,7 @@ def _fmt_usd(value: float) -> str:
 
 
 def _uncached_input_rate(model: str, when: datetime) -> float:
-    """What one input token costs uncached, for the savings tile."""
+    """What one input token costs uncached, for the cache-reads tile."""
     prices = pricing.find_pricing(model, when)
     return prices.get("input", 0.0) if prices else 0.0
 
@@ -128,9 +128,10 @@ def _uncached_input_rate(model: str, when: datetime) -> float:
 def _tiles(merged: list[reports.MergedRecord], total_cost: float) -> list[Tile]:
     """The five tiles, each with the subline its number is read against.
 
-    Cache savings prices every cache read as fresh input, then divides by what
-    was paid. The multiple answers "is the caching working"; a dollar figure
-    does not.
+    Cache reads vs spend prices every cache read as fresh input, then divides by
+    the whole bill. The multiple answers "is the caching working"; a dollar
+    figure does not. It is not what caching saved: the denominator covers output
+    and uncached input too, and the reads themselves were not free.
     """
     tokens = aggregate.TokenCounts()
     read_at_input_price = 0.0
@@ -145,7 +146,7 @@ def _tiles(merged: list[reports.MergedRecord], total_cost: float) -> list[Tile]:
     active = max(len(days), 1)
     observed_input = tokens.input + tokens.cache_create + tokens.cache_read
     cached_share = (tokens.cache_read / observed_input * 100) if observed_input else 0.0
-    savings_multiple = (read_at_input_price / total_cost) if total_cost > 0 else 0.0
+    read_multiple = (read_at_input_price / total_cost) if total_cost > 0 else 0.0
 
     return [
         Tile("Processed tokens", _fmt_tokens(tokens.total),
@@ -156,8 +157,9 @@ def _tiles(merged: list[reports.MergedRecord], total_cost: float) -> list[Tile]:
              f"{_fmt_tokens(tokens.cache_create)} written to cache"),
         Tile("Output", _fmt_tokens(tokens.output),
              f"{_fmt_tokens(tokens.output / active)} per active day"),
-        Tile("Cache savings", f"{savings_multiple:.1f}x",
-             f"{_fmt_usd(read_at_input_price)} if those reads had been fresh input"),
+        Tile("Cache reads vs spend", f"{read_multiple:.1f}x",
+             f"{_fmt_usd(read_at_input_price)} if those reads had been fresh input, "
+             f"against {_fmt_usd(total_cost)} paid"),
     ]
 
 

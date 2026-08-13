@@ -69,6 +69,24 @@ class TestMachinesPage:
         assert "Revoke" in body
         assert "active" in body
 
+    def test_a_health_check_alone_moves_the_token_stamp(self, app, client):
+        """Which is why that column is not called a push."""
+        token = _token_from(_mint(client).text)
+        client.get("/v1/health", headers=sf.auth(token))
+        assert app.state.db.connect().execute(
+            "SELECT last_used_at FROM machine_tokens").fetchone()[0] is not None
+
+    def test_an_id_nothing_was_minted_for_is_a_404(self, client):
+        """Rendering it would draw a machine that does not exist, with 0 records."""
+        assert client.get("/machines/never-minted").status_code == 404
+
+    def test_the_token_column_is_named_for_what_stamps_it(self, client):
+        """Any authenticated request moves last_used_at, health checks included."""
+        _mint(client)
+        body = client.get("/machines").text
+        assert "Token last used" in body
+        assert "Last push" not in body
+
 
 class TestMinting:
     def test_the_token_it_shows_is_one_ingest_accepts(self, client):
@@ -166,10 +184,15 @@ class TestMintedPolicy:
 class TestMintedPage:
     def test_the_form_says_where_the_policy_lives(self, client):
         """It is the machine's file, so the page has to point at where to edit it."""
+        _mint(client)
         for route in ("/machines", "/machines/laptop-1"):
             body = client.get(route).text
             assert "push.toml" in body
             assert "ccreport server allow" in body
+
+    def test_the_form_says_which_fields_allow_and_deny_reach(self, client):
+        """They write the allow list alone; networks and restricted need connect."""
+        assert "need connect run again" in client.get("/machines").text
 
     def test_the_command_has_a_copy_control(self, client):
         page = _mint(client).text

@@ -254,7 +254,7 @@ def machine_for_token(conn: sqlite3.Connection, token_hash: str) -> str | None:
 
 
 def touch_token(conn: sqlite3.Connection, token_hash: str, now: float) -> None:
-    """Stamp a token as used, which is what the machines page reports as last seen."""
+    """Stamp a token as used. Every authenticated request does it, health checks included."""
     conn.execute(
         "UPDATE machine_tokens SET last_used_at = ? WHERE token_hash = ?", (now, token_hash),
     )

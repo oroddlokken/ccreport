@@ -8,14 +8,14 @@
 
   <label class="check">
     <input type="checkbox" name="restricted" value="1">
-    Hide project names
+    Don't send project names
   </label>
   <div class="dependent">
     <label>Except these projects
       <input name="allow" autocomplete="off" placeholder="ccreport, kantine">
     </label>
-    <p class="hint">A hidden project still pushes its counts, under a pseudonym and with no cwd or repo. Blank hides every project.</p>
+    <p class="hint">The rest still push their counts, under a pseudonym and with no cwd or repo. Blank sends no name at all.</p>
   </div>
 
-  <p class="hint note">This policy lands in that machine's <span class="mono">~/.config/ccreport/push.toml</span> and nowhere on this server. Change it there later with <span class="mono">ccreport server allow</span> and <span class="mono">deny</span>, or by re-running connect.</p>
+  <p class="hint note">This policy lands in that machine's <span class="mono">~/.config/ccreport/push.toml</span> and nowhere on this server. <span class="mono">ccreport server allow</span> and <span class="mono">deny</span> edit the project list there later; the networks and this checkbox need connect run again.</p>
 </fieldset>

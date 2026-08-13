@@ -203,7 +203,7 @@ class TestGroupedLoading:
         assert {m.record.day_key() for m in merged} == {"2026-03-02", "2026-03-03"}
 
     def test_a_group_prices_at_its_earliest_instant(self, app):
-        """What the savings tile reads. A group is one model on one day, so the
+        """What the cache-reads tile reads. A group is one model on one day, so the
         first call's instant prices every call in it."""
         merged = reports.load_grouped(app.state.db.connect(), reports.Filters(project="projB"))
         assert [m.record.timestamp for m in merged] == [datetime(2026, 3, 3, 12, tzinfo=UTC)]

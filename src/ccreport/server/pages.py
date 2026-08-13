@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from ipaddress import ip_network
 from pathlib import Path
 
-from fastapi import APIRouter, Form, Query, Request
+from fastapi import APIRouter, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
@@ -67,11 +67,19 @@ def machines(request: Request):
 
 @router.get("/machines/{machine_id}", response_class=HTMLResponse)
 def machine(request: Request, machine_id: str):
-    """One machine's tokens, each with a revoke button."""
+    """One machine's tokens, each with a revoke button.
+
+    An id nothing was minted for is a 404. Rendering it would draw a machine
+    that does not exist, with a zero record count and no token, which reads as
+    a real machine that has never pushed.
+    """
     conn = request.app.state.db.connect()
+    label = db.machine_label(conn, machine_id)
+    if label is None:
+        raise HTTPException(status_code=404, detail=f"No machine {machine_id}.")
     return templates.TemplateResponse(request, "machine.html", {
         "machine_id": machine_id,
-        "label": db.machine_label(conn, machine_id) or machine_id,
+        "label": label or machine_id,
         "records": db.record_count(conn, machine_id),
         "tokens": db.machine_tokens(conn, machine_id),
     })

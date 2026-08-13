@@ -197,7 +197,7 @@ class TestTiles:
     def test_each_carries_a_derived_subline(self, app):
         assert all(tile.subline for tile in _view(app).tiles)
 
-    def test_cache_savings_matches_the_hand_computed_figure(self, tmp_path):
+    def test_the_cache_read_multiple_matches_the_hand_computed_figure(self, tmp_path):
         """Every cache read priced at what it would have cost as fresh input."""
         app = create_app(sf.config(tmp_path))
         client = TestClient(app)
@@ -216,7 +216,7 @@ class TestTiles:
             1000, 100, 0, 200_000, model, datetime.fromtimestamp(_ts(1), tz=UTC),
         )
 
-        tile = next(t for t in _view(app).tiles if t.label == "Cache savings")
+        tile = next(t for t in _view(app).tiles if t.label == "Cache reads vs spend")
         assert tile.value == f"{expected_saved / actual_cost:.1f}x"
         assert f"{expected_saved:.2f}" in tile.subline or "$" in tile.subline
 
@@ -314,7 +314,7 @@ class TestCachedBuild:
 class TestPage:
     def test_it_renders_the_headline_and_the_footnote(self, client):
         body = client.get("/").text
-        assert "not an invoice" in body
+        assert "Tokens priced at full API rates." in body
         assert "Accounts" in body
         assert "Breakdown" in body
 
