@@ -295,5 +295,15 @@ table.breakdown { margin-top: .5rem; }
   font-weight: 500;
   color: var(--dim);
 }
+/* The value cell is as wide empty as filled, so the legend's rows do not
+   re-wrap the moment the cursor enters the plot. Wide enough for a
+   ten-figure token count. */
+.u-legend .u-value {
+  display: inline-block;
+  min-width: 6.5rem;
+  text-align: left;
+  font-variant-numeric: tabular-nums;
+}
+
 /* The vendored uPlot select box is 7% black, invisible on this surface. */
 .u-select { background: color-mix(in srgb, var(--accent) 18%, transparent); }
