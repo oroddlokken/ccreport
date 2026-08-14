@@ -6,9 +6,10 @@
   <span class="dim">{{ view.start }} — {{ view.end }}</span>
   <span class="toggles">
     {% for days in ranges %}
-    <a class="toggle {% if days == view.days %}on{% endif %}" href="/?days={{ days }}">{{ range_labels[days] }}</a>
+    <a class="toggle {% if days == view.days %}on{% endif %}"
+       href="/?days={{ days }}&by={{ dimension }}&metric={{ metric }}">{{ range_labels[days] }}</a>
     {% endfor %}
-    <a class="toggle" href="/?days={{ view.days }}">Refresh</a>
+    <a class="toggle" href="/?days={{ view.days }}&by={{ dimension }}&metric={{ metric }}">Refresh</a>
   </span>
 </div>
 
@@ -26,7 +27,7 @@
     {% for row in view.accounts %}
     <div class="account">
       <div class="account-head">
-        <span>{{ row.account }}</span>
+        <a href="/account/{{ row.account | urlencode }}?days={{ view.days }}">{{ row.account }}</a>
         <span class="num">{{ "${:,.2f}".format(row.cost) }}</span>
       </div>
       <div class="track"><div class="fill" style="width: {{ (row.share * 100) | round(1) }}%"></div></div>
@@ -44,8 +45,10 @@
     <div class="chart-head">
       <h2>Daily</h2>
       <span class="toggles">
-        <a class="toggle on" id="metric-cost" href="#">Cost</a>
-        <a class="toggle" id="metric-tokens" href="#">Tokens</a>
+        {% for name in metrics %}
+        <a class="toggle metric {% if name == metric %}on{% endif %}" data-metric="{{ name }}"
+           href="/?days={{ view.days }}&by={{ dimension }}&metric={{ name }}">{{ name | capitalize }}</a>
+        {% endfor %}
       </span>
     </div>
     <div id="chart"></div>
@@ -66,25 +69,25 @@
   <div class="chart-head">
     <h2>Breakdown</h2>
     <span class="toggles">
-      {% for dimension in dimensions %}
-      <a class="toggle dimension {% if loop.first %}on{% endif %}"
-         data-dimension="{{ dimension }}" href="#">{{ dimension }}</a>
+      {% for name in dimensions %}
+      <a class="toggle dimension {% if name == dimension %}on{% endif %}" data-dimension="{{ name }}"
+         href="/?days={{ view.days }}&by={{ name }}&metric={{ metric }}">{{ name }}</a>
       {% endfor %}
     </span>
   </div>
-  {% for dimension in dimensions %}
-  <table class="breakdown" data-dimension="{{ dimension }}"
-         {% if not loop.first %}hidden{% endif %}>
+  {% for name in dimensions %}
+  <table class="breakdown" data-dimension="{{ name }}"
+         {% if name != dimension %}hidden{% endif %}>
     <thead>
       <tr>
-        <th>{{ dimension }}</th><th class="num">Cost</th>
+        <th>{{ name }}</th><th class="num">Cost</th>
         <th class="num">Share</th><th class="num">Tokens</th><th class="num">Calls</th>
       </tr>
     </thead>
     <tbody>
-      {% for row in view.breakdowns[dimension] %}
+      {% for row in view.breakdowns[name] %}
       <tr>
-        <td>{{ row.key }}</td>
+        <td><a href="/{{ name }}/{{ row.key | urlencode }}?days={{ view.days }}">{{ row.key }}</a></td>
         <td class="num">{{ "${:,.2f}".format(row.cost) }}</td>
         <td class="num">{{ (row.share * 100) | round(1) }}%</td>
         <td class="num">{{ "{:,}".format(row.tokens) }}</td>
@@ -100,6 +103,7 @@
 
 <link rel="stylesheet" href="{{ asset('vendor/uPlot.min.css') }}">
 <script src="{{ asset('vendor/uPlot.iife.min.js') }}"></script>
+<script src="{{ asset('palette.js') }}"></script>
 <script id="chart-data" type="application/json">{{ chart | safe }}</script>
 <script src="{{ asset('dashboard.js') }}"></script>
 {% endblock %}

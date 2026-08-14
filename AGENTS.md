@@ -139,12 +139,34 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
 - Ingest sits outside the web UI's network allowlist and the UI sits inside it,
   wired in `factory.py`: a machine pushes from wherever it is and its token is
   what admits it, while the pages are reachable from home and nowhere else.
-  `/static` is behind the gate with the pages it styles
+  `/static` is behind the gate with the pages it styles, through
+  `middleware.NetworkGated` rather than the dependency: `app.mount` takes no
+  `dependencies`, so the check has to sit one layer down in the ASGI app
 - The dashboard is `/`; everything that administers the server is under
   `/settings` — machines, minting and account names, forms and redirects
   included. `/tokens/{hash}/revoke` and `/delete` are the exception: they
   redirect through Referer and are posted to from whichever page listed the
   token
+- `/{dimension}/{key}` is one entity's page, for each of `dashboard.SCOPES`. It
+  is registered last in `pages.py` and matches whatever the named routes did
+  not, which is why `factory.py` mounts `/static` before the router — the
+  catch-all would otherwise answer 404 for every asset. The scope matches the
+  string the breakdown table shows, not a stored column, so an alias, a machine
+  label and a redacted project bucket each reach their own rows, and it is
+  never cached: `cached_build` holds the whole-server view per range, which is
+  the page a browser opens over and over
+- A day page is its own range and charts by hour, so it is the one build that
+  calls `reports.load` — `load_grouped` folds the hour away. It widens the ts
+  window by a day at each end and matches `day_key()` afterwards, because `day`
+  is the machine's calendar day and a machine on another clock keeps records
+  whose instant falls outside this server's day
+- A detail page draws four charts rather than one with a toggle, and each has
+  one scale: cost, cost by model, tokens by kind and calls do not share an
+  axis. Series colours come from `static/palette.js` in fixed order, so a
+  filter that drops one series never repaints the others, and the six hues are
+  validated as a set against the dark surface — re-run the dataviz validator
+  before changing a value. A seventh series folds into `Other` at
+  `dashboard.TRACE_LIMIT`
 - A stylesheet or script is linked through the `asset()` template global, never
   as a bare `/static/…` path. It stamps the URL with the file's mtime, because
   StaticFiles sends no Cache-Control and a browser is otherwise free to hold

@@ -7,13 +7,23 @@
   const box = document.getElementById("chart");
   if (!box || !payload.days.length) return;
 
-  // Legible on the dark background, and apart from each other. More accounts
-  // than colours cycles.
-  const COLORS = ["#7aa2f7", "#7bd88f", "#e0af68", "#bb9af7", "#f7768e", "#2ac3de"];
+  const COLORS = window.CCREPORT_COLORS;
 
   const xs = payload.days.map((day) => Date.parse(day + "T00:00:00") / 1000);
-  let metric = "cost";
+  const selected = document.querySelector(".toggle.metric.on");
+  let metric = selected ? selected.dataset.metric : "cost";
   let chart = null;
+
+  // Both toggles are real links, so the page works with scripting off. With it
+  // on, the click stays local and only rewrites the address bar — which is what
+  // a reload reads to open on the tab and series last clicked. The URL is built
+  // from the current one rather than the link's href: the other toggle's hrefs
+  // still carry what the page was rendered with, and would undo this one.
+  function remember(key, value) {
+    const url = new URL(window.location.href);
+    url.searchParams.set(key, value);
+    history.replaceState(null, "", url.pathname + "?" + url.searchParams.toString());
+  }
 
   function draw() {
     const data = [xs, ...payload.series.map((s) => s[metric])];
@@ -39,19 +49,16 @@
     chart = new uPlot(opts, data, box);
   }
 
-  document.getElementById("metric-cost").addEventListener("click", (e) => {
-    e.preventDefault();
-    metric = "cost";
-    document.getElementById("metric-cost").classList.add("on");
-    document.getElementById("metric-tokens").classList.remove("on");
-    draw();
-  });
-  document.getElementById("metric-tokens").addEventListener("click", (e) => {
-    e.preventDefault();
-    metric = "tokens";
-    document.getElementById("metric-tokens").classList.add("on");
-    document.getElementById("metric-cost").classList.remove("on");
-    draw();
+  document.querySelectorAll(".toggle.metric").forEach((tab) => {
+    tab.addEventListener("click", (e) => {
+      e.preventDefault();
+      metric = tab.dataset.metric;
+      document.querySelectorAll(".toggle.metric").forEach((t) => {
+        t.classList.toggle("on", t === tab);
+      });
+      remember("metric", metric);
+      draw();
+    });
   });
 
   document.querySelectorAll(".toggle.dimension").forEach((tab) => {
@@ -64,6 +71,7 @@
       document.querySelectorAll("table.breakdown").forEach((table) => {
         table.hidden = table.dataset.dimension !== wanted;
       });
+      remember("by", wanted);
     });
   });
 

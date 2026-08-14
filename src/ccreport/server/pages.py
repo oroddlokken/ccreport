@@ -59,14 +59,25 @@ templates.env.globals["asset"] = _asset
 
 
 @router.get("/", response_class=HTMLResponse)
-def index(request: Request, days: int = Query(default=dashboard.DEFAULT_RANGE)):
-    """The merged spend dashboard."""
+def index(request: Request, days: int = Query(default=dashboard.DEFAULT_RANGE),
+          by: str = Query(default=""), metric: str = Query(default="")):
+    """The merged spend dashboard.
+
+    *by* and *metric* are which breakdown table and which chart series the page
+    opens on. They stay out of `cached_build`'s key, because the view carries
+    every breakdown and both series whichever one is showing — the query string
+    is where they live so a reload lands on the last click rather than back at
+    model and cost.
+    """
     view = dashboard.cached_build(request.app.state.db, days)
     return templates.TemplateResponse(request, "dashboard.html", {
         "view": view,
         "ranges": dashboard.RANGES,
         "range_labels": dashboard.RANGE_LABELS,
         "dimensions": dashboard.DIMENSIONS,
+        "dimension": by if by in dashboard.DIMENSIONS else dashboard.DIMENSIONS[0],
+        "metrics": dashboard.METRICS,
+        "metric": metric if metric in dashboard.METRICS else dashboard.METRICS[0],
         "chart": json.dumps({
             "days": view.chart_days,
             "series": [
@@ -208,6 +219,20 @@ def delete_token(request: Request, token_hash: str):
     return RedirectResponse(url=request.headers.get("referer") or "/", status_code=303)
 
 
+def _chart_payload(view: dashboard.Dashboard) -> str:
+    """The detail page's charts as the JSON its script reads."""
+    return json.dumps([
+        {
+            "key": chart.key,
+            "title": chart.title,
+            "unit": chart.unit,
+            "axis": chart.axis,
+            "traces": [{"label": t.label, "values": t.values} for t in chart.traces],
+        }
+        for chart in view.charts
+    ])
+
+
 @router.post("/settings/machines/{machine_id}/delete")
 def delete_machine(request: Request, machine_id: str, confirm: str = Form("")):
     """Remove a machine, its tokens, its ingest state and every record it pushed.
@@ -230,3 +255,30 @@ def delete_machine(request: Request, machine_id: str, confirm: str = Form("")):
     return RedirectResponse(
         url=f"/settings/machines?deleted={quote(machine_id)}&records={destroyed:d}", status_code=303,
     )
+
+
+@router.get("/{dimension}/{key:path}", response_class=HTMLResponse)
+def detail(request: Request, dimension: str, key: str,
+           days: int = Query(default=dashboard.DEFAULT_RANGE)):
+    """One entity's page: the same fold, over the records that match it alone.
+
+    Registered last, so every page above owns its own path and only what none
+    of them claimed reaches here. A dimension this server has no breakdown for
+    is a 404: the URL was mistyped, and an empty page reads as an idle month.
+
+    Not cached. `cached_build` holds the whole-server view per range, which is
+    the page a browser opens over and over; one entity is a page someone
+    clicked into.
+    """
+    if dimension not in dashboard.SCOPES:
+        raise HTTPException(status_code=404, detail=f"No {dimension} pages.")
+    scope = dashboard.Scope(dimension=dimension, key=key)
+    view = dashboard.build(request.app.state.db.connect(), days, scope=scope)
+    return templates.TemplateResponse(request, "detail.html", {
+        "view": view,
+        "scope": scope,
+        "ranges": dashboard.RANGES,
+        "range_labels": dashboard.RANGE_LABELS,
+        "dimensions": [name for name in dashboard.SCOPES if name != dimension],
+        "charts": _chart_payload(view),
+    })

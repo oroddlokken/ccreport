@@ -30,6 +30,17 @@ DEFAULT_RANGE = 30
 DIMENSIONS = ("model", "day", "project", "machine")
 """What the breakdown table switches between. Same columns throughout."""
 
+METRICS = ("cost", "tokens")
+"""Which series the chart draws. Both are in the payload either way."""
+
+SCOPES = ("account", *DIMENSIONS)
+"""What a detail page can be about. One more than the dashboard's tabs: the
+accounts have a column of their own there rather than a table."""
+
+TRACE_LIMIT = 6
+"""Series per chart before the rest fold into one. Past this the eye is reading
+a legend, not a chart, and the palette has run out of hues that stay apart."""
+
 
 def range_bounds(days: int, now: datetime) -> tuple[datetime, datetime]:
     """The half-open span a range toggle selects, ending at the next midnight.
@@ -85,6 +96,40 @@ class Series:
     tokens: list[float] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class Scope:
+    """What one detail page is about, as the breakdown row spells it.
+
+    The key is matched against the string the table shows rather than against a
+    stored column, so an account alias, a machine label and a redacted project
+    bucket all lead to the rows they stand for.
+    """
+
+    dimension: str
+    key: str
+
+
+@dataclass
+class Trace:
+    """One line on a chart: a label and a value per bucket on the axis."""
+
+    label: str
+    values: list[float]
+
+
+@dataclass
+class Chart:
+    """One plot: its axis, its lines, and what the numbers on them are."""
+
+    key: str
+    title: str
+    unit: str
+    """usd, tokens or calls. Picks the tick format, and says why two charts
+    that look alike are not one chart with two scales."""
+    axis: list[str]
+    traces: list[Trace]
+
+
 @dataclass
 class Dashboard:
     """Everything one render of the page needs."""
@@ -101,6 +146,9 @@ class Dashboard:
     series: list[Series]
     breakdowns: dict[str, list[dict]]
     machines: list[str]
+    scope: Scope | None = None
+    charts: list[Chart] = field(default_factory=list)
+    """Empty on the whole-server page, which has one chart and a toggle."""
 
 
 def _fmt_tokens(n: float) -> str:
@@ -175,36 +223,115 @@ def _account_rows(report, total_cost: float) -> list[AccountRow]:
     ]
 
 
-def _chart(merged: list[reports.MergedRecord], start: datetime, days: int,
-           accounts: list[str]) -> tuple[list[str], list[Series]]:
+def _day_axis(start: datetime, days: int) -> list[str]:
+    """The calendar days a range covers, in order."""
+    return [(start + timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(days)]
+
+
+def _day_position(axis: list[str]):
+    """Where a record lands on a day axis, or None if it falls outside it."""
+    index = {day: position for position, day in enumerate(axis)}
+    return lambda item: index.get(item.record.day_key())
+
+
+def _hour_position(midnight: datetime):
+    """Where a record lands on one day's 24 hours, in this server's clock."""
+    def position(item: reports.MergedRecord) -> int | None:
+        elapsed = item.record.timestamp.astimezone() - midnight
+        hour = int(elapsed.total_seconds() // 3600)
+        return hour if 0 <= hour < 24 else None
+    return position
+
+
+def _chart(merged: list[reports.MergedRecord], axis: list[str],
+           accounts: list[str]) -> list[Series]:
     """One series per account over a dense day axis.
 
     Dense, so a day nobody worked is a zero rather than a gap the line jumps
     across.
     """
-    axis = [
-        (start + timedelta(days=offset)).strftime("%Y-%m-%d")
-        for offset in range(days)
-    ]
-    index = {day: position for position, day in enumerate(axis)}
-    series = {account: Series(account=account, cost=[0.0] * days, tokens=[0.0] * days)
+    position_of = _day_position(axis)
+    series = {account: Series(account=account, cost=[0.0] * len(axis), tokens=[0.0] * len(axis))
               for account in accounts}
     for item in merged:
-        position = index.get(item.record.day_key())
+        position = position_of(item)
         if position is None or item.account not in series:
             continue
         series[item.account].cost[position] += item.record.cost()
         series[item.account].tokens[position] += item.record.tokens.total
-    return axis, [series[account] for account in accounts]
+    return [series[account] for account in accounts]
 
 
 _DIMENSION_KEYS = {
+    "account": lambda item: item.account,
     "model": lambda item: item.record.model,
     "day": lambda item: item.record.day_key(),
     "project": lambda item: item.record.project,
     "machine": lambda item: item.machine,
 }
 """What each breakdown groups on. machine is the one no local report has."""
+
+
+def _hour_axis(day: str) -> list[str]:
+    """The 24 local hours of one day, as the stamps the chart plots on."""
+    return [f"{day}T{hour:02d}:00" for hour in range(24)]
+
+
+def _traced(merged: list[reports.MergedRecord], axis: list[str],
+            position_of, pairs_of) -> list[Trace]:
+    """One trace per key, dense over *axis*, fattest first.
+
+    *pairs_of* turns one record into the (label, value) pairs it contributes:
+    one for a cost split by account, four for a split by token kind. Dense
+    again, so an idle hour is a zero and not a gap.
+    """
+    traces: dict[str, list[float]] = {}
+    for item in merged:
+        position = position_of(item)
+        if position is None:
+            continue
+        for label, value in pairs_of(item):
+            traces.setdefault(label, [0.0] * len(axis))[position] += value
+    ordered = sorted(traces.items(), key=lambda pair: -sum(pair[1]))
+    if len(ordered) > TRACE_LIMIT:
+        rest = [sum(values) for values in zip(*(v for _, v in ordered[TRACE_LIMIT:]), strict=True)]
+        ordered = [*ordered[:TRACE_LIMIT], ("Other", rest)]
+    return [Trace(label=label, values=values) for label, values in ordered]
+
+
+def _token_pairs(item: reports.MergedRecord) -> list[tuple[str, float]]:
+    """One record's tokens as the four kinds they were billed as."""
+    tokens = item.record.tokens
+    return [
+        ("Input", float(tokens.input)),
+        ("Output", float(tokens.output)),
+        ("Cache write", float(tokens.cache_create)),
+        ("Cache read", float(tokens.cache_read)),
+    ]
+
+
+def _charts(merged: list[reports.MergedRecord], axis: list[str], position_of) -> list[Chart]:
+    """The four plots a detail page draws over one axis.
+
+    Four rather than one with a toggle: cost, what it went on, what shape the
+    tokens were and how many calls carried them answer different questions, and
+    a reader comparing them wants them on screen together. One scale each — a
+    dollar axis and a token axis on one plot would be two charts drawn over
+    each other.
+    """
+    return [
+        Chart(key="cost-account", title="Cost by account", unit="usd", axis=axis,
+              traces=_traced(merged, axis, position_of,
+                             lambda item: [(item.account, item.record.cost())])),
+        Chart(key="cost-model", title="Cost by model", unit="usd", axis=axis,
+              traces=_traced(merged, axis, position_of,
+                             lambda item: [(item.record.model, item.record.cost())])),
+        Chart(key="tokens-kind", title="Tokens by kind", unit="tokens", axis=axis,
+              traces=_traced(merged, axis, position_of, _token_pairs)),
+        Chart(key="calls", title="Calls", unit="calls", axis=axis,
+              traces=_traced(merged, axis, position_of,
+                             lambda item: [("Calls", float(item.record.count))])),
+    ]
 
 
 def _breakdown(merged: list[reports.MergedRecord], dimension: str,
@@ -269,22 +396,54 @@ def cached_build(database: db.Database, days: int, now: datetime | None = None) 
     return view
 
 
-def build(conn, days: int, now: datetime | None = None) -> Dashboard:
-    """Everything the page shows, for one range toggle."""
+def _day_records(conn, key: str) -> tuple[list[reports.MergedRecord], datetime]:
+    """One calendar day's records, ungrouped, and the local midnight they open.
+
+    Ungrouped because the hour is what this page plots and `load_grouped` folds
+    it away. The ts window is a day wider at each end and the day itself is
+    matched afterwards: `day` is the machine's own calendar day, and a machine
+    an hour off this server's clock keeps records whose instant falls outside
+    the local day they belong to.
+    """
+    midnight = datetime.strptime(key, "%Y-%m-%d").astimezone()
+    merged = reports.load(conn, reports.Filters(
+        since=midnight - timedelta(days=1), until=midnight + timedelta(days=2),
+    ))
+    return [item for item in merged if item.record.day_key() == key], midnight
+
+
+def build(conn, days: int, now: datetime | None = None,
+          scope: Scope | None = None) -> Dashboard:
+    """Everything the page shows, for one range toggle and one scope.
+
+    With a *scope* the same fold runs over the records that match it alone, and
+    the page gains the four charts. A day scope is its own range: the toggle
+    cannot widen a page that is about one day.
+    """
     now = now or datetime.now(tz=UTC).astimezone()
     days = days if days in RANGES else DEFAULT_RANGE
-    if days == ALL_TIME:
-        start, end = all_time_bounds(db.oldest_record_ts(conn), now)
+    hourly = scope is not None and scope.dimension == "day"
+    if hourly:
+        merged, start = _day_records(conn, scope.key)  # type: ignore[union-attr]
+        end = start + timedelta(days=1)
+        axis = _hour_axis(scope.key)  # type: ignore[union-attr]
+        position_of = _hour_position(start)
     else:
-        start, end = range_bounds(days, now)
-    span = (end - start).days
-    merged = reports.load_grouped(conn, reports.Filters(since=start, until=end))
-    nok = reports.nok_context(merged)
+        if days == ALL_TIME:
+            start, end = all_time_bounds(db.oldest_record_ts(conn), now)
+        else:
+            start, end = range_bounds(days, now)
+        merged = reports.load_grouped(conn, reports.Filters(since=start, until=end))
+        if scope is not None:
+            key_of = _DIMENSION_KEYS[scope.dimension]
+            merged = [item for item in merged if str(key_of(item)) == scope.key]
+        axis = _day_axis(start, (end - start).days)
+        position_of = _day_position(axis)
 
+    nok = reports.nok_context(merged)
     account_report = reports.build(merged, "account", nok)
     total_cost = account_report.total.cost
     accounts = [row.key for row in account_report.rows]
-    axis, series = _chart(merged, start, span, accounts)
 
     return Dashboard(
         days=days,
@@ -295,11 +454,13 @@ def build(conn, days: int, now: datetime | None = None) -> Dashboard:
         nok_enabled=nok.enabled,
         accounts=_account_rows(account_report, total_cost),
         tiles=_tiles(merged, total_cost),
-        chart_days=axis,
-        series=series,
+        chart_days=[] if scope is not None else axis,
+        series=[] if scope is not None else _chart(merged, axis, accounts),
         breakdowns={
             dimension: _breakdown(merged, dimension, total_cost)
-            for dimension in DIMENSIONS
+            for dimension in (SCOPES if scope is not None else DIMENSIONS)
         },
         machines=sorted({item.machine for item in merged}),
+        scope=scope,
+        charts=_charts(merged, axis, position_of) if scope is not None else [],
     )

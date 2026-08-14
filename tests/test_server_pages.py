@@ -295,6 +295,16 @@ class TestAccessControl:
     def test_it_cannot_revoke_either(self, gated):
         assert TestClient(gated).post("/tokens/abc/revoke").status_code == 403
 
+    def test_it_cannot_read_the_assets_either(self, gated):
+        """A mount takes no dependencies, so the files carry the check themselves."""
+        assert TestClient(gated).get("/static/app.css").status_code == 403
+
+    def test_an_allowed_address_still_gets_the_asset(self, client):
+        resp = client.get("/static/app.css")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/css")
+        assert ".danger-zone" in resp.text
+
     def test_ingest_still_works_from_a_disallowed_address(self, gated):
         """A machine pushes from a hotel; its token is what admits it."""
         client = TestClient(gated)

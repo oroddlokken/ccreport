@@ -132,7 +132,7 @@ class TestAllTime:
     def test_the_toggle_reads_all_on_the_page(self, client):
         body = client.get(f"/?days={dashboard.ALL_TIME}").text
         assert ">All</a>" in body
-        assert f'href="/?days={dashboard.ALL_TIME}"' in body
+        assert f'href="/?days={dashboard.ALL_TIME}&by=model&metric=cost"' in body
 
 
 class TestTotals:
@@ -274,6 +274,62 @@ class TestRedactedProjects:
         assert [row["key"] for row in rows] == ["personal-aggregated"]
 
 
+class TestTogglesInTheURL:
+    """Which breakdown and which chart series the page opens on."""
+
+    def _row(self, body: str, dimension: str) -> str:
+        """The <table> tag for one dimension, hidden attribute and all."""
+        tag = re.search(rf'<table class="breakdown" data-dimension="{dimension}"[^>]*>', body)
+        assert tag, f"no {dimension} table on the page"
+        return tag[0]
+
+    def test_the_default_is_the_first_dimension(self, client):
+        body = client.get("/").text
+        assert "hidden" not in self._row(body, "model")
+        assert "hidden" in self._row(body, "project")
+
+    @pytest.mark.parametrize("dimension", dashboard.DIMENSIONS)
+    def test_by_opens_that_table_and_no_other(self, client, dimension):
+        body = client.get(f"/?by={dimension}").text
+        showing = [d for d in dashboard.DIMENSIONS if "hidden" not in self._row(body, d)]
+        assert showing == [dimension]
+
+    def test_by_marks_that_tab(self, client):
+        body = client.get("/?by=machine").text
+        assert 'class="toggle dimension on" data-dimension="machine"' in body
+
+    def test_metric_marks_that_tab(self, client):
+        body = client.get("/?metric=tokens").text
+        assert 'class="toggle metric on" data-metric="tokens"' in body
+
+    def test_the_default_metric_is_cost(self, client):
+        assert 'class="toggle metric on" data-metric="cost"' in client.get("/").text
+
+    @pytest.mark.parametrize("query", ["?by=nonsense", "?metric=nonsense", ""])
+    def test_a_value_the_page_has_no_tab_for_falls_back(self, client, query):
+        """A hand-edited URL draws the page it would have drawn with no query."""
+        body = client.get(f"/{query}").text
+        assert 'class="toggle dimension on" data-dimension="model"' in body
+        assert 'class="toggle metric on" data-metric="cost"' in body
+
+    def test_a_range_link_carries_both_toggles(self, client):
+        """Switching the range keeps the tab, which is the point of the round trip."""
+        body = client.get("/?days=7&by=project&metric=tokens").text
+        assert 'href="/?days=90&by=project&metric=tokens"' in body
+
+    def test_a_dimension_link_carries_the_range_and_the_metric(self, client):
+        body = client.get("/?days=0&by=project&metric=tokens").text
+        assert 'href="/?days=0&by=machine&metric=tokens"' in body
+
+    def test_neither_toggle_costs_a_build(self, app):
+        """They pick what shows; the view carries every breakdown and both series."""
+        client = TestClient(app)
+        client.get("/?by=project&metric=tokens")
+        first = dashboard.cached_build(app.state.db, dashboard.DEFAULT_RANGE)
+        client.get("/?by=machine&metric=cost")
+        assert dashboard.cached_build(app.state.db, dashboard.DEFAULT_RANGE) is first
+
+
 class TestCachedBuild:
     """One build per range per push. The page is otherwise the corpus, folded
     again, on every render."""
@@ -366,11 +422,11 @@ class TestPage:
     def test_the_range_toggles_are_links(self, client):
         body = client.get("/").text
         for days in dashboard.RANGES:
-            assert f'href="/?days={days}"' in body
+            assert f'href="/?days={days}&by=model&metric=cost"' in body
 
     def test_the_selected_range_is_marked(self, client):
         body = client.get("/?days=7").text
-        assert 'class="toggle on" href="/?days=7"' in body
+        assert 'class="toggle on"\n       href="/?days=7&by=model&metric=cost"' in body
 
     def test_every_breakdown_dimension_has_a_table(self, client):
         body = client.get("/").text

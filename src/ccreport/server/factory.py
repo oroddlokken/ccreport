@@ -10,7 +10,7 @@ from starlette.staticfiles import StaticFiles
 from ccreport import exchange
 from ccreport.server import db, ingest, pages, report_api
 from ccreport.server.config import ServerConfig, load_config
-from ccreport.server.middleware import restrict_remote_addr_dep
+from ccreport.server.middleware import NetworkGated, restrict_remote_addr_dep
 
 
 def create_app(config: ServerConfig | None = None) -> FastAPI:
@@ -40,10 +40,15 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     app.include_router(ingest.router)
     gate = [Depends(restrict_remote_addr_dep(config.networks))]
     app.include_router(report_api.router, dependencies=gate)
-    app.include_router(pages.router, dependencies=gate)
+    # Before the pages: they end in /{dimension}/{key}, which would otherwise
+    # match /static/app.css and answer 404 for every asset on the site.
     app.mount(
         "/static",
-        StaticFiles(directory=str(Path(__file__).with_name("static"))),
+        NetworkGated(
+            StaticFiles(directory=str(Path(__file__).with_name("static"))),
+            config.networks,
+        ),
         name="static",
     )
+    app.include_router(pages.router, dependencies=gate)
     return app

@@ -212,6 +212,15 @@ pre.command {
 
 table.breakdown { margin-top: .5rem; }
 
+/* Two plots per row where the window allows it, so a reader compares cost
+   against what the tokens under it were doing without scrolling between them. */
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(24rem, 1fr)); gap: 1.5rem; }
+.charts .chart-box { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .75rem 1rem 1rem; }
+.charts h2 { margin: 0 0 .4rem; font-size: .95rem; }
+.charts .plot { min-height: 200px; }
+.detail-head { margin-bottom: 1.5rem; }
+.detail-head h1 { font-size: 1.5rem; margin-bottom: .2rem; word-break: break-all; }
+
 /* uPlot draws its own legend; these keep it in the page's palette. */
 .u-legend { color: var(--dim); font-size: .8rem; }
 .u-legend .u-marker { border-radius: 2px; }
