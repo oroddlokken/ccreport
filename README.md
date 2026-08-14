@@ -48,12 +48,10 @@ The status line imports nothing outside the stdlib, so any `python3` runs it;
 it works before `uv sync` has. Quota percentages are refreshed by a detached
 process, so a fresh reading lands on a later render.
 
-### The SessionStart hook
+### The hooks
 
-A render memoizes what it reads from the running claude process in a file under
-`TMPDIR`, keyed by session id. `--resume` hands the same id to a new process, so
-`bin/clear-statusline-memo.sh` deletes that file. Install it as a `SessionStart`
-hook, the one moment those readings change:
+Two per-session files under `TMPDIR` hold what a render learned, and two hooks
+drop them when what they hold has changed. Both need `jq`:
 
 ```json
 {
@@ -67,15 +65,37 @@ hook, the one moment those readings change:
           }
         ]
       }
+    ],
+    "ConfigChange": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /path/to/ccreport/bin/clear-statusline-cache.sh"
+          }
+        ]
+      }
     ]
   }
 }
 ```
 
-`SessionStart` takes no matcher — it fires on startup, resume, clear, compact
-and fork alike. The hook needs `jq`, prints nothing (a `SessionStart` hook's
-stdout is appended to the session's context) and exits 0 on anything it cannot
-parse.
+`clear-statusline-memo.sh` deletes the memo, whose
+`--dangerously-skip-permissions` verdict comes from the argv of the claude
+process that launched the session id. `--resume` reuses that id under new argv,
+and `SessionStart` takes no matcher — it fires on startup, resume, clear,
+compact and fork alike, which is every moment that verdict can change.
+
+`clear-statusline-cache.sh` deletes the fetch cache, which holds the `sbx`/`!sbx`
+badge and the segments the `CLAUDE_CODE_STATUSLINE_*` toggles switch on for 15
+seconds. Both are read out of settings files, so `ConfigChange` is what puts an
+edit on the next render rather than 15 seconds later. It leaves the memo in
+place: the DSP verdict is not a settings reading.
+
+Neither hook prints anything — a `SessionStart` hook's stdout is appended to the
+session's context — and both exit 0 on anything they cannot parse. Exit 0 does
+double duty in the `ConfigChange` one: exit 2 there blocks the settings change
+itself.
 
 ## ccreport
 

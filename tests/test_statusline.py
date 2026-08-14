@@ -1892,6 +1892,57 @@ class TestFastCache:
         name = sl._fast_cache_path(sid).name
         assert "/" not in name.replace("claude-statusline-", "", 1)
 
+    @pytest.mark.parametrize(
+        "sid",
+        [
+            "9039cf27-6302-4b0c-8be4-33083d6ee07e",
+            "../../etc/passwd",  # the substitution is what keeps rm -f in TMPDIR
+            "a" * 80,  # past the 64-char cap
+            "weird id!#$",
+        ],
+    )
+    def test_the_config_change_hook_deletes_the_file_this_module_writes(self, sid):
+        """The hook rebuilds the fetch-cache path in bash rather than importing it.
+        Drift deletes a name nobody wrote, silently, and the edited setting stays
+        off the line until the TTL runs out.
+        """
+        if not shutil.which("jq"):
+            pytest.skip("hook parses its stdin with jq")
+        hook = Path(__file__).resolve().parent.parent / "bin" / "clear-statusline-cache.sh"
+        sl._save_fetched(sid, self.CWD, self.NOW, self._fetched())
+        memo = sl._memo_path(sid)
+        memo.write_text('{"dsp": true}', encoding="utf-8")
+        run = subprocess.run(
+            ["bash", str(hook)],
+            input=json.dumps(
+                {
+                    "session_id": sid,
+                    "hook_event_name": "ConfigChange",
+                    "config_source": "user_settings",
+                },
+            ),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert not sl._fast_cache_path(sid).exists()
+        assert memo.exists()  # the DSP verdict is not a settings reading
+        assert run.stdout == ""
+
+    @pytest.mark.parametrize(
+        "payload", ["", "not json", "{}", '{"session_id": ""}', '{"session_id": "gone"}'],
+    )
+    def test_the_config_change_hook_never_blocks_the_config_change(self, payload):
+        """A ConfigChange hook that exits 2 stops the edit from taking effect."""
+        if not shutil.which("jq"):
+            pytest.skip("hook parses its stdin with jq")
+        hook = Path(__file__).resolve().parent.parent / "bin" / "clear-statusline-cache.sh"
+        run = subprocess.run(
+            ["bash", str(hook)], input=payload, capture_output=True, text=True, check=False,
+        )
+        assert run.returncode == 0
+        assert run.stdout == ""
+
 
 class TestCatchUpCacheStats:
     """The one bookkeeping write the fast path keeps (see _catch_up_cache_stats)."""
