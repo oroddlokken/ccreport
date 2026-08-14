@@ -47,6 +47,16 @@ def _asset(name: str) -> str:
         return f"/static/{name}"
 
 
+def _json_for_script(payload: object) -> str:
+    """json.dumps, safe to inline inside a script element.
+
+    json.dumps leaves "</" alone, so an account or project pushed as
+    "</script><script>…" would end the element and run as markup. Escaping the
+    slash keeps the JSON identical to a parser and inert to the HTML tokenizer.
+    """
+    return json.dumps(payload).replace("</", "<\\/")
+
+
 def _when(ts: float | None) -> str:
     """An epoch as a readable local stamp, or a dash where there is nothing."""
     if not ts:
@@ -78,7 +88,7 @@ def index(request: Request, days: int = Query(default=dashboard.DEFAULT_RANGE),
         "dimension": by if by in dashboard.DIMENSIONS else dashboard.DIMENSIONS[0],
         "metrics": dashboard.METRICS,
         "metric": metric if metric in dashboard.METRICS else dashboard.METRICS[0],
-        "chart": json.dumps({
+        "chart": _json_for_script({
             "days": view.chart_days,
             "series": [
                 {"account": s.account, "cost": s.cost, "tokens": s.tokens}
@@ -178,17 +188,26 @@ def mint(request: Request, machine_id: str = Form(...), label: str = Form(""),
     in the machine's own push.toml, and this is only where it gets typed.
     """
     conn = request.app.state.db.connect()
-    bad = _bad_cidr(networks)
-    if bad:
+    machine_id = machine_id.strip()
+    error = ""
+    if not machine_id:
+        error = "A machine id is required."
+    elif (bad := _bad_cidr(networks)):
+        error = f"{bad} is not a network."
+    if error:
+        # The submitted values ride back into the form: a policy that took a
+        # minute to type is not retyped over one bad CIDR.
         return templates.TemplateResponse(
             request, "machines.html",
-            {"machines": db.machine_overview(conn), "error": f"{bad} is not a network."},
+            {"machines": db.machine_overview(conn), "error": error,
+             "form": {"machine_id": machine_id, "label": label.strip(),
+                      "networks": networks, "restricted": bool(restricted), "allow": allow}},
             status_code=400,
         )
-    token = tokens.mint(conn, machine_id.strip(), label.strip() or machine_id.strip(), time.time())
+    token = tokens.mint(conn, machine_id, label.strip() or machine_id, time.time())
     conn.commit()
     return templates.TemplateResponse(request, "minted.html", {
-        "machine_id": machine_id.strip(),
+        "machine_id": machine_id,
         "token": token,
         "command": tokens.connect_command(
             str(request.base_url), token,
@@ -221,7 +240,7 @@ def delete_token(request: Request, token_hash: str):
 
 def _chart_payload(view: dashboard.Dashboard) -> str:
     """The detail page's charts as the JSON its script reads."""
-    return json.dumps([
+    return _json_for_script([
         {
             "key": chart.key,
             "title": chart.title,

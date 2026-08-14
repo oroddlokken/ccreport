@@ -10,7 +10,7 @@ from starlette.staticfiles import StaticFiles
 from ccreport import exchange
 from ccreport.server import db, ingest, pages, report_api
 from ccreport.server.config import ServerConfig, load_config
-from ccreport.server.middleware import NetworkGated, restrict_remote_addr_dep
+from ccreport.server.middleware import ImmutableCached, NetworkGated, restrict_remote_addr_dep
 
 
 def create_app(config: ServerConfig | None = None) -> FastAPI:
@@ -45,7 +45,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     app.mount(
         "/static",
         NetworkGated(
-            StaticFiles(directory=str(Path(__file__).with_name("static"))),
+            ImmutableCached(StaticFiles(directory=str(Path(__file__).with_name("static")))),
             config.networks,
         ),
         name="static",

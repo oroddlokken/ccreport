@@ -6,14 +6,14 @@
 <div class="command-box">
   <div class="command-head">
     <span class="dim">Run on <span class="mono">{{ machine_id }}</span></span>
-    <button type="button" class="ghost copy">Copy</button>
+    <button type="button" class="ghost copy" aria-live="polite">Copy</button>
   </div>
 <pre class="command">{{ command }}</pre>
 </div>
 
 <p class="hint">Revoking this token stops that machine at its next push.</p>
 
-<p><a href="/settings/machines/{{ machine_id }}">← Back to {{ machine_id }}</a></p>
+<p><a href="/settings/machines/{{ machine_id | urlencode }}">← Back to {{ machine_id }}</a></p>
 
 <script src="{{ asset('copy.js') }}"></script>
 {% endblock %}
