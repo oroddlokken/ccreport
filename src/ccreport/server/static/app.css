@@ -15,6 +15,10 @@
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
   /* One radius for every box on the page, so no corner disagrees with another. */
   --radius: 2px;
+  /* One content column, shared by header and main. Sized to fill a 14-inch
+     MacBook Pro window (1512px) with a margin, rather than the prose width
+     this data-dense page does not want. */
+  --page: 84rem;
   /* The categorical hues every chart draws from, in fixed order: a series
      keeps its colour when a filter drops the ones beside it. Validated as a
      set against --panel with the dataviz validator (worst adjacent pair
@@ -44,7 +48,7 @@ header { border-bottom: 1px solid var(--line); padding: .6rem 1.5rem; }
 /* Same 60rem column as main, so the brand sits over the content
    rather than a viewport-width to its left. */
 .header-inner {
-  max-width: 60rem;
+  max-width: var(--page);
   margin: 0 auto;
   display: flex;
   align-items: baseline;
@@ -66,7 +70,7 @@ nav a[aria-current="page"] { color: var(--text); }
   white-space: nowrap;
 }
 
-main { max-width: 60rem; margin: 0 auto; padding: 1rem 1.5rem; }
+main { max-width: var(--page); margin: 0 auto; padding: 1rem 1.5rem; }
 main a { color: var(--accent); text-decoration: none; }
 main a:hover { text-decoration: underline; }
 
