@@ -77,9 +77,10 @@ class ServerConfig:
     """Projects that keep their names, already resolved through this machine's
     merge rules so an alias matches the way a report groups it."""
     salt: str = ""
-    """What the pseudonyms are hashed against. Generated when restricted is
-    first set and never leaves the machine, so the server sees a durable
-    grouping key it cannot reverse."""
+    """What a pseudonym would be hashed against. Generated when restricted is
+    first set and never leaves the machine. Nothing derives from it since
+    redact() went to nulls; it is kept written so re-introducing a pseudonym
+    needs no config migration."""
     networks: tuple[str, ...] = ()
     """CIDRs this machine must hold an address inside before it pushes here.
     Empty means no gate, which is what a personal machine wants."""
@@ -231,12 +232,16 @@ def pseudonym(salt: str, name: str) -> str:
     project reads as the same key on every push and across machines that share
     a salt — and the salt never leaves the machine, so the server cannot walk
     it back to the name.
+
+    No caller: redact() nulls the project instead, because a row per pseudonym
+    told the server how many private projects there are. Kept for the day a
+    grouping key is worth that again.
     """
     return hashlib.sha256(f"{salt}\x00{name}".encode()).hexdigest()[:8]
 
 
 def pseudo_session(salt: str, session_id: str) -> str:
-    """The same, for a session id.
+    """The same, for a session id, and with no caller for the same reason.
 
     Longer than a project pseudonym: a machine has tens of projects and tens of
     thousands of sessions, and the session report is only useful while they
@@ -245,24 +250,31 @@ def pseudo_session(salt: str, session_id: str) -> str:
     return hashlib.sha256(f"{salt}\x00session\x00{session_id}".encode()).hexdigest()[:16]
 
 
+REDACTION_SHAPE = "null-identity"
+"""What redact() leaves of an unallowed record, as a value policy_hash moves on.
+
+The salt no longer changes when the redaction does — nothing derives from it
+since the pseudonyms went — so this string is the only thing that can force the
+re-push a shape change needs. Change what redact() strips, change this.
+"""
+
+
 def redact(rec: dict, server: ServerConfig) -> dict:
     """Strip a record's identity unless its project is opted in.
 
     What survives is everything the money is made of: model, timestamps and
-    token counts. What goes is project, cwd, repo and session id — the project
-    and the session as pseudonyms rather than nulls, so the server can still
-    group them, and cwd and repo as nothing at all, since a path and a remote
-    are the name written out.
+    token counts. What goes is project, cwd, repo and session id, all four to
+    nothing at all.
+
+    A pseudonym per project would let the server draw a row each, and a row per
+    private project is the count and the shape of the work — which is the thing
+    being kept back. The session goes with it for the same reason: a session
+    count per bucket says how much hidden work there was. All of it lands in one
+    bucket per account instead, which the server names.
     """
     if not server.restricted or rec["project"] in server.allow:
         return rec
-    return {
-        **rec,
-        "project": pseudonym(server.salt, rec["project"] or ""),
-        "cwd": None,
-        "repo": None,
-        "sid": pseudo_session(server.salt, rec["sid"] or "") if rec["sid"] else None,
-    }
+    return {**rec, "project": None, "cwd": None, "repo": None, "sid": None}
 
 
 def policy_hash(server: ServerConfig, override_rules: object = "") -> str:
@@ -275,11 +287,16 @@ def policy_hash(server: ServerConfig, override_rules: object = "") -> str:
 
     The local merge rules are in it for the same reason: they decide which name
     `allow` is matched against, so editing one re-points the whole policy.
+
+    REDACTION_SHAPE covers the third: what redact() leaves behind. A code edit
+    moves nothing else here, so without it the rows a previous shape wrote would
+    stand on the server until their files changed, which they never will.
     """
     material = "\x00".join([
         "1" if server.restricted else "0",
         *sorted(server.allow),
         server.salt,
+        REDACTION_SHAPE,
         repr(override_rules),
     ])
     return hashlib.sha256(material.encode()).hexdigest()[:16]

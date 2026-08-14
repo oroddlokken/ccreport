@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 import server_fixture as sf
 from fastapi.testclient import TestClient
@@ -9,7 +11,7 @@ from fastapi.testclient import TestClient
 from ccreport.server import tokens
 from ccreport.server.factory import create_app
 
-UI_ROUTES = ["/", "/machines", "/machines/laptop-1"]
+UI_ROUTES = ["/", "/machines", "/machines/laptop-1", "/accounts"]
 
 
 @pytest.fixture(autouse=True)
@@ -284,3 +286,154 @@ class TestAccessControl:
         client = TestClient(gated)
         token = sf.mint_for(gated)
         assert client.get("/v1/health", headers=sf.auth(token)).status_code == 200
+
+
+class TestAccountsPage:
+    """Where the login email gets a name the server draws instead."""
+
+    def _push(self, client, **over):
+        """One record stamped now, so the dashboard's default range covers it."""
+        token = _token_from(_mint(client).text)
+        over.setdefault("ts", time.time())
+        return client.post(
+            "/v1/ingest", json=sf.batch([sf.record(**over)]), headers=sf.auth(token),
+        )
+
+    def test_an_empty_server_says_so(self, client):
+        assert "No machine has pushed a record yet." in client.get("/accounts").text
+
+    def test_it_lists_the_account_with_its_label_records_and_cost(self, client):
+        self._push(client)
+        body = client.get("/accounts").text
+        assert "me@example.net" in body
+        assert "acct-1" in body
+        assert 'name="alias"' in body
+
+    def test_the_nav_reaches_it(self, client):
+        assert 'href="/accounts"' in client.get("/machines").text
+
+    def test_setting_an_alias_renames_the_account_on_the_dashboard(self, client):
+        self._push(client)
+        resp = client.post("/accounts/acct-1/alias", data={"alias": "personal"})
+        assert resp.status_code == 200
+        body = client.get("/").text
+        assert "personal" in body
+        assert "me@example.net" not in body
+
+    def test_the_field_comes_back_holding_what_was_set(self, client):
+        self._push(client)
+        client.post("/accounts/acct-1/alias", data={"alias": "personal"})
+        assert 'value="personal"' in client.get("/accounts").text
+
+    def test_clearing_it_puts_the_label_back(self, client):
+        self._push(client)
+        client.post("/accounts/acct-1/alias", data={"alias": "personal"})
+        client.post("/accounts/acct-1/alias", data={"alias": "  "})
+        assert "me@example.net" in client.get("/").text
+        assert client.app.state.db.connect().execute(
+            "SELECT COUNT(*) FROM account_aliases").fetchone()[0] == 0
+
+    def test_the_merged_report_reads_the_same_name(self, client):
+        self._push(client)
+        client.post("/accounts/acct-1/alias", data={"alias": "personal"})
+        assert client.get("/v1/report/account").json()["accounts"] == ["personal"]
+
+    def test_a_disallowed_address_cannot_read_or_set_one(self, tmp_path):
+        gated = TestClient(create_app(sf.config(tmp_path, networks=sf.ELSEWHERE)))
+        assert gated.get("/accounts").status_code == 403
+        assert gated.post("/accounts/acct-1/alias", data={"alias": "x"}).status_code == 403
+
+
+class TestDeletingATokenAndAMachine:
+    """Revoking is for a machine still out there; deleting is for a mistake."""
+
+    def _push(self, client, token, **over):
+        return client.post(
+            "/v1/ingest", json=sf.batch(**over), headers=sf.auth(token),
+        )
+
+    def test_the_token_table_offers_a_delete(self, client):
+        _mint(client)
+        assert "Delete" in client.get("/machines/laptop-1").text
+
+    def test_deleting_a_token_removes_its_row(self, app, client):
+        token = _token_from(_mint(client).text)
+        client.post(f"/tokens/{tokens.token_hash(token)}/delete")
+        assert app.state.db.connect().execute(
+            "SELECT COUNT(*) FROM machine_tokens").fetchone()[0] == 0
+
+    def test_a_deleted_token_stops_the_next_push(self, client):
+        token = _token_from(_mint(client).text)
+        assert self._push(client, token).status_code == 200
+        client.post(f"/tokens/{tokens.token_hash(token)}/delete")
+        assert self._push(client, token, mtime_ns=2).status_code == 401
+
+    def test_deleting_one_token_leaves_the_other_working(self, client):
+        first = _token_from(_mint(client).text)
+        second = _token_from(_mint(client).text)
+        client.post(f"/tokens/{tokens.token_hash(first)}/delete")
+        assert client.get("/v1/health", headers=sf.auth(first)).status_code == 401
+        assert client.get("/v1/health", headers=sf.auth(second)).status_code == 200
+
+    def test_revoke_still_only_stamps_the_row(self, app, client):
+        token = _token_from(_mint(client).text)
+        client.post(f"/tokens/{tokens.token_hash(token)}/revoke")
+        assert app.state.db.connect().execute(
+            "SELECT revoked_at FROM machine_tokens").fetchone()[0] is not None
+
+    def test_the_page_asks_for_the_id_before_it_deletes_the_machine(self, client):
+        _mint(client)
+        body = client.get("/machines/laptop-1").text
+        assert 'action="/machines/laptop-1/delete"' in body
+        assert 'name="confirm"' in body
+
+    def test_the_typed_id_takes_the_machine_and_everything_under_it(self, app, client):
+        token = _token_from(_mint(client).text)
+        self._push(client, token)
+        resp = client.post("/machines/laptop-1/delete", data={"confirm": "laptop-1"})
+        assert resp.status_code == 200
+        assert "Deleted laptop-1 and its 1 records." in resp.text
+        conn = app.state.db.connect()
+        for table in ("machines", "machine_tokens", "ingest_files", "server_records"):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0, table
+
+    def test_the_deleted_machine_is_a_404(self, client):
+        _mint(client)
+        client.post("/machines/laptop-1/delete", data={"confirm": "laptop-1"})
+        assert client.get("/machines/laptop-1").status_code == 404
+
+    @pytest.mark.parametrize("confirm", ["", "laptop", " laptop-1x"])
+    def test_a_confirmation_that_does_not_match_deletes_nothing(self, app, client, confirm):
+        token = _token_from(_mint(client).text)
+        self._push(client, token)
+        resp = client.post("/machines/laptop-1/delete", data={"confirm": confirm})
+        assert resp.status_code == 400
+        assert "Nothing was deleted." in resp.text
+        assert app.state.db.connect().execute(
+            "SELECT COUNT(*) FROM server_records").fetchone()[0] == 1
+
+    def test_a_padded_id_still_matches(self, client):
+        """The field is typed by hand and a browser is happy to trail a space."""
+        _mint(client)
+        resp = client.post("/machines/laptop-1/delete", data={"confirm": " laptop-1 "})
+        assert "Deleted laptop-1" in resp.text
+
+    def test_deleting_a_machine_that_never_existed_is_a_404(self, client):
+        assert client.post(
+            "/machines/never-minted/delete", data={"confirm": "never-minted"},
+        ).status_code == 404
+
+    def test_the_dashboard_drops_its_spend(self, app, client):
+        """cached_build keys on content_stamp, which the cascade has to move."""
+        from ccreport.server import dashboard
+
+        token = _token_from(_mint(client).text)
+        self._push(client, token, records=[sf.record(ts=time.time())])
+        assert dashboard.cached_build(app.state.db, 30).total_cost > 0
+        client.post("/machines/laptop-1/delete", data={"confirm": "laptop-1"})
+        assert dashboard.cached_build(app.state.db, 30).total_cost == 0
+
+    def test_neither_delete_is_reachable_from_outside(self, tmp_path):
+        gated = TestClient(create_app(sf.config(tmp_path, networks=sf.ELSEWHERE)))
+        assert gated.post("/tokens/abc/delete").status_code == 403
+        assert gated.post("/machines/x/delete", data={"confirm": "x"}).status_code == 403

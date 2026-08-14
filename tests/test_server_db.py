@@ -199,7 +199,23 @@ class TestContentStamp:
         db.replace_file_records(conn, "m1", path, mtime_ns, size, rows, now)
 
     def test_an_empty_database_stamps_without_raising(self, conn):
-        assert db.content_stamp(conn) == (0, 0, 0)
+        assert db.content_stamp(conn) == (0, 0, 0, 0, 0)
+
+    def test_naming_an_account_moves_it(self, conn):
+        """A rename has no push behind it, and it changes every rendered name."""
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        self._push(conn, [db.record_to_row(_record())])
+        before = db.content_stamp(conn)
+        db.set_account_alias(conn, "acct-1", "personal", 700.0)
+        assert db.content_stamp(conn) != before
+
+    def test_clearing_that_name_moves_it_back_off(self, conn):
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        self._push(conn, [db.record_to_row(_record())])
+        db.set_account_alias(conn, "acct-1", "personal", 700.0)
+        named = db.content_stamp(conn)
+        db.set_account_alias(conn, "acct-1", "", 800.0)
+        assert db.content_stamp(conn) != named
 
     def test_reading_it_twice_gives_the_same_answer(self, conn):
         db.upsert_machine(conn, "m1", "laptop", 100.0)

@@ -439,3 +439,174 @@ class TestRemoteFetch:
         monkeypatch.setattr(remote.urllib.request, "urlopen", fail)
         with pytest.raises(remote.RemoteError, match="403"):
             remote.fetch_report("https://ccr.example.net", "day")
+
+
+class TestAccountAliases:
+    """A screenshot of the dashboard leaks the login email; an alias is the fix."""
+
+    def _set(self, app, uuid, alias):
+        from ccreport.server import db
+
+        conn = app.state.db.connect()
+        db.set_account_alias(conn, uuid, alias, 1.0)
+        conn.commit()
+
+    def test_an_alias_renames_the_account_everywhere_a_report_names_it(self, app, client):
+        self._set(app, "u-work", "work")
+        body = _report(client, "account")
+        assert sorted(row["key"] for row in body["rows"]) == ["me@home.example", "work"]
+        assert body["accounts"] == ["me@home.example", "work"]
+
+    def test_the_grouped_loader_renames_it_too(self, app):
+        """The dashboard loads through this one; the two must agree on a name."""
+        self._set(app, "u-work", "work")
+        merged = reports.load_grouped(app.state.db.connect())
+        assert {m.account for m in merged} == {"me@home.example", "work"}
+
+    def test_clearing_it_falls_back_to_the_pushed_label(self, app, client):
+        self._set(app, "u-work", "work")
+        self._set(app, "u-work", "")
+        assert _report(client, "account")["accounts"] == [
+            "me@home.example", "me@work.example",
+        ]
+
+    def test_an_account_that_pushed_no_label_falls_back_to_its_uuid(self, tmp_path):
+        app = create_app(sf.config(tmp_path))
+        token = sf.mint_for(app)
+        TestClient(app).post(
+            "/v1/ingest",
+            json=sf.batch([sf.record(account_uuid="u-bare", account_label=None)]),
+            headers=sf.auth(token),
+        )
+        merged = reports.load(app.state.db.connect())
+        assert [m.account for m in merged] == ["u-bare"]
+
+    def test_the_stored_label_is_not_rewritten(self, app):
+        """The alias renames the view. The history keeps what was pushed."""
+        self._set(app, "u-work", "work")
+        conn = app.state.db.connect()
+        assert conn.execute(
+            "SELECT DISTINCT account_label FROM server_records WHERE account_uuid = 'u-work'",
+        ).fetchall() == [("me@work.example",)]
+
+    def test_filtering_by_the_alias_selects_what_the_email_does(self, app):
+        self._set(app, "u-work", "work")
+        conn = app.state.db.connect()
+        by_alias = reports.load(conn, reports.Filters(account="work"))
+        assert [m.record.message_id for m in by_alias] == ["a1", "a2"]
+
+    def test_the_grouped_loader_filters_by_the_alias_too(self, app):
+        self._set(app, "u-work", "work")
+        merged = reports.load_grouped(app.state.db.connect(), reports.Filters(account="work"))
+        assert {m.account for m in merged} == {"work"}
+        assert sum(m.record.count for m in merged) == 2
+
+    def test_the_uuid_and_the_email_still_filter_after_an_alias_is_set(self, app):
+        self._set(app, "u-work", "work")
+        conn = app.state.db.connect()
+        for name in ("u-work", "me@work.example"):
+            merged = reports.load(conn, reports.Filters(account=name))
+            assert [m.record.message_id for m in merged] == ["a1", "a2"], name
+
+    def test_one_alias_on_two_accounts_selects_both(self, app):
+        """Nothing stops the same name being typed twice; half the spend is worse."""
+        self._set(app, "u-work", "mine")
+        self._set(app, "u-home", "mine")
+        merged = reports.load(app.state.db.connect(), reports.Filters(account="mine"))
+        assert sorted(m.record.message_id for m in merged) == ["a1", "a2", "b1"]
+
+
+class TestAggregatedBucket:
+    """A restricted machine sends NULL; the server folds it, one row per account."""
+
+    @pytest.fixture
+    def app(self, tmp_path):
+        """Two accounts, each with one named project and two redacted ones."""
+        app = create_app(sf.config(tmp_path))
+        client = TestClient(app)
+        records = [
+            sf.record(mid="n1", dk="n1:r", ts=_ts(2), sid="s-1", project="projA",
+                      account_uuid="u-work", account_label="me@work.example", utc_offset=0),
+            sf.record(mid="r1", dk="r1:r", ts=_ts(2), sid=None, project=None,
+                      cwd=None, repo=None,
+                      account_uuid="u-work", account_label="me@work.example", utc_offset=0),
+            sf.record(mid="r2", dk="r2:r", ts=_ts(3), sid=None, project=None,
+                      cwd=None, repo=None,
+                      account_uuid="u-work", account_label="me@work.example", utc_offset=0),
+            sf.record(mid="r3", dk="r3:r", ts=_ts(3), sid=None, project=None,
+                      cwd=None, repo=None,
+                      account_uuid="u-home", account_label="me@home.example", utc_offset=0),
+        ]
+        token = sf.mint_for(app, "laptop-1", "Laptop")
+        resp = client.post(
+            "/v1/ingest", json=sf.batch(records), headers=sf.auth(token),
+        )
+        assert resp.json()["files"][0]["status"] == "accepted", resp.json()
+        return app
+
+    def _set(self, app, uuid, alias):
+        from ccreport.server import db
+
+        conn = app.state.db.connect()
+        db.set_account_alias(conn, uuid, alias, 1.0)
+        conn.commit()
+
+    def _projects(self, client):
+        return [row["key"] for row in _report(client, "project")["rows"]]
+
+    def test_every_redacted_project_on_one_account_is_one_row(self, client):
+        assert sorted(self._projects(client)) == [
+            "me@home.example/aggregated", "me@work.example/aggregated", "projA",
+        ]
+
+    def test_the_bucket_carries_the_cost_of_everything_in_it(self, client):
+        rows = {row["key"]: row for row in _report(client, "project")["rows"]}
+        bucket = rows["me@work.example/aggregated"]
+        assert bucket["agg"]["count"] == 2
+        assert bucket["agg"]["cost"] > 0
+
+    def test_an_alias_replaces_the_whole_account_segment(self, app, client):
+        """post@rykroken.net/personal-aggregated is never a name."""
+        self._set(app, "u-work", "personal")
+        names = self._projects(client)
+        assert "personal-aggregated" in names
+        assert not any("me@work.example" in name for name in names)
+
+    def test_clearing_the_alias_puts_the_label_back(self, app, client):
+        self._set(app, "u-work", "personal")
+        self._set(app, "u-work", "")
+        assert "me@work.example/aggregated" in self._projects(client)
+
+    def test_an_account_with_no_label_falls_back_to_its_uuid(self, tmp_path):
+        app = create_app(sf.config(tmp_path))
+        token = sf.mint_for(app)
+        TestClient(app).post(
+            "/v1/ingest",
+            json=sf.batch([sf.record(
+                project=None, sid=None, cwd=None, repo=None,
+                account_uuid="u-bare", account_label=None,
+            )]),
+            headers=sf.auth(token),
+        )
+        merged = reports.load(app.state.db.connect())
+        assert [m.record.project for m in merged] == ["u-bare/aggregated"]
+
+    def test_the_dashboard_breakdown_shows_the_same_one_row(self, app):
+        from ccreport.server import dashboard
+
+        merged = reports.load_grouped(app.state.db.connect())
+        rows = dashboard._breakdown(merged, "project", 1.0)
+        assert sorted(row["key"] for row in rows) == [
+            "me@home.example/aggregated", "me@work.example/aggregated", "projA",
+        ]
+
+    def test_the_grouped_loader_agrees_with_the_record_loader(self, app):
+        conn = app.state.db.connect()
+        assert (
+            {m.record.project for m in reports.load_grouped(conn)}
+            == {m.record.project for m in reports.load(conn)}
+        )
+
+    def test_a_named_project_is_untouched(self, client):
+        rows = {row["key"]: row for row in _report(client, "session")["rows"]}
+        assert rows["s-1"]["project"] == "projA"

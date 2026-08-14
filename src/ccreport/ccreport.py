@@ -1720,8 +1720,33 @@ def cmd_server_connect(args) -> None:
         console.print(f"Restricted: only {allowed} will be identified by name.")
 
 
+def _split_allow_targets(targets: Sequence[str], entries: dict, path: Path) -> tuple[str, list[str]]:
+    """Read a server URL and the project names out of one variadic argument list.
+
+    A leading URL is optional, so a name that push.toml does not carry is a
+    project. A URL push.toml does not carry is not: it stays the error it was,
+    because taking it for a project name would silently allow a project nobody
+    has.
+    """
+    first = targets[0]
+    if first in entries:
+        return first, list(targets[1:])
+    if first.startswith(("http://", "https://")):
+        print(f"ccreport: {first} is not in {path}.", file=sys.stderr)
+        sys.exit(1)
+    if len(entries) == 1:
+        return next(iter(entries)), list(targets)
+    if entries:
+        print(f"ccreport: name the server — {path} has {', '.join(sorted(entries))}.",
+              file=sys.stderr)
+    else:
+        print(f"ccreport: no server in {path} — run `ccreport server connect` first.",
+              file=sys.stderr)
+    sys.exit(1)
+
+
 def cmd_server_allow(args) -> None:
-    """Add or remove a project from a server's allow list, and force the re-push.
+    """Add or remove projects from a server's allow list, and force the re-push.
 
     The re-push is not optional: the files that named a project are closed logs
     that will never change again, so nothing else would take the name back off
@@ -1731,18 +1756,19 @@ def cmd_server_allow(args) -> None:
 
     path = Path(args.config or push.CONFIG_PATH)
     entries = push.read_raw(path)
-    if args.url not in entries:
-        print(f"ccreport: {args.url} is not in {path}.", file=sys.stderr)
+    url, projects = _split_allow_targets(args.targets, entries, path)
+    if not projects:
+        print(f"ccreport: name a project to {args.command} on {url}.", file=sys.stderr)
         sys.exit(1)
-    current = list(entries[args.url].get("allow") or ())
-    resolved = _resolved_projects([args.project])
+    current = list(entries[url].get("allow") or ())
+    resolved = _resolved_projects(projects)
     if args.command == "allow":
         updated = sorted(set(current) | set(resolved))
     else:
         updated = sorted(set(current) - set(resolved))
-    push.write_server(path, args.url, {"allow": updated})
-    cache_db.clear_push_state(args.url)
-    console.print(f"{args.url}: now identifying {', '.join(updated) or 'nothing'}.")
+    push.write_server(path, url, {"allow": updated})
+    cache_db.clear_push_state(url)
+    console.print(f"{url}: now identifying {', '.join(updated) or 'nothing'}.")
     console.print("The watermark was cleared; the next push re-sends everything.")
 
 
@@ -2980,8 +3006,8 @@ def main() -> None:
     server_sub = ps.add_subparsers(dest="server_command")
     for name, helptext in (
         ("connect", "Set up this machine against a server"),
-        ("allow", "Identify one more project by name"),
-        ("deny", "Stop identifying a project by name"),
+        ("allow", "Identify more projects by name"),
+        ("deny", "Stop identifying projects by name"),
         ("status", "What each server knows this machine as"),
         ("push", "Push this machine's records to a ccreport server"),
     ):
@@ -2998,8 +3024,10 @@ def main() -> None:
             sp.add_argument("--only-on-network", metavar="CIDRS",
                             help="Comma-separated CIDRs this machine must be inside to push")
         if name in ("allow", "deny"):
-            sp.add_argument("url", help="The server URL, as push.toml spells it")
-            sp.add_argument("project", help="The project name, before or after a merge rule")
+            sp.add_argument("targets", nargs="+", metavar="TARGET",
+                            help="Project names, before or after a merge rule, after an optional "
+                                 "leading server URL as push.toml spells it. The URL may be left "
+                                 "out when push.toml names one server")
         if name == "push":
             sp.add_argument("--server", help="Only this server URL, as push.toml spells it")
             sp.add_argument("--full", action="store_true",

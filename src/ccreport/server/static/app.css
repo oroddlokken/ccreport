@@ -96,6 +96,12 @@ button.ghost {
 }
 button.ghost:hover { color: var(--accent); border-color: var(--accent); }
 
+td.actions { display: flex; gap: .5rem; }
+td.actions form { margin: 0; }
+
+form.rename { margin: 0; gap: .4rem; align-items: center; flex-wrap: nowrap; }
+form.rename input { min-width: 9rem; }
+
 form.mint { display: block; max-width: 30rem; }
 form.mint .fields { display: flex; gap: .75rem; flex-wrap: wrap; }
 form.mint .fields label { flex: 1 1 10rem; }

@@ -4,8 +4,8 @@ Folds the same records `ccreport --server` renders, through the same
 `aggregate.py`. What the page adds is the five stat tiles and the shapes uPlot
 wants.
 
-A project a restricted machine did not opt in to appears under its pseudonym,
-with its real cost and token counts.
+Everything a restricted machine did not opt in to appears as one row per
+account, with its real cost and token counts and no name of its own.
 """
 
 from __future__ import annotations

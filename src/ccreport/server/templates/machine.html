@@ -3,6 +3,7 @@
 {% block content %}
 <h1>{{ label }}</h1>
 <p class="dim mono">{{ machine_id }} · {{ "{:,}".format(records) }} records</p>
+{% if error %}<p class="off">{{ error }}</p>{% endif %}
 
 <h2>Tokens</h2>
 {% if tokens %}
@@ -20,12 +21,15 @@
         {% if t.revoked_at %}<span class="off">revoked {{ t.revoked_at | when }}</span>
         {% else %}<span class="ok">active</span>{% endif %}
       </td>
-      <td>
+      <td class="actions">
         {% if not t.revoked_at %}
         <form method="post" action="/tokens/{{ t.token_hash }}/revoke">
           <button type="submit" class="danger">Revoke</button>
         </form>
         {% endif %}
+        <form method="post" action="/tokens/{{ t.token_hash }}/delete">
+          <button type="submit" class="danger">Delete</button>
+        </form>
       </td>
     </tr>
     {% endfor %}
@@ -41,5 +45,16 @@
   <input type="hidden" name="label" value="{{ label }}">
   {% include "_policy_fields.html" %}
   <button type="submit">Mint</button>
+</form>
+
+<h2>Delete this machine</h2>
+<p class="hint">Takes its tokens, what it has already pushed and the
+{{ "{:,}".format(records) }} records above with it. This server is the only copy of those
+records once the machine's own logs have rotated away, and nothing here undoes it.</p>
+<form method="post" action="/machines/{{ machine_id }}/delete">
+  <label>Type <span class="mono">{{ machine_id }}</span> to confirm
+    <input name="confirm" autocomplete="off" required>
+  </label>
+  <button type="submit" class="danger">Delete machine</button>
 </form>
 {% endblock %}

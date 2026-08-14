@@ -17,7 +17,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 """Stamped into PRAGMA user_version once the schema below has been applied.
 
 BUMP THIS on any change to _SCHEMA_SQL — an existing database is otherwise
@@ -117,6 +117,17 @@ CREATE TABLE IF NOT EXISTS ingest_files (
     n_records  INTEGER NOT NULL,
     updated_at REAL NOT NULL,
     PRIMARY KEY (machine_id, file_path)
+) WITHOUT ROWID;
+
+-- What this server calls an account. server_records.account_label holds the
+-- login email the pushing machine stamped on, and a screenshot of the
+-- dashboard leaks it; an alias renames every view the server draws without
+-- rewriting a single stored record. An account with no row here renders as its
+-- label, so clearing an alias is deleting the row.
+CREATE TABLE IF NOT EXISTS account_aliases (
+    account_uuid TEXT PRIMARY KEY,
+    alias        TEXT NOT NULL,
+    updated_at   REAL NOT NULL
 ) WITHOUT ROWID;
 
 -- The same shape exchange.py already caches on every client, because the
@@ -273,6 +284,30 @@ def revoke_token(conn: sqlite3.Connection, token_hash: str, now: float) -> bool:
     return cur.rowcount > 0
 
 
+def delete_token(conn: sqlite3.Connection, token_hash: str) -> bool:
+    """Remove a token's row. False when there was no row by that hash.
+
+    Apart from revoke on purpose: revoking is what you do to a machine still
+    out there and keeps when it stopped working, deleting is what you do to a
+    token minted by mistake, which has no history worth the row.
+    """
+    return conn.execute(
+        "DELETE FROM machine_tokens WHERE token_hash = ?", (token_hash,),
+    ).rowcount > 0
+
+
+def delete_machine(conn: sqlite3.Connection, machine_id: str) -> int:
+    """Remove a machine and return how many records went with it.
+
+    Its tokens, its ingest_files and its server_records follow through the
+    ON DELETE CASCADE the three declare, which is why the count is read first:
+    afterwards there is nothing left to count.
+    """
+    destroyed = record_count(conn, machine_id)
+    conn.execute("DELETE FROM machines WHERE machine_id = ?", (machine_id,))
+    return destroyed
+
+
 def machine_overview(conn: sqlite3.Connection) -> list[dict]:
     """Every machine with its token state and how much it has stored.
 
@@ -310,6 +345,67 @@ def machine_tokens(conn: sqlite3.Connection, machine_id: str) -> list[dict]:
     ]
 
 
+def account_aliases(conn: sqlite3.Connection) -> dict[str, str]:
+    """Every alias set, keyed by account uuid.
+
+    Read once per report and handed to the row builders, rather than looked up
+    per record: a merged corpus is one query's worth of accounts and hundreds of
+    thousands of records.
+    """
+    return dict(conn.execute("SELECT account_uuid, alias FROM account_aliases").fetchall())
+
+
+def accounts_with_alias(conn: sqlite3.Connection, alias: str | None) -> tuple[str, ...]:
+    """The accounts *alias* names, so a filter typed as an alias matches rows.
+
+    A tuple rather than one uuid: nothing stops two accounts being given the
+    same alias, and a filter that silently picked one of them would report half
+    the spend.
+    """
+    if not alias:
+        return ()
+    rows = conn.execute(
+        "SELECT account_uuid FROM account_aliases WHERE alias = ?", (alias,),
+    ).fetchall()
+    return tuple(row[0] for row in rows)
+
+
+def set_account_alias(conn: sqlite3.Connection, account_uuid: str, alias: str, now: float) -> None:
+    """Name *account_uuid*, or clear its name when *alias* is blank."""
+    alias = alias.strip()
+    if not alias:
+        conn.execute("DELETE FROM account_aliases WHERE account_uuid = ?", (account_uuid,))
+        return
+    conn.execute(
+        "INSERT INTO account_aliases (account_uuid, alias, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(account_uuid) DO UPDATE SET "
+        "alias = excluded.alias, updated_at = excluded.updated_at",
+        (account_uuid, alias, now),
+    )
+
+
+def account_overview(conn: sqlite3.Connection) -> list[dict]:
+    """Every account with records here, its stored label, its alias and its spend.
+
+    The label is the newest one that account pushed: a person who changed their
+    login email has both in the table, and the older one is not who they are.
+    """
+    rows = conn.execute("""
+        SELECT r.account_uuid, COUNT(*), COALESCE(SUM(r.cost), 0),
+               (SELECT r2.account_label FROM server_records r2
+                 WHERE r2.account_uuid = r.account_uuid AND r2.account_label IS NOT NULL
+              ORDER BY r2.ts DESC LIMIT 1),
+               (SELECT a.alias FROM account_aliases a WHERE a.account_uuid = r.account_uuid)
+          FROM server_records r
+      GROUP BY r.account_uuid
+      ORDER BY SUM(r.cost) DESC
+    """).fetchall()
+    return [
+        {"account_uuid": row[0], "records": row[1], "cost": row[2], "label": row[3], "alias": row[4]}
+        for row in rows
+    ]
+
+
 def record_count(conn: sqlite3.Connection, machine_id: str) -> int:
     """How many records the server holds for one machine."""
     return conn.execute(
@@ -326,7 +422,7 @@ def oldest_record_ts(conn: sqlite3.Connection) -> float | None:
 
 
 def content_stamp(conn: sqlite3.Connection) -> tuple:
-    """A value that moves whenever a push changed what the records hold.
+    """A value that moves whenever a render's input changed.
 
     Read from ingest_files rather than from server_records: every write path
     goes through replace_file_records, which stamps a row here in the same
@@ -335,13 +431,21 @@ def content_stamp(conn: sqlite3.Connection) -> tuple:
     edit — a re-push of one file moves updated_at, a machine dropped by a
     cascade moves the count, and a file that shrank moves the record total.
 
+    account_aliases rides along because it renames what every view draws
+    without a push behind it: without its two parts here the dashboard keeps
+    showing the email until the next machine pushes. Setting or re-setting an
+    alias moves the max, clearing one moves the count.
+
     A rate arriving in exchange_rates is deliberately not in it: nothing here
     would notice a rate updated in place, and the NOK column it moves is
     re-derived on the next push or the next day anyway.
     """
-    return conn.execute(
-        "SELECT COUNT(*), COALESCE(MAX(updated_at), 0), COALESCE(SUM(n_records), 0) FROM ingest_files",
-    ).fetchone()
+    return conn.execute("""
+        SELECT COUNT(*), COALESCE(MAX(updated_at), 0), COALESCE(SUM(n_records), 0),
+               (SELECT COUNT(*) FROM account_aliases),
+               (SELECT COALESCE(MAX(updated_at), 0) FROM account_aliases)
+          FROM ingest_files
+    """).fetchone()
 
 
 def machine_label(conn: sqlite3.Connection, machine_id: str) -> str | None:

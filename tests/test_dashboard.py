@@ -239,20 +239,39 @@ class TestTiles:
 
 
 class TestRedactedProjects:
-    def test_a_pseudonymous_project_keeps_its_numbers(self, tmp_path):
-        """The point of the redaction design; the page must not hide it away."""
+    def _redacted(self, tmp_path, count=2):
+        """A machine that opted nothing in: *count* records, all identity stripped."""
         app = create_app(sf.config(tmp_path))
-        client = TestClient(app)
         token = sf.mint_for(app)
-        record = sf.record(
-            mid="m1", dk="d1", ts=_ts(1), project="a1b2c3d4", cwd=None, repo=None,
-            sid="9f8e7d6c5b4a3210", utc_offset=_offset(),
-        )
-        client.post("/v1/ingest", json=sf.batch([record]), headers=sf.auth(token))
-        rows = _view(app).breakdowns["project"]
-        assert [row["key"] for row in rows] == ["a1b2c3d4"]
+        records = [
+            sf.record(mid=f"m{n}", dk=f"d{n}", ts=_ts(n + 1), project=None, cwd=None,
+                      repo=None, sid=None, utc_offset=_offset())
+            for n in range(count)
+        ]
+        TestClient(app).post("/v1/ingest", json=sf.batch(records), headers=sf.auth(token))
+        return app
+
+    def test_the_bucket_keeps_its_numbers(self, tmp_path):
+        """The point of the redaction design; the page must not hide it away."""
+        rows = _view(self._redacted(tmp_path)).breakdowns["project"]
         assert rows[0]["cost"] > 0
         assert rows[0]["tokens"] > 0
+
+    def test_every_redacted_project_is_one_row_named_for_the_account(self, tmp_path):
+        """A row per project would count the private projects and price each."""
+        rows = _view(self._redacted(tmp_path)).breakdowns["project"]
+        assert [row["key"] for row in rows] == ["me@example.net/aggregated"]
+        assert rows[0]["calls"] == 2
+
+    def test_naming_the_account_names_the_bucket(self, tmp_path):
+        from ccreport.server import db
+
+        app = self._redacted(tmp_path)
+        conn = app.state.db.connect()
+        db.set_account_alias(conn, "acct-1", "personal", 1.0)
+        conn.commit()
+        rows = _view(app).breakdowns["project"]
+        assert [row["key"] for row in rows] == ["personal-aggregated"]
 
 
 class TestCachedBuild:
@@ -304,6 +323,32 @@ class TestCachedBuild:
         other = create_app(sf.config(tmp_path / "other"))
         assert dashboard.cached_build(other.state.db, 30, NOW).total_cost == 0.0
         assert dashboard.cached_build(app.state.db, 30, NOW).total_cost > 0.0
+
+    def test_an_alias_invalidates_it(self, app):
+        """No push is behind a rename, so content_stamp has to read the aliases."""
+        from ccreport.server import db
+
+        first = dashboard.cached_build(app.state.db, 30, NOW)
+        conn = app.state.db.connect()
+        db.set_account_alias(conn, "work", "personal", 1.0)
+        conn.commit()
+        second = dashboard.cached_build(app.state.db, 30, NOW)
+        assert second is not first
+        assert "personal" in [row.account for row in second.accounts]
+        assert "work@example.net" not in [row.account for row in second.accounts]
+
+    def test_clearing_an_alias_invalidates_it_too(self, app):
+        from ccreport.server import db
+
+        conn = app.state.db.connect()
+        db.set_account_alias(conn, "work", "personal", 1.0)
+        conn.commit()
+        renamed = dashboard.cached_build(app.state.db, 30, NOW)
+        db.set_account_alias(conn, "work", "", 2.0)
+        conn.commit()
+        back = dashboard.cached_build(app.state.db, 30, NOW)
+        assert back is not renamed
+        assert "work@example.net" in [row.account for row in back.accounts]
 
     def test_the_page_serves_the_cached_view(self, app):
         view = dashboard.cached_build(app.state.db, 30, NOW)

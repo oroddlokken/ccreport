@@ -142,12 +142,35 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   sits beside it and wins: a push.toml that lost its `restricted = true` to an
   edit or an old backup redacts everything rather than reading as open
 - A restricted machine sends every record's counts and strips the identity of
-  any project outside `allow`: project and session become salted pseudonyms so
-  the server can still group them, cwd and repo become null. The salt never
-  leaves the machine. Changing `restricted`, `allow` or the local merge rules
-  moves `policy_hash`, which clears the watermark *and* sets `replace` on every
-  file — the server's skip is keyed on (mtime_ns, size), and the logs that
-  carried the old names are closed and will never change again
+  any project outside `allow`: project, session, cwd and repo all become null.
+  A pseudonym per project would have drawn a row each, and the count of private
+  projects with a price on each is the shape of the work. `reports.project_display`
+  folds every null project into one bucket per account instead —
+  `<alias>-aggregated`, or `<account label>/aggregated` where nothing is named,
+  or `<uuid>/aggregated` where the record carried no label. The alias replaces
+  the whole account segment, slash included. `push.pseudonym` and
+  `pseudo_session` are kept with no caller, as is `salt`, so re-introducing a
+  grouping key needs no config migration
+- Changing `restricted`, `allow`, the local merge rules or
+  `push.REDACTION_SHAPE` moves `policy_hash`, which clears the watermark *and*
+  sets `replace` on every file — the server's skip is keyed on (mtime_ns, size),
+  and the logs that carried the old names are closed and will never change
+  again. REDACTION_SHAPE is what a change to `redact` has to move: the salt no
+  longer varies with the redaction, so nothing else in that material would
+- What the server calls an account is `reports.account_display`: the
+  `account_aliases` row, then `server_records.account_label`, then the uuid. The
+  /accounts page writes it and `server_records` is never rewritten, so the login
+  email stays in the history and leaves the screen. `db.content_stamp` reads
+  that table for the same reason it reads `ingest_files` — a rename has no push
+  behind it and the dashboard's cache would otherwise keep drawing the email.
+  An alias also filters: `db.accounts_with_alias` widens the account clause so a
+  name typed off the dashboard selects what the email does
+- Revoking a token stamps `revoked_at`; deleting it removes the row. Both stop
+  the next push, and which one to reach for is whether the machine is still out
+  there. `POST /machines/{id}/delete` takes the machine, its tokens, its
+  `ingest_files` and every record it pushed, through the ON DELETE CASCADE those
+  three declare — behind the machine id typed into a form field, because this
+  server is the only copy of those records once the machine's logs have rotated
 - The network gate is `on_allowed_network`: a connected UDP socket per CIDR,
   which picks a route without sending a packet, so a VPN handing out an address
   in range counts as being on the network. Every CIDR is parsed before any is

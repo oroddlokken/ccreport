@@ -55,10 +55,18 @@ class TestRedaction:
 
     def test_a_project_outside_the_allow_list_loses_its_identity(self):
         out = push.redact(_record(), _server())
-        assert out["project"] != "ccr-projB"
+        assert out["project"] is None
         assert out["cwd"] is None
         assert out["repo"] is None
-        assert out["sid"] != "sess-1"
+        assert out["sid"] is None
+
+    def test_no_salted_value_reaches_the_request(self):
+        """A pseudonym per project counts the private projects for the server."""
+        out = push.redact(_record(), _server())
+        salted = {
+            push.pseudonym("s41t", "ccr-projB"), push.pseudo_session("s41t", "sess-1"),
+        }
+        assert not salted & {str(value) for value in out.values()}
 
     def test_its_token_counts_match_the_source_exactly(self):
         """Every record still pays; what it loses is who it was."""
@@ -72,23 +80,17 @@ class TestRedaction:
         rec = _record(project="ccr-projA", cwd="/tmp/ccr-projA")
         assert push.redact(rec, _server()) == rec
 
-    def test_the_same_project_hashes_the_same_way_twice(self):
-        """A pseudonym is a durable grouping key or it is nothing."""
-        first = push.redact(_record(), _server())
-        second = push.redact(_record(mid="m2"), _server())
-        assert first["project"] == second["project"]
-        assert first["sid"] == second["sid"]
-
-    def test_two_projects_do_not_collide(self):
+    def test_two_projects_fold_into_the_same_nothing(self):
+        """One bucket per account, so the server cannot count them."""
         one = push.redact(_record(project="one"), _server())
         two = push.redact(_record(project="two"), _server())
-        assert one["project"] != two["project"]
+        assert one["project"] is two["project"] is None
 
-    def test_another_salt_gives_another_pseudonym(self):
-        """The salt never leaves the machine, so the server cannot reverse it."""
+    def test_the_salt_no_longer_changes_what_is_sent(self):
+        """Nothing derives from it now; REDACTION_SHAPE is what moves the policy."""
         mine = push.redact(_record(), _server())
         theirs = push.redact(_record(), _server(salt="other"))
-        assert mine["project"] != theirs["project"]
+        assert mine == theirs
 
     def test_a_record_with_no_session_keeps_none(self):
         assert push.redact(_record(sid=None), _server())["sid"] is None
@@ -96,7 +98,7 @@ class TestRedaction:
     def test_an_empty_allow_list_identifies_nothing(self):
         """A valid restricted state: complete usage, no names at all."""
         out = push.redact(_record(project="ccr-projA"), _server(allow=()))
-        assert out["project"] != "ccr-projA"
+        assert out["project"] is None
 
 
 class TestFailClosed:
@@ -147,6 +149,12 @@ class TestPolicyHash:
         assert push.policy_hash(_server(allow=("a", "b"))) == push.policy_hash(
             _server(allow=("b", "a")),
         )
+
+    def test_the_redaction_shape_is_in_it(self, monkeypatch):
+        """A code edit moves nothing else here, so old rows would stand forever."""
+        before = push.policy_hash(_server())
+        monkeypatch.setattr(push, "REDACTION_SHAPE", "something-else")
+        assert push.policy_hash(_server()) != before
 
 
 class TestNetworkGate:
@@ -483,6 +491,51 @@ class TestAllowDenyCommands:
                 "--config", str(configured),
             ])
         assert exit_info.value.code == 1
+
+    def test_allow_takes_several_projects_at_once(self, configured, monkeypatch):
+        self._run(monkeypatch, [
+            "server", "allow", "https://ccr.example.net", "ccr-projB", "ccr-projC",
+            "--config", str(configured),
+        ])
+        assert push.load_config(configured)[0].allow == ("ccr-projA", "ccr-projB", "ccr-projC")
+
+    def test_deny_takes_several_projects_at_once(self, tmp_path, monkeypatch):
+        path = tmp_path / "push.toml"
+        push.write_server(path, "https://ccr.example.net", {
+            "token": "t", "restricted": True,
+            "allow": ["ccr-projA", "ccr-projB", "ccr-projC"], "salt": "s",
+        })
+        self._run(monkeypatch, [
+            "server", "deny", "https://ccr.example.net", "ccr-projA", "ccr-projC",
+            "--config", str(path),
+        ])
+        assert push.load_config(path)[0].allow == ("ccr-projB",)
+
+    def test_one_server_needs_no_url(self, configured, monkeypatch):
+        self._run(monkeypatch, [
+            "server", "allow", "ccr-projB", "ccr-projC", "--config", str(configured),
+        ])
+        assert push.load_config(configured)[0].allow == ("ccr-projA", "ccr-projB", "ccr-projC")
+
+    def test_two_servers_need_the_url_and_the_error_names_both(
+        self, configured, monkeypatch, capsys,
+    ):
+        push.write_server(configured, "https://other.example.net", {"token": "t2"})
+        with pytest.raises(SystemExit) as exit_info:
+            self._run(monkeypatch, ["server", "allow", "ccr-projB", "--config", str(configured)])
+        assert exit_info.value.code == 1
+        err = capsys.readouterr().err
+        assert "https://ccr.example.net" in err
+        assert "https://other.example.net" in err
+
+    def test_a_url_with_no_project_is_an_error(self, configured, monkeypatch, capsys):
+        with pytest.raises(SystemExit) as exit_info:
+            self._run(monkeypatch, [
+                "server", "allow", "https://ccr.example.net", "--config", str(configured),
+            ])
+        assert exit_info.value.code == 1
+        assert "name a project" in capsys.readouterr().err
+        assert push.load_config(configured)[0].allow == ("ccr-projA",)
 
 
 class TestStatusCommand:

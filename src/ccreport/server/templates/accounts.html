@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Accounts — ccreport{% endblock %}
+{% block content %}
+<h1>Accounts</h1>
+<p class="hint">A name replaces the pushed label everywhere this server draws — the dashboard,
+its chart legend and <span class="mono">ccreport --server</span>. The records keep the label
+they arrived with. Save an empty field to go back to it.</p>
+
+{% if accounts %}
+<table>
+  <thead>
+    <tr>
+      <th>Account</th><th>Pushed as</th>
+      <th class="num">Records</th><th class="num">Cost</th><th>Name</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for a in accounts %}
+    <tr>
+      <td class="mono dim">{{ a.account_uuid }}</td>
+      <td>{{ a.label or "—" }}</td>
+      <td class="num">{{ "{:,}".format(a.records) }}</td>
+      <td class="num">${{ "%.2f"|format(a.cost) }}</td>
+      <td>
+        <form method="post" action="/accounts/{{ a.account_uuid }}/alias" class="rename">
+          <input name="alias" value="{{ a.alias or '' }}" autocomplete="off"
+                 placeholder="{{ a.label or a.account_uuid }}">
+          <button type="submit">Save</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="dim">No machine has pushed a record yet.</p>
+{% endif %}
+{% endblock %}
