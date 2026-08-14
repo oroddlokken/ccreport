@@ -23,6 +23,11 @@
     return Number.isInteger(value) ? String(value) : value.toFixed(2);
   }
 
+  // Daily points carry no clock; an hourly axis gets date and 24h time in the
+  // reader's locale instead of uPlot's "12:00am" default.
+  const dayFmt = new Intl.DateTimeFormat(CCREPORT_LOCALE, { dateStyle: "medium" });
+  const hourFmt = new Intl.DateTimeFormat(CCREPORT_LOCALE, { dateStyle: "short", timeStyle: "short" });
+
   function tick(unit) {
     if (unit === "usd") return (u, values) => values.map((v) => "$" + compact(v));
     if (unit === "tokens") return (u, values) => values.map((v) => compact(v));
@@ -32,6 +37,7 @@
   function draw(spec, box) {
     const xs = spec.axis.map(stamp);
     const bars = spec.traces.length === 1;
+    const when = spec.axis.some((v) => v.length > 10) ? hourFmt : dayFmt;
     const opts = {
       width: box.clientWidth || 480,
       height: 200,
@@ -40,7 +46,7 @@
       legend: { live: true },
       cursor: { x: true, y: false },
       series: [
-        {},
+        { value: (u, ts) => (ts == null ? "--" : when.format(new Date(ts * 1000))) },
         ...spec.traces.map((trace, i) => ({
           label: trace.label,
           stroke: colors[i % colors.length],

@@ -73,6 +73,8 @@
     });
     const money = (u, v) => (v == null ? "--" : usd.format(v));
     const count = (u, v) => (v == null ? "--" : new Intl.NumberFormat(CCREPORT_LOCALE).format(v));
+    // Daily points carry no clock; uPlot's default would read "12:00am".
+    const day = new Intl.DateTimeFormat(CCREPORT_LOCALE, { dateStyle: "medium" });
     const opts = {
       width: box.clientWidth || 640,
       height: 200,
@@ -80,7 +82,7 @@
       // the legend -- without it they point at nothing.
       legend: { live: true },
       series: [
-        {},
+        { value: (u, ts) => (ts == null ? "--" : day.format(new Date(ts * 1000))) },
         ...payload.series.map((s, i) => ({
           label: s.account,
           stroke: COLORS[i % COLORS.length],
