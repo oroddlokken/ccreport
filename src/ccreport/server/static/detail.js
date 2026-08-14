@@ -44,7 +44,9 @@
       // Live, so moving across the plot reads the values out under the title
       // instead of asking the eye to measure against the axis.
       legend: { live: true },
-      cursor: { x: true, y: false },
+      // One sync key for the page: the charts share a time axis, so hovering
+      // a day in one reads the same day out in all of them.
+      cursor: { x: true, y: false, sync: { key: "ccreport-detail" } },
       series: [
         { value: (u, ts) => (ts == null ? "--" : when.format(new Date(ts * 1000))) },
         ...spec.traces.map((trace, i) => ({
