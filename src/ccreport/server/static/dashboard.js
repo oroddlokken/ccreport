@@ -27,6 +27,8 @@
 
   function draw() {
     const data = [xs, ...payload.series.map((s) => s[metric])];
+    const money = (u, v) => (v == null ? "--" : "$" + v.toFixed(2));
+    const count = (u, v) => (v == null ? "--" : new Intl.NumberFormat().format(v));
     const opts = {
       width: box.clientWidth || 640,
       height: 200,
@@ -41,6 +43,7 @@
           // hover point still lands on the day under the pointer.
           points: { show: false },
           paths: uPlot.paths.spline(),
+          value: metric === "cost" ? money : count,
         })),
       ],
       scales: {
@@ -52,7 +55,9 @@
         { stroke: "#8b93a7", grid: { stroke: "#272b36" } },
         { stroke: "#8b93a7", grid: { stroke: "#272b36" } },
       ],
-      legend: { live: false },
+      // Live, so the crosshair and hover points read the day's values out in
+      // the legend -- without it they point at nothing.
+      legend: { live: true },
     };
     if (chart) chart.destroy();
     chart = new uPlot(opts, data, box);
