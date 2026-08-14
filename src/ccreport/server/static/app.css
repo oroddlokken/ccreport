@@ -13,6 +13,8 @@
   --off: #f7768e;
   --off-line: #4a2b33;   /* --off dimmed to --line's weight, for a border that carries it */
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  /* One radius for every box on the page, so no corner disagrees with another. */
+  --radius: 2px;
 }
 
 * { box-sizing: border-box; }
@@ -28,7 +30,7 @@ header {
   display: flex;
   align-items: baseline;
   gap: 1.5rem;
-  padding: 1rem 1.5rem;
+  padding: .6rem 1.5rem;
   border-bottom: 1px solid var(--line);
 }
 
@@ -37,19 +39,19 @@ nav { display: flex; gap: 1rem; }
 nav a { color: var(--dim); text-decoration: none; }
 nav a:hover { color: var(--accent); }
 
-main { max-width: 60rem; margin: 0 auto; padding: 1.5rem; }
+main { max-width: 60rem; margin: 0 auto; padding: 1rem 1.5rem; }
 main a { color: var(--accent); text-decoration: none; }
 main a:hover { text-decoration: underline; }
 
 h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
-h2 { font-size: 1.05rem; margin: 2rem 0 .5rem; font-weight: 600; }
+h2 { font-size: 1.05rem; margin: 1.25rem 0 .5rem; font-weight: 600; }
 
 table {
   width: 100%;
   border-collapse: collapse;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--radius);
   overflow: hidden;
 }
 
@@ -69,7 +71,7 @@ label { display: flex; flex-direction: column; gap: .25rem; font-size: .85rem; c
 input {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--radius);
   color: var(--text);
   padding: .4rem .6rem;
   font: inherit;
@@ -80,7 +82,7 @@ button {
   background: var(--accent);
   color: #10131a;
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--radius);
   padding: .45rem .9rem;
   font: inherit;
   font-weight: 600;
@@ -110,7 +112,7 @@ form.mint input:not([type="checkbox"]) { width: 100%; }
 
 fieldset.policy {
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--radius);
   padding: .5rem 1rem 1rem;
   margin: 1rem 0;
 }
@@ -132,7 +134,7 @@ label.check:not(:has(:checked)) + .policy-cols .dependent { opacity: .45; }
   margin-top: 2rem;
   padding: 0 1.1rem 1.1rem;
   border: 1px solid var(--off-line);
-  border-radius: 6px;
+  border-radius: var(--radius);
   background: var(--panel);
 }
 .danger-zone h2 { margin: 1rem 0 .4rem; color: var(--off); }
@@ -147,7 +149,7 @@ form.confirm input { flex: 1 1 12rem; }
 .command-box {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--radius);
   margin: 1rem 0 .75rem;
   overflow: hidden;
 }
@@ -175,21 +177,21 @@ pre.command {
 
 /* --- Dashboard --- */
 
-.range { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+.range { display: flex; justify-content: space-between; align-items: center; margin-bottom: .75rem; }
 .toggles { display: inline-flex; gap: .4rem; }
 .toggle {
   color: var(--dim);
   text-decoration: none;
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--radius);
   padding: .15rem .55rem;
   font-size: .8rem;
 }
 .toggle.on { color: var(--bg); background: var(--accent); border-color: var(--accent); font-weight: 600; }
 
-.headline { margin-bottom: 1.5rem; }
-.figure { font-size: 2.6rem; font-weight: 650; letter-spacing: -0.02em; line-height: 1.1; }
-.footnote { max-width: 46ch; font-size: .8rem; margin: .5rem 0 0; }
+.headline { margin-bottom: .75rem; }
+.figure { font-size: 2.2rem; font-weight: 650; letter-spacing: -0.02em; line-height: 1.1; }
+.footnote { max-width: 46ch; font-size: .8rem; margin: .25rem 0 0; }
 
 .split { display: grid; grid-template-columns: minmax(14rem, 20rem) 1fr; gap: 1.5rem; align-items: start; }
 @media (max-width: 52rem) { .split { grid-template-columns: 1fr; } }
@@ -197,17 +199,17 @@ pre.command {
 .account { margin-bottom: .9rem; }
 .account-head, .account-foot { display: flex; justify-content: space-between; gap: 1rem; }
 .account-foot { font-size: .8rem; margin-top: .2rem; }
-.track { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: .35rem; }
+.track { height: 6px; background: var(--line); border-radius: var(--radius); overflow: hidden; margin-top: .35rem; }
 .fill { height: 100%; background: var(--accent); }
 
 .chart-head { display: flex; justify-content: space-between; align-items: baseline; }
 .chart-box { min-width: 0; }
 #chart { margin-top: .5rem; }
 
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: .75rem; margin: 1.75rem 0; }
-.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .75rem .9rem; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: .75rem; margin: 1rem 0; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: .6rem .8rem; }
 .tile-label { font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
-.tile-value { font-size: 1.5rem; font-weight: 600; margin: .15rem 0; font-variant-numeric: tabular-nums; }
+.tile-value { font-size: 1.35rem; font-weight: 600; margin: .15rem 0; font-variant-numeric: tabular-nums; }
 .tile-sub { font-size: .75rem; }
 
 table.breakdown { margin-top: .5rem; }
@@ -215,7 +217,7 @@ table.breakdown { margin-top: .5rem; }
 /* Two plots per row where the window allows it, so a reader compares cost
    against what the tokens under it were doing without scrolling between them. */
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(24rem, 1fr)); gap: 1.5rem; }
-.charts .chart-box { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .75rem 1rem 1rem; }
+.charts .chart-box { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: .75rem 1rem 1rem; }
 .charts h2 { margin: 0 0 .4rem; font-size: .95rem; }
 .charts .plot { min-height: 200px; }
 .detail-head { margin-bottom: 1.5rem; }
@@ -223,4 +225,4 @@ table.breakdown { margin-top: .5rem; }
 
 /* uPlot draws its own legend; these keep it in the page's palette. */
 .u-legend { color: var(--dim); font-size: .8rem; }
-.u-legend .u-marker { border-radius: 2px; }
+.u-legend .u-marker { border-radius: var(--radius); }
