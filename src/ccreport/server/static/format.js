@@ -2,11 +2,9 @@
 // place. The data attribute carries the raw value, the element's text is the
 // fallback that stands with scripting off or on any value Intl refuses.
 //
-// The locale is pinned rather than read from the browser: an English browser
-// UI on a Norwegian machine reports en-US, and this page already speaks
-// kroner and MVA. Loaded in head, so the chart scripts can share the constant;
-// the rewrite itself waits for the parsed document.
-const CCREPORT_LOCALE = "nb-NO";
+// undefined = the browser's own locale. Loaded in head so the chart scripts
+// can share the constant; the rewrite itself waits for the parsed document.
+const CCREPORT_LOCALE = undefined;
 
 document.addEventListener("DOMContentLoaded", function () {
   const usd = new Intl.NumberFormat(CCREPORT_LOCALE, {
