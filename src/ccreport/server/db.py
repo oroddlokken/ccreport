@@ -17,11 +17,14 @@ import sqlite3
 import threading
 from pathlib import Path
 
-SCHEMA_VERSION = 3
-"""Stamped into PRAGMA user_version once the schema below has been applied.
+from ccreport import migrations
 
-BUMP THIS on any change to _SCHEMA_SQL — an existing database is otherwise
-never reopened on the slow path and never sees the new DDL.
+MIGRATION_BASELINE = 3
+"""The version the schema below leaves a database at, before any chain step.
+
+Frozen. Every change from here on is an entry in `MIGRATION_CHAIN` further down,
+which is also what moves SCHEMA_VERSION — a bump on its own re-runs the CREATE
+script, and that script cannot add a column to a table it finds already there.
 """
 
 _SCHEMA_SQL = """\
@@ -179,6 +182,21 @@ def row_to_record(row: tuple) -> dict:
     return rec
 
 
+MIGRATION_CHAIN: tuple[migrations.Step, ...] = ()
+"""Every schema change since MIGRATION_BASELINE, in the order they are applied.
+
+Append only, one version above the last. A step that adds a column is what
+reaches a server database that already has the table — the CREATE script above
+cannot, and this file is the only copy of a machine's records once its logs have
+rotated. A change the CREATE script does cover, a new table or index, still needs
+an entry here to move the version that re-runs it; `Step(N, "name")` with no
+callable is that entry.
+"""
+
+SCHEMA_VERSION = migrations.head(MIGRATION_CHAIN, MIGRATION_BASELINE)
+"""The version a fully migrated database is stamped at. Derived, never edited."""
+
+
 class Database:
     """One connection per thread over one server database file.
 
@@ -229,7 +247,13 @@ def connect(path: Path) -> sqlite3.Connection:
             # above it only needs setting on a file this build has not opened.
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(_SCHEMA_SQL)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
+            # Creates what is missing, then steps a database that already had
+            # those tables up to the same shape. The stamp is its doing: it goes
+            # on with the last step, so a crash mid-chain resumes rather than
+            # recording a schema that is not there.
+            migrations.run(
+                conn, chain=MIGRATION_CHAIN, baseline=MIGRATION_BASELINE, db_path=path,
+            )
             conn.commit()
     except BaseException:
         conn.close()

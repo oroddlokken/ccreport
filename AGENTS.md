@@ -117,6 +117,20 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   functions, so nothing in `aggregate.py` may import rich. `tests/golden/`
   holds the pre-split rendering of every report — a diff there means the split
   changed output
+- A schema change reaches a database that already exists only through
+  `migrations.py`: a numbered `Step` appended to `MIGRATION_CHAIN` in
+  `cache_db.py` or `server/db.py`, one version above the last. `SCHEMA_VERSION`
+  is the chain head and is never hand-edited. The `CREATE ... IF NOT EXISTS`
+  scripts still carry a new table or index, and `Step(N, "name")` with no
+  callable is what moves the version that re-runs them — but a column added to a
+  table that is already there is skipped by the very `IF NOT EXISTS` that makes
+  the script safe to re-run, so it needs a step that does the `ALTER`. Steps run
+  inside a transaction with the stamp, so one may not `BEGIN`, `COMMIT` or turn
+  `foreign_keys` off, and needs no meta flag: its version is the flag. An entry
+  that has shipped is never edited — `migrations.run` records each step's source
+  hash and refuses to start where the recorded one no longer matches. The five
+  meta-flagged repairs in `cache_db._run_migrations` and `_ADDED_COLUMNS` are the
+  frozen pre-baseline bootstrap at 11, and nothing renumbers them
 - The server prices every record at ingest with its own `pricing.py` and stores
   the client's cost, if the log carried one, in a separate column. A model it
   has no price for fails that whole file with a reason in the response — never

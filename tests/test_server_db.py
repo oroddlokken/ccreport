@@ -6,6 +6,7 @@ import sqlite3
 
 import pytest
 
+from ccreport import migrations
 from ccreport.server import db
 
 
@@ -83,6 +84,38 @@ class TestSchema:
         )]
         second.close()
         assert "idx_srec_ts" in names
+
+    def test_a_new_column_reaches_a_database_that_already_has_the_table(
+        self, tmp_path, monkeypatch,
+    ):
+        """What the CREATE script cannot do and this file cannot go without: it
+        is the only copy of a machine's records once its own logs have rotated,
+        so a column added to server_records has to arrive by migration."""
+        path = tmp_path / "server.db"
+        first = db.connect(path)
+        db.upsert_machine(first, "m1", "laptop", 100.0)
+        db.replace_file_records(
+            first, "m1", "/p/a.jsonl", 1, 10, [db.record_to_row(_record())], 500.0,
+        )
+        first.close()
+
+        def add_region(conn: sqlite3.Connection) -> None:
+            conn.execute("ALTER TABLE server_records ADD COLUMN region TEXT")
+
+        step = migrations.Step(db.MIGRATION_BASELINE + 1, "record region", add_region)
+        monkeypatch.setattr(db, "MIGRATION_CHAIN", (step,))
+        monkeypatch.setattr(db, "SCHEMA_VERSION", step.version)
+
+        second = db.connect(path)
+        try:
+            assert "region" in [row[1] for row in second.execute(
+                "PRAGMA table_info(server_records)")]
+            assert [rec["mid"] for rec in db.load_file_records(second, "m1", "/p/a.jsonl")] == [
+                "msg_1",
+            ]
+            assert second.execute("PRAGMA user_version").fetchone()[0] == step.version
+        finally:
+            second.close()
 
     def test_a_record_cannot_name_a_machine_that_does_not_exist(self, conn):
         """Foreign keys are on, which is what keeps orphan rows out of a merge."""

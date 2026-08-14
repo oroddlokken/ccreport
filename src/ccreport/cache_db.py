@@ -23,6 +23,8 @@ from operator import itemgetter
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from ccreport import migrations
+
 # pricing.py imports cache_db only inside functions, so this direction is safe.
 from ccreport.pricing import project_key, rolling_cost_keys
 
@@ -43,13 +45,11 @@ _LEGACY_SNAPSHOT_DIR = Path.home() / ".local" / "share" / "macsetup" / "claude" 
 
 _conn: sqlite3.Connection | None = None
 
-# Stamped into the DB's PRAGMA user_version once the bootstrap below has run to
-# completion; get_connection skips the entire bootstrap when the two match.
-#
-# BUMP THIS on any change to _SCHEMA_SQL, _ADDED_COLUMNS, or the migration list
-# in _run_migrations — an existing DB is otherwise never reopened on the slow
-# path and never sees the new DDL. A needless bump costs one slow open per DB.
-SCHEMA_VERSION = 11
+# The version the bootstrap below leaves a DB at: _SCHEMA_SQL, _ADDED_COLUMNS and
+# the meta-flagged repairs in _run_migrations, all frozen at this number. Every
+# change from here on is an entry in MIGRATION_CHAIN, defined beside them, and
+# that is also what moves SCHEMA_VERSION — nothing here is hand-edited again.
+MIGRATION_BASELINE = 11
 
 _SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS meta (
@@ -565,7 +565,20 @@ def get_connection() -> sqlite3.Connection:
             for table, col, col_type in _ADDED_COLUMNS:
                 _add_column(conn, table, col, col_type)
             migration_ran = _run_migrations(conn)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
+            stamped = _user_version(conn)
+            # The chain picks up where the frozen bootstrap above stops, and the
+            # stamp is its doing: it moves with the last step it applied, so a
+            # crash mid-chain resumes rather than recording a schema that is not
+            # there. A step that rewrote rows earns the sanity check below on the
+            # same terms as a pre-baseline repair.
+            # The lock wait rides the same knob as the write lock: the status
+            # line sets it low, because a render that waits out another process's
+            # migration is a frame that never draws.
+            migrations.run(
+                conn, chain=MIGRATION_CHAIN, baseline=MIGRATION_BASELINE, db_path=DB_PATH,
+                timeout_s=_db_timeout(),
+            )
+            migration_ran = migration_ran or _user_version(conn) != stamped
         # Once a day (the run that writes the snapshot), plus any run that
         # migrated data — damage arrives from both directions. Deliberately
         # outside the gate: the daily cadence is the point, and migration_ran
@@ -806,6 +819,30 @@ def _rename_already_done(err: sqlite3.OperationalError) -> bool:
     """
     msg = str(err).lower()
     return ("no such column" in msg and "file_size" in msg) or "duplicate column" in msg
+
+
+MIGRATION_CHAIN: tuple[migrations.Step, ...] = ()
+"""Every schema change since MIGRATION_BASELINE, in the order they are applied.
+
+Append only, one version above the last, and never edit an entry that has
+shipped — a stamp has already carried databases past it, and `migrations.run`
+refuses to start on one whose recorded source no longer matches. The five
+meta-flagged repairs above stay where they are: they are the pre-baseline
+bootstrap, and a DB that ran them is stamped past them already.
+
+A step runs inside a transaction, so it must not BEGIN, COMMIT or turn
+PRAGMA foreign_keys off, and it need not write a meta flag — its version is the
+flag. A change _SCHEMA_SQL already covers, a new table or index, still needs an
+entry to move the version that re-runs the script: `Step(N, "name")` alone.
+"""
+
+SCHEMA_VERSION = migrations.head(MIGRATION_CHAIN, MIGRATION_BASELINE)
+"""The version a fully migrated DB is stamped at. Derived, never edited.
+
+get_connection skips the whole bootstrap when PRAGMA user_version already reads
+this, and _ccreport_files_fingerprint mixes it in so a schema change re-parses
+the corpus.
+"""
 
 
 # ---------------------------------------------------------------------------

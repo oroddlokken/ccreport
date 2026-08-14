@@ -14,7 +14,7 @@ from typing import cast
 import pytest
 from _narrow import present
 
-from ccreport import cache_db
+from ccreport import cache_db, migrations
 from ccreport.cache_db import (
     _CCR_COLS,
     RateLimitSample,
@@ -292,6 +292,72 @@ class TestSchemaVersionGate:
         )
         self._reopen()
         assert calls == [], "and the DB is back on the fast path"
+
+
+class TestMigrationChain:
+    """The numbered steps that pick up where the frozen bootstrap stops."""
+
+    _LEGACY_FLAGS = (
+        "migrated_flat_pricing_2026_03_13",
+        "migrated_flat_pricing_ccreport",
+        "migrated_flat_pricing_ccreport_variants",
+        "migrated_rename_fingerprint",
+        "migrated_dedup_keys_pk_order",
+    )
+
+    def _seed(self, tmp_path, monkeypatch):
+        """A DB that ran every pre-baseline repair, stamped before the baseline."""
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_DISABLE", "1")
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_DIR", str(tmp_path / "snaps"))
+        path = tmp_path / "cache.db"
+        seed = sqlite3.connect(path)
+        seed.executescript(cache_db._SCHEMA_SQL)
+        _seed_ccreport(seed, [("m1", "claude-opus-4-6", 1773424801.0, 5.0)])
+        seed.executemany(
+            "INSERT INTO meta (key, value) VALUES (?, '1')",
+            [(flag,) for flag in self._LEGACY_FLAGS],
+        )
+        seed.execute("PRAGMA user_version = 0")
+        seed.commit()
+        seed.close()
+        monkeypatch.setattr(cache_db, "DB_PATH", path)
+        monkeypatch.setattr(cache_db, "_conn", None)
+        return path
+
+    def test_the_flagged_repairs_do_not_run_again(self, tmp_path, monkeypatch):
+        """Their flags are the record, and the chain starts above them. Re-running
+        the flat-pricing repair would null a cost the DB has already recomputed."""
+        self._seed(tmp_path, monkeypatch)
+        conn = cache_db.get_connection()
+        try:
+            assert conn.execute("SELECT cost FROM ccreport_records").fetchone()[0] == 5.0
+            assert cache_db._user_version(conn) == cache_db.SCHEMA_VERSION
+        finally:
+            cache_db.close_connection()
+
+    def test_a_step_reaches_a_database_the_schema_script_cannot_widen(
+        self, tmp_path, monkeypatch,
+    ):
+        """The whole point of the chain: ccreport_records exists already, so only
+        a step can add a column to it."""
+        self._seed(tmp_path, monkeypatch)
+
+        def add_lane(conn: sqlite3.Connection) -> None:
+            conn.execute("ALTER TABLE ccreport_records ADD COLUMN lane TEXT")
+
+        step = migrations.Step(cache_db.MIGRATION_BASELINE + 1, "record lane", add_lane)
+        monkeypatch.setattr(cache_db, "MIGRATION_CHAIN", (step,))
+        monkeypatch.setattr(cache_db, "SCHEMA_VERSION", step.version)
+
+        conn = cache_db.get_connection()
+        try:
+            assert "lane" in _columns(conn, "ccreport_records")
+            assert cache_db._user_version(conn) == step.version
+            assert conn.execute(
+                "SELECT name FROM schema_migrations WHERE version = ?", (step.version,),
+            ).fetchone()[0] == "record lane"
+        finally:
+            cache_db.close_connection()
 
 
 class TestBootstrapFailure:
