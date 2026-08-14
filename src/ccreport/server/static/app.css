@@ -11,6 +11,7 @@
   --accent: #7aa2f7;
   --ok: #7bd88f;
   --off: #f7768e;
+  --off-line: #4a2b33;   /* --off dimmed to --line's weight, for a border that carries it */
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
 }
 
@@ -102,7 +103,7 @@ td.actions form { margin: 0; }
 form.rename { margin: 0; gap: .4rem; align-items: center; flex-wrap: nowrap; }
 form.rename input { min-width: 9rem; }
 
-form.mint { display: block; max-width: 30rem; }
+form.mint { display: block; }
 form.mint .fields { display: flex; gap: .75rem; flex-wrap: wrap; }
 form.mint .fields label { flex: 1 1 10rem; }
 form.mint input:not([type="checkbox"]) { width: 100%; }
@@ -114,11 +115,30 @@ fieldset.policy {
   margin: 1rem 0;
 }
 fieldset.policy legend { padding: 0 .4rem; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); }
-label.check { flex-direction: row; align-items: center; gap: .5rem; margin-top: 1rem; color: var(--text); }
+/* Two columns where the window has room for them, one where it does not. Both
+   are label, input, hint in that order, so the two inputs sit on one line. */
+.policy-cols { display: flex; gap: 1.75rem; flex-wrap: wrap; margin-top: .8rem; }
+.policy-cols > div { flex: 1 1 20rem; min-width: 0; }
+
+label.check { flex-direction: row; align-items: center; gap: .5rem; margin-top: .6rem; color: var(--text); }
 label.check input { accent-color: var(--accent); margin: 0; }
 
-.dependent { margin: .5rem 0 0 1.1rem; padding-left: .9rem; border-left: 1px solid var(--line); }
-label.check:not(:has(:checked)) + .dependent { opacity: .45; }
+/* The allow list is the checkbox's field and reads as nothing without it. */
+label.check:not(:has(:checked)) + .policy-cols .dependent { opacity: .45; }
+
+/* The one action on this server that no reflog undoes, so it gets a border of
+   its own rather than the weight of the mint form it sits under. */
+.danger-zone {
+  margin-top: 2rem;
+  padding: 0 1.1rem 1.1rem;
+  border: 1px solid var(--off-line);
+  border-radius: 6px;
+  background: var(--panel);
+}
+.danger-zone h2 { margin: 1rem 0 .4rem; color: var(--off); }
+form.confirm { align-items: center; gap: .6rem; margin-top: .9rem; }
+form.confirm label { flex-direction: row; align-items: center; gap: .3rem; }
+form.confirm input { flex: 1 1 12rem; }
 
 .hint { color: var(--dim); font-size: .75rem; line-height: 1.45; margin: .35rem 0 0; }
 .hint.note { border-top: 1px solid var(--line); margin-top: 1rem; padding-top: .7rem; }

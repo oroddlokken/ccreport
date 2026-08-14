@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 import pytest
 import server_fixture as sf
 from fastapi.testclient import TestClient
 
-from ccreport.server import tokens
+from ccreport.server import pages, tokens
 from ccreport.server.factory import create_app
 
-UI_ROUTES = ["/", "/machines", "/machines/laptop-1", "/accounts"]
+UI_ROUTES = ["/", "/settings/machines", "/settings/machines/laptop-1", "/settings/accounts"]
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +35,7 @@ def client(app):
 
 
 def _mint(client, machine_id="laptop-1", label="Laptop"):
-    return client.post("/machines/mint", data={"machine_id": machine_id, "label": label})
+    return client.post("/settings/machines/mint", data={"machine_id": machine_id, "label": label})
 
 
 def _token_from(page: str) -> str:
@@ -49,25 +50,44 @@ def _command_from(page: str) -> str:
     return line.split('<pre class="command">', 1)[-1].removesuffix("</pre>").strip()
 
 
+class TestStaticAssetURLs:
+    def test_the_stylesheet_link_carries_the_file_mtime(self, client):
+        """StaticFiles sends no Cache-Control, so the URL is what busts the cache."""
+        stamp = int((pages.STATIC_DIR / "app.css").stat().st_mtime)
+        assert f"/static/app.css?mtime={stamp}" in client.get("/settings/machines").text
+
+    def test_an_edited_file_gets_a_new_url(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pages, "STATIC_DIR", tmp_path)
+        (tmp_path / "app.css").write_text("body{}")
+        before = pages._asset("app.css")
+        os.utime(tmp_path / "app.css", (0, 0))
+        assert pages._asset("app.css") != before
+
+    def test_a_file_that_is_not_there_still_gets_a_url(self, tmp_path, monkeypatch):
+        """The 404 is StaticFiles' to report; raising here would take the page down."""
+        monkeypatch.setattr(pages, "STATIC_DIR", tmp_path)
+        assert pages._asset("gone.css") == "/static/gone.css"
+
+
 class TestMachinesPage:
     def test_an_empty_server_says_so(self, client):
-        body = client.get("/machines").text
+        body = client.get("/settings/machines").text
         assert "No machine has a token yet." in body
 
     def test_a_minted_machine_shows_up_as_active(self, client):
         _mint(client)
-        body = client.get("/machines").text
+        body = client.get("/settings/machines").text
         assert "Laptop" in body
         assert "active" in body
 
     def test_the_page_reports_what_that_machine_has_stored(self, app, client):
         token = _token_from(_mint(client).text)
         client.post("/v1/ingest", json=sf.batch(), headers=sf.auth(token))
-        assert ">1<" in client.get("/machines").text.replace(" ", "").replace("\n", "")
+        assert ">1<" in client.get("/settings/machines").text.replace(" ", "").replace("\n", "")
 
     def test_a_machine_page_lists_its_tokens(self, client):
         _mint(client)
-        body = client.get("/machines/laptop-1").text
+        body = client.get("/settings/machines/laptop-1").text
         assert "Revoke" in body
         assert "active" in body
 
@@ -80,12 +100,12 @@ class TestMachinesPage:
 
     def test_an_id_nothing_was_minted_for_is_a_404(self, client):
         """Rendering it would draw a machine that does not exist, with 0 records."""
-        assert client.get("/machines/never-minted").status_code == 404
+        assert client.get("/settings/machines/never-minted").status_code == 404
 
     def test_the_token_column_is_named_for_what_stamps_it(self, client):
         """Any authenticated request moves last_used_at, health checks included."""
         _mint(client)
-        body = client.get("/machines").text
+        body = client.get("/settings/machines").text
         assert "Token last used" in body
         assert "Last push" not in body
 
@@ -126,8 +146,8 @@ class TestMinting:
             assert client.get("/v1/health", headers=sf.auth(token)).status_code == 200
 
     def test_a_label_left_blank_falls_back_to_the_machine_id(self, client):
-        client.post("/machines/mint", data={"machine_id": "bare-1", "label": ""})
-        assert "bare-1" in client.get("/machines").text
+        client.post("/settings/machines/mint", data={"machine_id": "bare-1", "label": ""})
+        assert "bare-1" in client.get("/settings/machines").text
 
 
 class TestMintedPolicy:
@@ -136,11 +156,11 @@ class TestMintedPolicy:
     def _mint(self, client, **fields):
         data = {"machine_id": "laptop-1", "label": "Laptop"}
         data.update(fields)
-        return client.post("/machines/mint", data=data)
+        return client.post("/settings/machines/mint", data=data)
 
     def test_both_mint_forms_carry_the_policy_fields(self, client):
         _mint(client)
-        for route in ("/machines", "/machines/laptop-1"):
+        for route in ("/settings/machines", "/settings/machines/laptop-1"):
             body = client.get(route).text
             assert 'name="networks"' in body
             assert 'name="restricted"' in body
@@ -187,14 +207,14 @@ class TestMintedPage:
     def test_the_form_says_where_the_policy_lives(self, client):
         """It is the machine's file, so the page has to point at where to edit it."""
         _mint(client)
-        for route in ("/machines", "/machines/laptop-1"):
+        for route in ("/settings/machines", "/settings/machines/laptop-1"):
             body = client.get(route).text
             assert "push.toml" in body
             assert "ccreport server allow" in body
 
     def test_the_form_says_which_fields_allow_and_deny_reach(self, client):
         """They write the allow list alone; networks and restricted need connect."""
-        assert "need connect run again" in client.get("/machines").text
+        assert "need connect run again" in client.get("/settings/machines").text
 
     def test_the_command_has_a_copy_control(self, client):
         page = _mint(client).text
@@ -234,7 +254,7 @@ class TestRevoking:
     def test_a_revoked_token_reads_as_revoked_on_the_page(self, client):
         token = _token_from(_mint(client).text)
         client.post(f"/tokens/{tokens.token_hash(token)}/revoke")
-        assert "revoked" in client.get("/machines/laptop-1").text
+        assert "revoked" in client.get("/settings/machines/laptop-1").text
 
     def test_revoking_one_token_leaves_the_other_working(self, client):
         first = _token_from(_mint(client).text)
@@ -268,7 +288,7 @@ class TestAccessControl:
 
     def test_it_cannot_mint_either(self, gated):
         resp = TestClient(gated).post(
-            "/machines/mint", data={"machine_id": "x", "label": "x"},
+            "/settings/machines/mint", data={"machine_id": "x", "label": "x"},
         )
         assert resp.status_code == 403
 
@@ -300,21 +320,21 @@ class TestAccountsPage:
         )
 
     def test_an_empty_server_says_so(self, client):
-        assert "No machine has pushed a record yet." in client.get("/accounts").text
+        assert "No machine has pushed a record yet." in client.get("/settings/accounts").text
 
     def test_it_lists_the_account_with_its_label_records_and_cost(self, client):
         self._push(client)
-        body = client.get("/accounts").text
+        body = client.get("/settings/accounts").text
         assert "me@example.net" in body
         assert "acct-1" in body
         assert 'name="alias"' in body
 
     def test_the_nav_reaches_it(self, client):
-        assert 'href="/accounts"' in client.get("/machines").text
+        assert 'href="/settings/accounts"' in client.get("/settings/machines").text
 
     def test_setting_an_alias_renames_the_account_on_the_dashboard(self, client):
         self._push(client)
-        resp = client.post("/accounts/acct-1/alias", data={"alias": "personal"})
+        resp = client.post("/settings/accounts/acct-1/alias", data={"alias": "personal"})
         assert resp.status_code == 200
         body = client.get("/").text
         assert "personal" in body
@@ -322,26 +342,26 @@ class TestAccountsPage:
 
     def test_the_field_comes_back_holding_what_was_set(self, client):
         self._push(client)
-        client.post("/accounts/acct-1/alias", data={"alias": "personal"})
-        assert 'value="personal"' in client.get("/accounts").text
+        client.post("/settings/accounts/acct-1/alias", data={"alias": "personal"})
+        assert 'value="personal"' in client.get("/settings/accounts").text
 
     def test_clearing_it_puts_the_label_back(self, client):
         self._push(client)
-        client.post("/accounts/acct-1/alias", data={"alias": "personal"})
-        client.post("/accounts/acct-1/alias", data={"alias": "  "})
+        client.post("/settings/accounts/acct-1/alias", data={"alias": "personal"})
+        client.post("/settings/accounts/acct-1/alias", data={"alias": "  "})
         assert "me@example.net" in client.get("/").text
         assert client.app.state.db.connect().execute(
             "SELECT COUNT(*) FROM account_aliases").fetchone()[0] == 0
 
     def test_the_merged_report_reads_the_same_name(self, client):
         self._push(client)
-        client.post("/accounts/acct-1/alias", data={"alias": "personal"})
+        client.post("/settings/accounts/acct-1/alias", data={"alias": "personal"})
         assert client.get("/v1/report/account").json()["accounts"] == ["personal"]
 
     def test_a_disallowed_address_cannot_read_or_set_one(self, tmp_path):
         gated = TestClient(create_app(sf.config(tmp_path, networks=sf.ELSEWHERE)))
-        assert gated.get("/accounts").status_code == 403
-        assert gated.post("/accounts/acct-1/alias", data={"alias": "x"}).status_code == 403
+        assert gated.get("/settings/accounts").status_code == 403
+        assert gated.post("/settings/accounts/acct-1/alias", data={"alias": "x"}).status_code == 403
 
 
 class TestDeletingATokenAndAMachine:
@@ -354,7 +374,7 @@ class TestDeletingATokenAndAMachine:
 
     def test_the_token_table_offers_a_delete(self, client):
         _mint(client)
-        assert "Delete" in client.get("/machines/laptop-1").text
+        assert "Delete" in client.get("/settings/machines/laptop-1").text
 
     def test_deleting_a_token_removes_its_row(self, app, client):
         token = _token_from(_mint(client).text)
@@ -383,14 +403,14 @@ class TestDeletingATokenAndAMachine:
 
     def test_the_page_asks_for_the_id_before_it_deletes_the_machine(self, client):
         _mint(client)
-        body = client.get("/machines/laptop-1").text
-        assert 'action="/machines/laptop-1/delete"' in body
+        body = client.get("/settings/machines/laptop-1").text
+        assert 'action="/settings/machines/laptop-1/delete"' in body
         assert 'name="confirm"' in body
 
     def test_the_typed_id_takes_the_machine_and_everything_under_it(self, app, client):
         token = _token_from(_mint(client).text)
         self._push(client, token)
-        resp = client.post("/machines/laptop-1/delete", data={"confirm": "laptop-1"})
+        resp = client.post("/settings/machines/laptop-1/delete", data={"confirm": "laptop-1"})
         assert resp.status_code == 200
         assert "Deleted laptop-1 and its 1 records." in resp.text
         conn = app.state.db.connect()
@@ -399,14 +419,14 @@ class TestDeletingATokenAndAMachine:
 
     def test_the_deleted_machine_is_a_404(self, client):
         _mint(client)
-        client.post("/machines/laptop-1/delete", data={"confirm": "laptop-1"})
-        assert client.get("/machines/laptop-1").status_code == 404
+        client.post("/settings/machines/laptop-1/delete", data={"confirm": "laptop-1"})
+        assert client.get("/settings/machines/laptop-1").status_code == 404
 
     @pytest.mark.parametrize("confirm", ["", "laptop", " laptop-1x"])
     def test_a_confirmation_that_does_not_match_deletes_nothing(self, app, client, confirm):
         token = _token_from(_mint(client).text)
         self._push(client, token)
-        resp = client.post("/machines/laptop-1/delete", data={"confirm": confirm})
+        resp = client.post("/settings/machines/laptop-1/delete", data={"confirm": confirm})
         assert resp.status_code == 400
         assert "Nothing was deleted." in resp.text
         assert app.state.db.connect().execute(
@@ -415,12 +435,12 @@ class TestDeletingATokenAndAMachine:
     def test_a_padded_id_still_matches(self, client):
         """The field is typed by hand and a browser is happy to trail a space."""
         _mint(client)
-        resp = client.post("/machines/laptop-1/delete", data={"confirm": " laptop-1 "})
+        resp = client.post("/settings/machines/laptop-1/delete", data={"confirm": " laptop-1 "})
         assert "Deleted laptop-1" in resp.text
 
     def test_deleting_a_machine_that_never_existed_is_a_404(self, client):
         assert client.post(
-            "/machines/never-minted/delete", data={"confirm": "never-minted"},
+            "/settings/machines/never-minted/delete", data={"confirm": "never-minted"},
         ).status_code == 404
 
     def test_the_dashboard_drops_its_spend(self, app, client):
@@ -430,10 +450,10 @@ class TestDeletingATokenAndAMachine:
         token = _token_from(_mint(client).text)
         self._push(client, token, records=[sf.record(ts=time.time())])
         assert dashboard.cached_build(app.state.db, 30).total_cost > 0
-        client.post("/machines/laptop-1/delete", data={"confirm": "laptop-1"})
+        client.post("/settings/machines/laptop-1/delete", data={"confirm": "laptop-1"})
         assert dashboard.cached_build(app.state.db, 30).total_cost == 0
 
     def test_neither_delete_is_reachable_from_outside(self, tmp_path):
         gated = TestClient(create_app(sf.config(tmp_path, networks=sf.ELSEWHERE)))
         assert gated.post("/tokens/abc/delete").status_code == 403
-        assert gated.post("/machines/x/delete", data={"confirm": "x"}).status_code == 403
+        assert gated.post("/settings/machines/x/delete", data={"confirm": "x"}).status_code == 403

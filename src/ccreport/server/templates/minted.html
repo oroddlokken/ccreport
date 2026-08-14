@@ -14,7 +14,7 @@
 
 <p class="hint">Revoking this token stops that machine at its next push.</p>
 
-<p><a href="/machines/{{ machine_id }}">← Back to {{ machine_id }}</a></p>
+<p><a href="/settings/machines/{{ machine_id }}">← Back to {{ machine_id }}</a></p>
 
-<script src="/static/copy.js"></script>
+<script src="{{ asset('copy.js') }}"></script>
 {% endblock %}

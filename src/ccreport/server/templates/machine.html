@@ -40,21 +40,21 @@
 {% endif %}
 
 <h2>Mint another</h2>
-<form method="post" action="/machines/mint" class="mint">
+<form method="post" action="/settings/machines/mint" class="mint">
   <input type="hidden" name="machine_id" value="{{ machine_id }}">
   <input type="hidden" name="label" value="{{ label }}">
   {% include "_policy_fields.html" %}
   <button type="submit">Mint</button>
 </form>
 
-<h2>Delete this machine</h2>
-<p class="hint">Takes its tokens, what it has already pushed and the
-{{ "{:,}".format(records) }} records above with it. This server is the only copy of those
-records once the machine's own logs have rotated away, and nothing here undoes it.</p>
-<form method="post" action="/machines/{{ machine_id }}/delete">
-  <label>Type <span class="mono">{{ machine_id }}</span> to confirm
-    <input name="confirm" autocomplete="off" required>
-  </label>
-  <button type="submit" class="danger">Delete machine</button>
-</form>
+<section class="danger-zone">
+  <h2>Delete this machine</h2>
+  <p class="hint">This deletes the {{ "{:,}".format(records) }} records and the tokens for this
+  machine. You cannot undo this.</p>
+  <form method="post" action="/settings/machines/{{ machine_id }}/delete" class="confirm">
+    <label for="confirm-delete">Type <span class="mono">{{ machine_id }}</span> to confirm</label>
+    <input id="confirm-delete" name="confirm" autocomplete="off" required>
+    <button type="submit" class="danger">Delete machine</button>
+  </form>
+</section>
 {% endblock %}

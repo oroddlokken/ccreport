@@ -140,6 +140,15 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   wired in `factory.py`: a machine pushes from wherever it is and its token is
   what admits it, while the pages are reachable from home and nowhere else.
   `/static` is behind the gate with the pages it styles
+- The dashboard is `/`; everything that administers the server is under
+  `/settings` — machines, minting and account names, forms and redirects
+  included. `/tokens/{hash}/revoke` and `/delete` are the exception: they
+  redirect through Referer and are posted to from whichever page listed the
+  token
+- A stylesheet or script is linked through the `asset()` template global, never
+  as a bare `/static/…` path. It stamps the URL with the file's mtime, because
+  StaticFiles sends no Cache-Control and a browser is otherwise free to hold
+  yesterday's app.css against a page you just changed
 - The client resolves before it sends: the account from `account_events`
   (`accounts.py`, shared with the CLI so a detached push needs no rich) and the
   project name through this machine's own override rules. The server holds no
@@ -173,18 +182,19 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   longer varies with the redaction, so nothing else in that material would
 - What the server calls an account is `reports.account_display`: the
   `account_aliases` row, then `server_records.account_label`, then the uuid. The
-  /accounts page writes it and `server_records` is never rewritten, so the login
-  email stays in the history and leaves the screen. `db.content_stamp` reads
+  /settings/accounts page writes it and `server_records` is never rewritten, so
+  the login email stays in the history and leaves the screen. `db.content_stamp` reads
   that table for the same reason it reads `ingest_files` — a rename has no push
   behind it and the dashboard's cache would otherwise keep drawing the email.
   An alias also filters: `db.accounts_with_alias` widens the account clause so a
   name typed off the dashboard selects what the email does
 - Revoking a token stamps `revoked_at`; deleting it removes the row. Both stop
   the next push, and which one to reach for is whether the machine is still out
-  there. `POST /machines/{id}/delete` takes the machine, its tokens, its
-  `ingest_files` and every record it pushed, through the ON DELETE CASCADE those
-  three declare — behind the machine id typed into a form field, because this
-  server is the only copy of those records once the machine's logs have rotated
+  there. `POST /settings/machines/{id}/delete` takes the machine, its tokens,
+  its `ingest_files` and every record it pushed, through the ON DELETE CASCADE
+  those three declare — behind the machine id typed into a form field, because
+  this server is the only copy of those records once the machine's logs have
+  rotated
 - The network gate is `on_allowed_network`: a connected UDP socket per CIDR,
   which picks a route without sending a packet, so a VPN handing out an address
   in range counts as being on the network. Every CIDR is parsed before any is

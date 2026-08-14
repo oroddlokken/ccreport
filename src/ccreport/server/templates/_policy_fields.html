@@ -1,20 +1,24 @@
 <fieldset class="policy">
   <legend>Push policy</legend>
 
-  <label>Networks
-    <input name="networks" autocomplete="off" placeholder="10.0.0.0/8, 192.168.1.0/24">
-  </label>
-  <p class="hint">Pushes only while this machine holds an address inside one of them. Blank pushes from anywhere.</p>
-
   <label class="check">
     <input type="checkbox" name="restricted" value="1">
     Don't send project names
   </label>
-  <div class="dependent">
-    <label>Except these projects
-      <input name="allow" autocomplete="off" placeholder="ccreport, kantine">
-    </label>
-    <p class="hint">The rest still push their counts, and land in one unnamed row per account with no project, session, cwd or repo. Blank sends no name at all.</p>
+
+  <div class="policy-cols">
+    <div>
+      <label>Networks
+        <input name="networks" autocomplete="off" placeholder="10.0.0.0/8, 192.168.1.0/24">
+      </label>
+      <p class="hint">Pushes only while this machine holds an address inside one of them. Blank pushes from anywhere.</p>
+    </div>
+    <div class="dependent">
+      <label>Except these projects
+        <input name="allow" autocomplete="off" placeholder="ccreport, kantine">
+      </label>
+      <p class="hint">The rest still push their counts, and land in one unnamed row per account with no project, session, cwd or repo. Blank sends no name at all.</p>
+    </div>
   </div>
 
   <p class="hint note">This policy lands in that machine's <span class="mono">~/.config/ccreport/push.toml</span> and nowhere on this server. <span class="mono">ccreport server allow</span> and <span class="mono">deny</span> edit the project list there later; the networks and this checkbox need connect run again.</p>

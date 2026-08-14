@@ -25,7 +25,26 @@ from ccreport.server import dashboard, db, tokens
 router = APIRouter(tags=["pages"])
 
 TEMPLATE_DIR = Path(__file__).with_name("templates")
+STATIC_DIR = Path(__file__).with_name("static")
 templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
+
+
+def _asset(name: str) -> str:
+    """A /static URL stamped with the file's mtime.
+
+    StaticFiles sends no Cache-Control, which leaves a browser free to hold an
+    old app.css for as long as its own heuristic allows. The stamp is what makes
+    an edit reach a tab that is already open. It is read per render rather than
+    cached for the process: this server runs from a working tree, where a file
+    changes under a process that keeps running.
+
+    A file that will not stat still gets its URL — a missing asset is StaticFiles'
+    404 to report, not this function's exception.
+    """
+    try:
+        return f"/static/{name}?mtime={int(Path(STATIC_DIR, name).stat().st_mtime)}"
+    except OSError:
+        return f"/static/{name}"
 
 
 def _when(ts: float | None) -> str:
@@ -36,6 +55,7 @@ def _when(ts: float | None) -> str:
 
 
 templates.env.filters["when"] = _when
+templates.env.globals["asset"] = _asset
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -57,7 +77,7 @@ def index(request: Request, days: int = Query(default=dashboard.DEFAULT_RANGE)):
     })
 
 
-@router.get("/machines", response_class=HTMLResponse)
+@router.get("/settings/machines", response_class=HTMLResponse)
 def machines(request: Request, deleted: str = Query(default=""),
              records: int = Query(default=0)):
     """Every machine, with its last push, record count and token state.
@@ -93,13 +113,13 @@ def _machine_page(request: Request, machine_id: str, error: str = "", status_cod
     }, status_code=status_code)
 
 
-@router.get("/machines/{machine_id}", response_class=HTMLResponse)
+@router.get("/settings/machines/{machine_id}", response_class=HTMLResponse)
 def machine(request: Request, machine_id: str):
     """One machine's tokens, each with a revoke and a delete."""
     return _machine_page(request, machine_id)
 
 
-@router.get("/accounts", response_class=HTMLResponse)
+@router.get("/settings/accounts", response_class=HTMLResponse)
 def accounts(request: Request):
     """Every account that has pushed, each row a field for the name to draw it under."""
     conn = request.app.state.db.connect()
@@ -108,7 +128,7 @@ def accounts(request: Request):
     )
 
 
-@router.post("/accounts/{account_uuid}/alias")
+@router.post("/settings/accounts/{account_uuid}/alias")
 def set_alias(request: Request, account_uuid: str, alias: str = Form("")):
     """Name one account, or clear the name back to the label it pushed under.
 
@@ -119,7 +139,7 @@ def set_alias(request: Request, account_uuid: str, alias: str = Form("")):
     conn = request.app.state.db.connect()
     db.set_account_alias(conn, account_uuid, alias, time.time())
     conn.commit()
-    return RedirectResponse(url="/accounts", status_code=303)
+    return RedirectResponse(url="/settings/accounts", status_code=303)
 
 
 def _bad_cidr(networks: str) -> str | None:
@@ -138,7 +158,7 @@ def _bad_cidr(networks: str) -> str | None:
     return None
 
 
-@router.post("/machines/mint", response_class=HTMLResponse)
+@router.post("/settings/machines/mint", response_class=HTMLResponse)
 def mint(request: Request, machine_id: str = Form(...), label: str = Form(""),
          networks: str = Form(""), restricted: str = Form(""), allow: str = Form("")):
     """Mint a token and show it once, with the command that consumes it.
@@ -188,7 +208,7 @@ def delete_token(request: Request, token_hash: str):
     return RedirectResponse(url=request.headers.get("referer") or "/", status_code=303)
 
 
-@router.post("/machines/{machine_id}/delete")
+@router.post("/settings/machines/{machine_id}/delete")
 def delete_machine(request: Request, machine_id: str, confirm: str = Form("")):
     """Remove a machine, its tokens, its ingest state and every record it pushed.
 
@@ -208,5 +228,5 @@ def delete_machine(request: Request, machine_id: str, confirm: str = Form("")):
     destroyed = db.delete_machine(conn, machine_id)
     conn.commit()
     return RedirectResponse(
-        url=f"/machines?deleted={quote(machine_id)}&records={destroyed:d}", status_code=303,
+        url=f"/settings/machines?deleted={quote(machine_id)}&records={destroyed:d}", status_code=303,
     )

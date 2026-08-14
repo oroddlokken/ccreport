@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}ccreport{% endblock %}</title>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="{{ asset('app.css') }}">
 </head>
 <body>
   <header>
     <a class="brand" href="/">ccreport</a>
-    <nav><a href="/">Dashboard</a> <a href="/machines">Machines</a> <a href="/accounts">Accounts</a></nav>
+    <nav><a href="/">Dashboard</a> <a href="/settings/machines">Machines</a> <a href="/settings/accounts">Accounts</a></nav>
   </header>
   <main>
     {% block content %}{% endblock %}

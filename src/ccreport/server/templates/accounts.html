@@ -22,7 +22,7 @@ they arrived with. Save an empty field to go back to it.</p>
       <td class="num">{{ "{:,}".format(a.records) }}</td>
       <td class="num">${{ "%.2f"|format(a.cost) }}</td>
       <td>
-        <form method="post" action="/accounts/{{ a.account_uuid }}/alias" class="rename">
+        <form method="post" action="/settings/accounts/{{ a.account_uuid }}/alias" class="rename">
           <input name="alias" value="{{ a.alias or '' }}" autocomplete="off"
                  placeholder="{{ a.label or a.account_uuid }}">
           <button type="submit">Save</button>

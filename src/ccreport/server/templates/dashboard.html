@@ -98,8 +98,8 @@
   {% endfor %}
 </section>
 
-<link rel="stylesheet" href="/static/vendor/uPlot.min.css">
-<script src="/static/vendor/uPlot.iife.min.js"></script>
+<link rel="stylesheet" href="{{ asset('vendor/uPlot.min.css') }}">
+<script src="{{ asset('vendor/uPlot.iife.min.js') }}"></script>
 <script id="chart-data" type="application/json">{{ chart | safe }}</script>
-<script src="/static/dashboard.js"></script>
+<script src="{{ asset('dashboard.js') }}"></script>
 {% endblock %}
