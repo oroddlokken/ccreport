@@ -29,7 +29,7 @@
     const data = [xs, ...payload.series.map((s) => s[metric])];
     const opts = {
       width: box.clientWidth || 640,
-      height: 260,
+      height: 200,
       series: [
         {},
         ...payload.series.map((s, i) => ({
@@ -37,8 +37,17 @@
           stroke: COLORS[i % COLORS.length],
           fill: COLORS[i % COLORS.length] + "22",
           width: 2,
+          // Thirty daily points is too dense for markers; the cursor's own
+          // hover point still lands on the day under the pointer.
+          points: { show: false },
+          paths: uPlot.paths.spline(),
         })),
       ],
+      scales: {
+        // Anchored at zero, with headroom so the spline's overshoot at a peak
+        // is drawn rather than clipped flat against the plot edge.
+        y: { range: (u, min, max) => [0, max * 1.08 || 1] },
+      },
       axes: [
         { stroke: "#8b93a7", grid: { stroke: "#272b36" } },
         { stroke: "#8b93a7", grid: { stroke: "#272b36" } },

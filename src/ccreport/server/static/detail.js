@@ -38,8 +38,8 @@
           stroke: colors[i % colors.length],
           fill: colors[i % colors.length] + (bars ? "cc" : "22"),
           width: 2,
-          paths: bars ? uPlot.paths.bars({ size: [0.7, 40], radius: 0.2 }) : undefined,
-          points: { show: !bars, size: 8 },
+          paths: bars ? uPlot.paths.bars({ size: [0.7, 40], radius: 0.2 }) : uPlot.paths.spline(),
+          points: { show: false },
         })),
       ],
       axes: [
