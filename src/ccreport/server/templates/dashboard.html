@@ -1,22 +1,25 @@
 {% extends "base.html" %}
-{% block title %}Spend — ccreport{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="{{ asset('vendor/uPlot.min.css') }}">
+{% endblock %}
 {% block content %}
 
 <div class="range">
-  <span class="dim">{{ view.start }} — {{ view.end }}</span>
+  <span class="dim"><span data-day="{{ view.start }}">{{ view.start }}</span> — <span data-day="{{ view.end }}">{{ view.end }}</span></span>
   <span class="toggles">
     {% for days in ranges %}
     <a class="toggle {% if days == view.days %}on{% endif %}"
+       {% if days == view.days %}aria-current="true"{% endif %}
        href="/?days={{ days }}&by={{ dimension }}&metric={{ metric }}">{{ range_labels[days] }}</a>
     {% endfor %}
-    <a class="toggle" href="/?days={{ view.days }}&by={{ dimension }}&metric={{ metric }}">Refresh</a>
+    <a class="toggle refresh" href="/?days={{ view.days }}&by={{ dimension }}&metric={{ metric }}">Refresh</a>
   </span>
 </div>
 
 <section class="headline">
-  <div class="figure">{{ "${:,.2f}".format(view.total_cost) }}</div>
+  <h1 class="figure" data-usd="{{ view.total_cost }}">{{ "${:,.2f}".format(view.total_cost) }}</h1>
   {% if view.nok_enabled %}
-  <div class="dim">{{ "kr {:,.0f}".format(view.total_cost_nok) }} incl. MVA</div>
+  <div class="dim"><span data-nok="{{ view.total_cost_nok }}">{{ "kr {:,.0f}".format(view.total_cost_nok) }}</span> incl. MVA</div>
   {% endif %}
   <p class="dim footnote">Tokens priced at full API rates.</p>
 </section>
@@ -28,16 +31,16 @@
     <div class="account">
       <div class="account-head">
         <a href="/account/{{ row.account | urlencode }}?days={{ view.days }}">{{ row.account }}</a>
-        <span class="num">{{ "${:,.2f}".format(row.cost) }}</span>
+        <span class="num" data-usd="{{ row.cost }}">{{ "${:,.2f}".format(row.cost) }}</span>
       </div>
-      <div class="track"><div class="fill" style="width: {{ (row.share * 100) | round(1) }}%"></div></div>
+      <div class="track"><div class="fill" style="width: {{ (row.share * 100) | round(1) }}%; background: var(--chart-{{ loop.index0 % 6 + 1 }})"></div></div>
       <div class="account-foot dim">
         <span>{{ (row.share * 100) | round(1) }}%</span>
-        <span>{{ "{:,}".format(row.tokens) }} tokens</span>
+        <span><span data-int="{{ row.tokens }}">{{ "{:,}".format(row.tokens) }}</span> tokens</span>
       </div>
     </div>
     {% else %}
-    <p class="dim">No records in this range.</p>
+    <p class="dim">Nothing in this range.</p>
     {% endfor %}
   </section>
 
@@ -47,11 +50,12 @@
       <span class="toggles">
         {% for name in metrics %}
         <a class="toggle metric {% if name == metric %}on{% endif %}" data-metric="{{ name }}"
+           {% if name == metric %}aria-current="true"{% endif %}
            href="/?days={{ view.days }}&by={{ dimension }}&metric={{ name }}">{{ name | capitalize }}</a>
         {% endfor %}
       </span>
     </div>
-    <div id="chart"></div>
+    <div id="chart" role="img" aria-label="Daily {{ metric }} per account; the breakdown table below carries the same numbers"></div>
   </section>
 </div>
 
@@ -71,37 +75,39 @@
     <span class="toggles">
       {% for name in dimensions %}
       <a class="toggle dimension {% if name == dimension %}on{% endif %}" data-dimension="{{ name }}"
+         {% if name == dimension %}aria-current="true"{% endif %}
          href="/?days={{ view.days }}&by={{ name }}&metric={{ metric }}">{{ name }}</a>
       {% endfor %}
     </span>
   </div>
   {% for name in dimensions %}
-  <table class="breakdown" data-dimension="{{ name }}"
-         {% if name != dimension %}hidden{% endif %}>
+  <div class="breakdown-clip" data-dimension="{{ name }}" {% if name != dimension %}hidden{% endif %}>
+  <table class="breakdown">
     <thead>
       <tr>
-        <th>{{ name }}</th><th class="num">Cost</th>
-        <th class="num">Share</th><th class="num">Tokens</th><th class="num">Calls</th>
+        <th scope="col">{{ name }}</th><th scope="col" class="num">Cost</th>
+        <th scope="col" class="num">Share</th><th scope="col" class="num">Tokens</th>
+        <th scope="col" class="num">Calls</th>
       </tr>
     </thead>
     <tbody>
       {% for row in view.breakdowns[name] %}
       <tr>
         <td><a href="/{{ name }}/{{ row.key | urlencode }}?days={{ view.days }}">{{ row.key }}</a></td>
-        <td class="num">{{ "${:,.2f}".format(row.cost) }}</td>
+        <td class="num" data-usd="{{ row.cost }}">{{ "${:,.2f}".format(row.cost) }}</td>
         <td class="num">{{ (row.share * 100) | round(1) }}%</td>
-        <td class="num">{{ "{:,}".format(row.tokens) }}</td>
-        <td class="num">{{ "{:,}".format(row.calls) }}</td>
+        <td class="num" data-int="{{ row.tokens }}">{{ "{:,}".format(row.tokens) }}</td>
+        <td class="num" data-int="{{ row.calls }}">{{ "{:,}".format(row.calls) }}</td>
       </tr>
       {% else %}
       <tr><td colspan="5" class="dim">Nothing in this range.</td></tr>
       {% endfor %}
     </tbody>
   </table>
+  </div>
   {% endfor %}
 </section>
 
-<link rel="stylesheet" href="{{ asset('vendor/uPlot.min.css') }}">
 <script src="{{ asset('vendor/uPlot.iife.min.js') }}"></script>
 <script src="{{ asset('palette.js') }}"></script>
 <script id="chart-data" type="application/json">{{ chart | safe }}</script>

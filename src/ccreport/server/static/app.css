@@ -13,6 +13,24 @@
   --off: #f7768e;
   --off-line: #4a2b33;   /* --off dimmed to --line's weight, for a border that carries it */
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  /* One radius for every box on the page, so no corner disagrees with another. */
+  --radius: 2px;
+  /* One content column, shared by header and main. Sized to fill a 14-inch
+     MacBook Pro window (1512px) with a margin, rather than the prose width
+     this data-dense page does not want. */
+  --page: 84rem;
+  /* The categorical hues every chart draws from, in fixed order: a series
+     keeps its colour when a filter drops the ones beside it. Validated as a
+     set against --panel with the dataviz validator (worst adjacent pair
+     amber/aqua, CVD dE 8.4); re-run it before changing any value, and keep
+     the count at six -- a seventh hue is what TRACE_LIMIT folds into Other.
+     palette.js reads these, so JS and CSS cannot drift apart. */
+  --chart-1: #3987e5;
+  --chart-2: #d95926;
+  --chart-3: #199e70;
+  --chart-4: #c98500;
+  --chart-5: #d55181;
+  --chart-6: #008300;
 }
 
 * { box-sizing: border-box; }
@@ -21,35 +39,50 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  /* rem, not px, so a raised browser font size scales the body text along
+     with everything else. 0.9375rem keeps the default at 15px. */
+  font: 0.9375rem/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
-header {
+header { border-bottom: 1px solid var(--line); padding: .6rem 1.5rem; }
+/* Same 60rem column as main, so the brand sits over the content
+   rather than a viewport-width to its left. */
+.header-inner {
+  max-width: var(--page);
+  margin: 0 auto;
   display: flex;
   align-items: baseline;
   gap: 1.5rem;
-  padding: 1rem 1.5rem;
-  border-bottom: 1px solid var(--line);
 }
 
 .brand { font-weight: 600; color: var(--text); text-decoration: none; }
 nav { display: flex; gap: 1rem; }
 nav a { color: var(--dim); text-decoration: none; }
 nav a:hover { color: var(--accent); }
+nav a[aria-current="page"] { color: var(--text); }
 
-main { max-width: 60rem; margin: 0 auto; padding: 1.5rem; }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+main { max-width: var(--page); margin: 0 auto; padding: 1rem 1.5rem; }
 main a { color: var(--accent); text-decoration: none; }
 main a:hover { text-decoration: underline; }
 
 h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
-h2 { font-size: 1.05rem; margin: 2rem 0 .5rem; font-weight: 600; }
+h2 { font-size: 1.05rem; margin: 1.25rem 0 .5rem; font-weight: 600; }
 
 table {
   width: 100%;
   border-collapse: collapse;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--radius);
   overflow: hidden;
 }
 
@@ -62,6 +95,8 @@ td a { color: var(--accent); text-decoration: none; }
 .dim { color: var(--dim); }
 .ok { color: var(--ok); }
 .off { color: var(--off); }
+/* A confirmation ("Deleted X …") is not an error and must not wear error red. */
+.notice { color: var(--ok); }
 
 form { display: flex; gap: .75rem; align-items: flex-end; flex-wrap: wrap; margin: .5rem 0; }
 label { display: flex; flex-direction: column; gap: .25rem; font-size: .85rem; color: var(--dim); }
@@ -69,23 +104,28 @@ label { display: flex; flex-direction: column; gap: .25rem; font-size: .85rem; c
 input {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--radius);
   color: var(--text);
   padding: .4rem .6rem;
   font: inherit;
 }
-input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+input:focus-visible, button:focus-visible, a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: var(--radius);
+}
 
 button {
   background: var(--accent);
-  color: #10131a;
+  color: var(--bg);
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--radius);
   padding: .45rem .9rem;
   font: inherit;
   font-weight: 600;
   cursor: pointer;
 }
+button:not(.ghost):not(.danger):hover { filter: brightness(1.1); }
 button.danger { background: transparent; color: var(--off); border: 1px solid var(--off); font-weight: 500; }
 button.ghost {
   background: transparent;
@@ -97,7 +137,9 @@ button.ghost {
 }
 button.ghost:hover { color: var(--accent); border-color: var(--accent); }
 
-td.actions { display: flex; gap: .5rem; }
+/* Flex on a wrapper, not the cell: a flex td leaves the table model and stops
+   stretching to the row's height. */
+.actions-row { display: flex; gap: .5rem; align-items: center; }
 td.actions form { margin: 0; }
 
 form.rename { margin: 0; gap: .4rem; align-items: center; flex-wrap: nowrap; }
@@ -110,7 +152,7 @@ form.mint input:not([type="checkbox"]) { width: 100%; }
 
 fieldset.policy {
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--radius);
   padding: .5rem 1rem 1rem;
   margin: 1rem 0;
 }
@@ -123,8 +165,10 @@ fieldset.policy legend { padding: 0 .4rem; font-size: .75rem; text-transform: up
 label.check { flex-direction: row; align-items: center; gap: .5rem; margin-top: .6rem; color: var(--text); }
 label.check input { accent-color: var(--accent); margin: 0; }
 
-/* The allow list is the checkbox's field and reads as nothing without it. */
-label.check:not(:has(:checked)) + .policy-cols .dependent { opacity: .45; }
+/* The allow list is the checkbox's field and reads as nothing without it.
+   Dimmed, not disabled -- the field stays usable, so the hint has to stay
+   readable too: .75 keeps it at contrast, .45 dropped it below AA. */
+label.check:not(:has(:checked)) + .policy-cols .dependent { opacity: .75; }
 
 /* The one action on this server that no reflog undoes, so it gets a border of
    its own rather than the weight of the mint form it sits under. */
@@ -132,7 +176,7 @@ label.check:not(:has(:checked)) + .policy-cols .dependent { opacity: .45; }
   margin-top: 2rem;
   padding: 0 1.1rem 1.1rem;
   border: 1px solid var(--off-line);
-  border-radius: 6px;
+  border-radius: var(--radius);
   background: var(--panel);
 }
 .danger-zone h2 { margin: 1rem 0 .4rem; color: var(--off); }
@@ -140,14 +184,14 @@ form.confirm { align-items: center; gap: .6rem; margin-top: .9rem; }
 form.confirm label { flex-direction: row; align-items: center; gap: .3rem; }
 form.confirm input { flex: 1 1 12rem; }
 
-.hint { color: var(--dim); font-size: .75rem; line-height: 1.45; margin: .35rem 0 0; }
+.hint { color: var(--dim); font-size: .75rem; line-height: 1.45; margin: .35rem 0 0; max-width: 64ch; }
 .hint.note { border-top: 1px solid var(--line); margin-top: 1rem; padding-top: .7rem; }
 .hint .mono { font-size: inherit; color: var(--text); }
 
 .command-box {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--radius);
   margin: 1rem 0 .75rem;
   overflow: hidden;
 }
@@ -160,6 +204,8 @@ form.confirm input { flex: 1 1 12rem; }
   border-bottom: 1px solid var(--line);
   font-size: .8rem;
 }
+/* Wide enough for both "Copy" and "Copied", so the header does not jiggle. */
+.command-head .copy { min-width: 4.5rem; }
 
 pre.command {
   margin: 0;
@@ -175,21 +221,26 @@ pre.command {
 
 /* --- Dashboard --- */
 
-.range { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+.range { display: flex; justify-content: space-between; align-items: center; margin-bottom: .75rem; }
 .toggles { display: inline-flex; gap: .4rem; }
 .toggle {
   color: var(--dim);
   text-decoration: none;
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: var(--radius);
   padding: .15rem .55rem;
   font-size: .8rem;
 }
 .toggle.on { color: var(--bg); background: var(--accent); border-color: var(--accent); font-weight: 600; }
+.toggle:hover { color: var(--accent); border-color: var(--accent); }
+.toggle.on:hover { color: var(--bg); }
+main a.toggle:hover { text-decoration: none; }
+/* Refresh is a verb among nouns; the gap keeps it from reading as a range. */
+.toggle.refresh { margin-left: .6rem; }
 
-.headline { margin-bottom: 1.5rem; }
-.figure { font-size: 2.6rem; font-weight: 650; letter-spacing: -0.02em; line-height: 1.1; }
-.footnote { max-width: 46ch; font-size: .8rem; margin: .5rem 0 0; }
+.headline { margin-bottom: .75rem; }
+.figure { font-size: 2.2rem; font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; margin: 0; }
+.footnote { max-width: 46ch; font-size: .8rem; margin: .25rem 0 0; }
 
 .split { display: grid; grid-template-columns: minmax(14rem, 20rem) 1fr; gap: 1.5rem; align-items: start; }
 @media (max-width: 52rem) { .split { grid-template-columns: 1fr; } }
@@ -197,30 +248,52 @@ pre.command {
 .account { margin-bottom: .9rem; }
 .account-head, .account-foot { display: flex; justify-content: space-between; gap: 1rem; }
 .account-foot { font-size: .8rem; margin-top: .2rem; }
-.track { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: .35rem; }
+.track { height: 6px; background: var(--line); border-radius: var(--radius); overflow: hidden; margin-top: .35rem; }
 .fill { height: 100%; background: var(--accent); }
 
 .chart-head { display: flex; justify-content: space-between; align-items: baseline; }
 .chart-box { min-width: 0; }
-#chart { margin-top: .5rem; }
+/* Reserved before uPlot mounts: 200px canvas plus a two-row legend, so the
+   tiles and breakdown do not jump when the script lands. */
+#chart { margin-top: .5rem; min-height: 264px; }
 
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: .75rem; margin: 1.75rem 0; }
-.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .75rem .9rem; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: .75rem; margin: 1rem 0; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: .6rem .8rem; }
 .tile-label { font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
-.tile-value { font-size: 1.5rem; font-weight: 600; margin: .15rem 0; font-variant-numeric: tabular-nums; }
+.tile-value { font-size: 1.35rem; font-weight: 600; margin: .15rem 0; font-variant-numeric: tabular-nums; }
 .tile-sub { font-size: .75rem; }
 
 table.breakdown { margin-top: .5rem; }
+/* The breakdown has no row cap server-side; the clip is what keeps a month of
+   many models inside the no-scroll budget the rest of the page fits. */
+.breakdown-clip { max-height: 17rem; overflow-y: auto; margin-top: .5rem; }
+.breakdown-clip table.breakdown { margin-top: 0; }
+.breakdown-clip thead th { position: sticky; top: 0; background: var(--panel); }
 
 /* Two plots per row where the window allows it, so a reader compares cost
    against what the tokens under it were doing without scrolling between them. */
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(24rem, 1fr)); gap: 1.5rem; }
-.charts .chart-box { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .75rem 1rem 1rem; }
+.charts .chart-box { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: .75rem 1rem 1rem; }
 .charts h2 { margin: 0 0 .4rem; font-size: .95rem; }
-.charts .plot { min-height: 200px; }
+/* 200px canvas plus the one-row legend under it, reserved against layout shift. */
+.charts .plot { min-height: 228px; }
 .detail-head { margin-bottom: 1.5rem; }
-.detail-head h1 { font-size: 1.5rem; margin-bottom: .2rem; word-break: break-all; }
+.detail-head h1 { font-size: 1.4rem; margin-bottom: .2rem; overflow-wrap: anywhere; }
 
-/* uPlot draws its own legend; these keep it in the page's palette. */
+/* uPlot draws its own legend; these keep it in the page's palette, and undo
+   the page's table and th styling, which otherwise turns long series names
+   into shouting uppercase panels. */
 .u-legend { color: var(--dim); font-size: .8rem; }
-.u-legend .u-marker { border-radius: 2px; }
+.u-legend .u-marker { border-radius: var(--radius); }
+.u-legend table { background: transparent; border: 0; width: auto; }
+.u-legend th, .u-legend td {
+  border: 0;
+  padding: .1rem .3rem;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: .8rem;
+  font-weight: 500;
+  color: var(--dim);
+}
+/* The vendored uPlot select box is 7% black, invisible on this surface. */
+.u-select { background: color-mix(in srgb, var(--accent) 18%, transparent); }

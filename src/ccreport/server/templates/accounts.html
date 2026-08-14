@@ -1,5 +1,4 @@
 {% extends "base.html" %}
-{% block title %}Accounts — ccreport{% endblock %}
 {% block content %}
 <h1>Accounts</h1>
 <p class="hint">A name replaces the pushed label everywhere this server draws — the dashboard,
@@ -10,8 +9,9 @@ they arrived with. Save an empty field to go back to it.</p>
 <table>
   <thead>
     <tr>
-      <th>Account</th><th>Pushed as</th>
-      <th class="num">Records</th><th class="num">Cost</th><th>Name</th>
+      <th scope="col">Account</th><th scope="col">Pushed as</th>
+      <th scope="col" class="num">Records</th><th scope="col" class="num">Cost</th>
+      <th scope="col">Name</th>
     </tr>
   </thead>
   <tbody>
@@ -19,11 +19,12 @@ they arrived with. Save an empty field to go back to it.</p>
     <tr>
       <td class="mono dim">{{ a.account_uuid }}</td>
       <td>{{ a.label or "—" }}</td>
-      <td class="num">{{ "{:,}".format(a.records) }}</td>
-      <td class="num">${{ "%.2f"|format(a.cost) }}</td>
+      <td class="num" data-int="{{ a.records }}">{{ "{:,}".format(a.records) }}</td>
+      <td class="num" data-usd="{{ a.cost }}">{{ "${:,.2f}".format(a.cost) }}</td>
       <td>
-        <form method="post" action="/settings/accounts/{{ a.account_uuid }}/alias" class="rename">
+        <form method="post" action="/settings/accounts/{{ a.account_uuid | urlencode }}/alias" class="rename">
           <input name="alias" value="{{ a.alias or '' }}" autocomplete="off"
+                 aria-label="Name for {{ a.label or a.account_uuid }}"
                  placeholder="{{ a.label or a.account_uuid }}">
           <button type="submit">Save</button>
         </form>

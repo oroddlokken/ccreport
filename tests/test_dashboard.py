@@ -278,8 +278,8 @@ class TestTogglesInTheURL:
     """Which breakdown and which chart series the page opens on."""
 
     def _row(self, body: str, dimension: str) -> str:
-        """The <table> tag for one dimension, hidden attribute and all."""
-        tag = re.search(rf'<table class="breakdown" data-dimension="{dimension}"[^>]*>', body)
+        """The clip wrapper's tag for one dimension, hidden attribute and all."""
+        tag = re.search(rf'<div class="breakdown-clip" data-dimension="{dimension}"[^>]*>', body)
         assert tag, f"no {dimension} table on the page"
         return tag[0]
 
@@ -426,7 +426,8 @@ class TestPage:
 
     def test_the_selected_range_is_marked(self, client):
         body = client.get("/?days=7").text
-        assert 'class="toggle on"\n       href="/?days=7&by=model&metric=cost"' in body
+        assert ('class="toggle on"\n       aria-current="true"\n'
+                '       href="/?days=7&by=model&metric=cost"') in body
 
     def test_every_breakdown_dimension_has_a_table(self, client):
         body = client.get("/").text

@@ -1,45 +1,52 @@
 {% extends "base.html" %}
-{% block title %}{{ label }} — ccreport{% endblock %}
 {% block content %}
 <h1>{{ label }}</h1>
-<p class="dim mono">{{ machine_id }} · {{ "{:,}".format(records) }} records</p>
+<p class="dim mono">{{ machine_id }} · <span data-int="{{ records }}">{{ "{:,}".format(records) }}</span> records</p>
 {% if error %}<p class="off">{{ error }}</p>{% endif %}
 
 <h2>Tokens</h2>
 {% if tokens %}
 <table>
   <thead>
-    <tr><th>Hash</th><th>Minted</th><th>Last used</th><th>State</th><th></th></tr>
+    <tr><th scope="col">Hash</th><th scope="col">Minted</th><th scope="col">Last used</th>
+    <th scope="col">State</th><th scope="col"><span class="sr-only">Actions</span></th></tr>
   </thead>
   <tbody>
     {% for t in tokens %}
     <tr>
       <td class="mono dim">{{ t.token_hash[:12] }}…</td>
-      <td>{{ t.created_at | when }}</td>
-      <td>{{ t.last_used_at | when }}</td>
+      <td data-ts="{{ t.created_at or '' }}">{{ t.created_at | when }}</td>
+      <td data-ts="{{ t.last_used_at or '' }}">{{ t.last_used_at | when }}</td>
       <td>
         {% if t.revoked_at %}<span class="off">revoked {{ t.revoked_at | when }}</span>
         {% else %}<span class="ok">active</span>{% endif %}
       </td>
       <td class="actions">
+        <div class="actions-row">
         {% if not t.revoked_at %}
         <form method="post" action="/tokens/{{ t.token_hash }}/revoke">
           <button type="submit" class="danger">Revoke</button>
         </form>
         {% endif %}
-        <form method="post" action="/tokens/{{ t.token_hash }}/delete">
-          <button type="submit" class="danger">Delete</button>
+        <form method="post" action="/tokens/{{ t.token_hash }}/delete"
+              onsubmit="return confirm('Delete this token row? It cannot be undone.')">
+          <button type="submit" class="ghost">Delete</button>
         </form>
+        </div>
       </td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
+<p class="hint">Revoke stops the token at the machine's next push and keeps the row.
+Delete removes the row too, and cannot be undone.</p>
 {% else %}
 <p class="dim">This machine has no token.</p>
 {% endif %}
 
 <h2>Mint another</h2>
+<p class="hint">The token this mints does not replace the ones above; an active token
+stays active until revoked.</p>
 <form method="post" action="/settings/machines/mint" class="mint">
   <input type="hidden" name="machine_id" value="{{ machine_id }}">
   <input type="hidden" name="label" value="{{ label }}">
@@ -49,9 +56,9 @@
 
 <section class="danger-zone">
   <h2>Delete this machine</h2>
-  <p class="hint">This deletes the {{ "{:,}".format(records) }} records and the tokens for this
+  <p class="hint">This deletes the <span data-int="{{ records }}">{{ "{:,}".format(records) }}</span> records and the tokens for this
   machine. You cannot undo this.</p>
-  <form method="post" action="/settings/machines/{{ machine_id }}/delete" class="confirm">
+  <form method="post" action="/settings/machines/{{ machine_id | urlencode }}/delete" class="confirm">
     <label for="confirm-delete">Type <span class="mono">{{ machine_id }}</span> to confirm</label>
     <input id="confirm-delete" name="confirm" autocomplete="off" required>
     <button type="submit" class="danger">Delete machine</button>

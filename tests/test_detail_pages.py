@@ -114,7 +114,7 @@ class TestRouting:
 
     def test_an_entity_with_no_records_is_an_empty_page(self, client):
         body = client.get("/machine/never-pushed").text
-        assert "Nothing here in this range." in body
+        assert "Nothing in this range." in body
         assert "$0.00" in body
 
     def test_the_page_is_behind_the_network_gate(self, tmp_path):
@@ -156,7 +156,7 @@ class TestScoping:
 
 
 def _total(body: str) -> float:
-    figure = re.search(r'<div class="figure">\$([\d,.]+)</div>', body)
+    figure = re.search(r'<div class="figure"[^>]*>\$([\d,.]+)</div>', body)
     assert figure, "the page carries no headline figure"
     return float(figure[1].replace(",", ""))
 

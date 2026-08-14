@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException, Request
+from starlette.datastructures import MutableHeaders
 from starlette.responses import PlainTextResponse
 
 if TYPE_CHECKING:
@@ -67,6 +68,32 @@ def restrict_remote_addr_dep(networks: Iterable[str]) -> Callable[[Request], Awa
             raise HTTPException(status_code=403, detail="Access denied")
 
     return dependency
+
+
+class ImmutableCached:
+    """Adds Cache-Control to static responses whose URL carries an mtime stamp.
+
+    pages._asset stamps every asset URL with the file's mtime, so what one URL
+    names never changes content — immutable is exact, and saves the browser a
+    conditional GET per asset per navigation. An unstamped URL (the stat-failed
+    fallback) and any non-200 pass through unmarked, so nothing stale or missing
+    is ever pinned.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or b"mtime=" not in scope.get("query_string", b""):
+            await self.app(scope, receive, send)
+            return
+
+        async def stamped(message: dict) -> None:
+            if message["type"] == "http.response.start" and message["status"] == 200:
+                MutableHeaders(scope=message)["Cache-Control"] = "max-age=31536000, immutable"
+            await send(message)
+
+        await self.app(scope, receive, stamped)
 
 
 class NetworkGated:

@@ -22,6 +22,7 @@ async function copyNode(node) {
 
 for (const button of document.querySelectorAll("button.copy")) {
   const target = button.closest(".command-box").querySelector(".command");
+  let timer = 0;
   button.addEventListener("click", async () => {
     try {
       await copyNode(target);
@@ -29,6 +30,8 @@ for (const button of document.querySelectorAll("button.copy")) {
     } catch {
       button.textContent = "Select it and copy";
     }
-    setTimeout(() => { button.textContent = "Copy"; }, 2000);
+    // One pending reset at a time, or a click burst flips the label back early.
+    clearTimeout(timer);
+    timer = setTimeout(() => { button.textContent = "Copy"; }, 2000);
   });
 }

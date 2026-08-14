@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 
@@ -67,6 +68,30 @@ class TestStaticAssetURLs:
         """The 404 is StaticFiles' to report; raising here would take the page down."""
         monkeypatch.setattr(pages, "STATIC_DIR", tmp_path)
         assert pages._asset("gone.css") == "/static/gone.css"
+
+
+class TestScriptEmbeddedJSON:
+    """The chart JSON is inlined with | safe, so it must be inert to the tokenizer."""
+
+    def test_a_closing_tag_in_a_label_cannot_end_the_script_element(self):
+        hostile = {"account": "</script><script>alert(1)</script>"}
+        out = pages._json_for_script(hostile)
+        assert "</" not in out
+        assert json.loads(out) == hostile
+
+
+class TestStaticCaching:
+    def test_a_stamped_asset_is_pinned_immutable(self, client):
+        resp = client.get("/static/app.css?mtime=123")
+        assert resp.headers["cache-control"] == "max-age=31536000, immutable"
+
+    def test_an_unstamped_asset_is_not_pinned(self, client):
+        assert "cache-control" not in client.get("/static/app.css").headers
+
+    def test_a_missing_asset_is_not_pinned(self, client):
+        resp = client.get("/static/no-such-file.css?mtime=123")
+        assert resp.status_code == 404
+        assert "cache-control" not in resp.headers
 
 
 class TestMachinesPage:
@@ -194,6 +219,21 @@ class TestMintedPolicy:
         assert "not-a-network is not a network." in resp.text
         assert app.state.db.connect().execute(
             "SELECT COUNT(*) FROM machine_tokens").fetchone()[0] == 0
+
+    def test_a_blank_machine_id_refuses_to_mint(self, app, client):
+        resp = self._mint(client, machine_id="   ")
+        assert resp.status_code == 400
+        assert "A machine id is required." in resp.text
+        assert app.state.db.connect().execute(
+            "SELECT COUNT(*) FROM machine_tokens").fetchone()[0] == 0
+
+    def test_a_refused_mint_echoes_what_was_typed(self, client):
+        """A policy that took a minute to type is not retyped over one bad CIDR."""
+        resp = self._mint(client, networks="10.0.0.0/8, nope", restricted="1", allow="ccreport")
+        assert resp.status_code == 400
+        assert 'value="10.0.0.0/8, nope"' in resp.text
+        assert 'value="ccreport"' in resp.text
+        assert "checked" in resp.text
 
     def test_the_minted_command_is_one_the_client_parses(self, client):
         page = self._mint(client, networks="10.0.0.0/8", restricted="1", allow="ccreport").text
