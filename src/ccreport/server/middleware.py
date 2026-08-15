@@ -19,7 +19,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.responses import PlainTextResponse
 
 if TYPE_CHECKING:
-    from starlette.types import ASGIApp, Receive, Scope, Send
+    from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 _TEST_HOSTS = frozenset({"testclient", "localhost"})
 """Hostnames Starlette's TestClient and a local browser present instead of an
@@ -88,7 +88,7 @@ class ImmutableCached:
             await self.app(scope, receive, send)
             return
 
-        async def stamped(message: dict) -> None:
+        async def stamped(message: Message) -> None:
             if message["type"] == "http.response.start" and message["status"] == 200:
                 MutableHeaders(scope=message)["Cache-Control"] = "max-age=31536000, immutable"
             await send(message)
