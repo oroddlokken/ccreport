@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Machines</h1>
+{% if note %}<p class="notice">{{ note }}</p>{% endif %}
+
+{% if machines %}
+<table>
+  <thead>
+    <tr>
+      <th scope="col">Machine</th><th scope="col">ID</th><th scope="col">Last seen</th>
+      <th scope="col">Token last used</th><th scope="col" class="num">Records</th>
+      <th scope="col">Token</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for m in machines %}
+    <tr>
+      <td><a href="/settings/machines/{{ m.machine_id | urlencode }}">{{ m.label }}</a></td>
+      <td class="mono dim">{{ m.machine_id }}</td>
+      <td data-ts="{{ m.last_seen or '' }}">{{ m.last_seen | when }}</td>
+      <td data-ts="{{ m.last_used_at or '' }}">{{ m.last_used_at | when }}</td>
+      <td class="num" data-int="{{ m.records }}">{{ "{:,}".format(m.records) }}</td>
+      <td>
+        {% if m.active_tokens %}<span class="ok">active</span>
+        {% else %}<span class="off">revoked</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="dim">No machine has a token yet.</p>
+{% endif %}
+
+<h2>Mint a token</h2>
+{% if error %}<p class="off">{{ error }}</p>{% endif %}
+<form method="post" action="/settings/machines/mint" class="mint">
+  <div class="fields">
+    <label>Machine ID <input name="machine_id" required autocomplete="off"
+                             value="{{ form.machine_id if form else '' }}"></label>
+    <label>Label <input name="label" autocomplete="off"
+                        value="{{ form.label if form else '' }}"></label>
+  </div>
+  {% include "_policy_fields.html" %}
+  <button type="submit">Mint</button>
+</form>
+{% endblock %}

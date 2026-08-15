@@ -6,7 +6,13 @@ requires-python = ">=3.13"
 # The status line imports none of these — it renders on stdlib alone, which is
 # why it can afford to run on every frame. They are ccreport's.
 dependencies = [
+    "fastapi>=0.141.1",
+    # [reload] is watchfiles, and granian refuses --reload without it: `just
+    # serve` and the docker-compose container both start with that flag.
+    "granian[reload]>=2.8.1",
+    "jinja2>=3.1.6",
     "orjson",
+    "python-multipart>=0.0.32",
     "rich",
 ]
 
@@ -36,6 +42,7 @@ dev = [
     "pytest-timeout>=2.4.0",
     "pytest-testmon>=2.2.0",
     "watchdog>=6.0.0",
+    "httpx>=0.28.1",
 ]
 
 [tool.ruff]
@@ -167,6 +174,14 @@ ignore = [
              # already loaded, so the block buys nothing and hides the import
   "TRY300",  # return in try — keeps the happy path beside the call it needs
   "TRY301",  # raise within try — the schema guards raise to their own handler
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI declares a route's dependencies and form fields as argument defaults —
+# `Depends(...)`, `Form(...)`, `Header(...)`. That is the framework's whole API,
+# and B008 reads every one of them as a mutable default.
+extend-immutable-calls = [
+  "fastapi.Depends", "fastapi.Form", "fastapi.Header", "fastapi.Path", "fastapi.Query",
 ]
 
 [tool.ruff.lint.per-file-ignores]

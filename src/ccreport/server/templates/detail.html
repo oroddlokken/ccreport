@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block head %}
+<link rel="stylesheet" href="{{ asset('vendor/uPlot.min.css') }}">
+{% endblock %}
+{% block content %}
+
+<div class="range">
+  <span class="dim">{{ scope.dimension }} · <span data-day="{{ view.start }}">{{ view.start }}</span> — <span data-day="{{ view.end }}">{{ view.end }}</span></span>
+  {% if scope.dimension != "day" %}
+  <span class="toggles">
+    {% for days in ranges %}
+    <a class="toggle {% if days == view.days %}on{% endif %}"
+       {% if days == view.days %}aria-current="true"{% endif %}
+       href="/{{ scope.dimension }}/{{ scope.key | urlencode }}?days={{ days }}">{{ range_labels[days] }}</a>
+    {% endfor %}
+  </span>
+  {% endif %}
+</div>
+
+<section class="headline detail-head">
+  <h1>{{ scope.key }}</h1>
+  <div class="figure" data-usd="{{ view.total_cost }}">{{ "${:,.2f}".format(view.total_cost) }}</div>
+  {% if view.nok_enabled %}
+  <div class="dim"><span data-nok="{{ view.total_cost_nok }}">{{ "kr {:,.0f}".format(view.total_cost_nok) }}</span> incl. MVA</div>
+  {% endif %}
+</section>
+
+<section class="tiles">
+  {% for tile in view.tiles %}
+  <div class="tile">
+    <div class="tile-label dim">{{ tile.label }}</div>
+    <div class="tile-value">{{ tile.value }}</div>
+    <div class="tile-sub dim">{{ tile.subline }}</div>
+  </div>
+  {% endfor %}
+</section>
+
+<section class="charts">
+  {% for chart in view.charts %}
+  <div class="chart-box" data-chart="{{ chart.key }}">
+    <div class="chart-head"><h2>{{ chart.title }}</h2></div>
+    <div class="plot" role="img" aria-label="{{ chart.title }} chart; the tables below carry the same numbers"></div>
+  </div>
+  {% endfor %}
+</section>
+
+{% for dimension in dimensions %}
+<section>
+  <div class="chart-head"><h2>By {{ dimension }}</h2></div>
+  <div class="table-clip">
+  <table class="breakdown">
+    <thead>
+      <tr>
+        <th scope="col">{{ dimension }}</th><th scope="col" class="num">Cost</th>
+        <th scope="col" class="num">Share</th><th scope="col" class="num">Tokens</th>
+        <th scope="col" class="num">Calls</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in view.breakdowns[dimension] %}
+      <tr>
+        <td><a href="/{{ dimension }}/{{ row.key | urlencode }}?days={{ view.days }}">{{ row.key }}</a></td>
+        <td class="num" data-usd="{{ row.cost }}">{{ "${:,.2f}".format(row.cost) }}</td>
+        <td class="num">{{ (row.share * 100) | round(1) }}%</td>
+        <td class="num" data-int="{{ row.tokens }}">{{ "{:,}".format(row.tokens) }}</td>
+        <td class="num" data-int="{{ row.calls }}">{{ "{:,}".format(row.calls) }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="dim">Nothing in this range.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endfor %}
+
+<script src="{{ asset('vendor/uPlot.iife.min.js') }}"></script>
+<script src="{{ asset('palette.js') }}"></script>
+<script id="chart-data" type="application/json">{{ charts | safe }}</script>
+<script src="{{ asset('detail.js') }}"></script>
+{% endblock %}

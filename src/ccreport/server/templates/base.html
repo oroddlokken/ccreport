@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}ccreport{% endblock %}</title>
+  <link rel="stylesheet" href="{{ asset('app.css') }}">
+  <script src="{{ asset('format.js') }}"></script>
+  <!-- After format.js, whose listener therefore runs first: a column with no
+       raw value sorts the text a reader sees. -->
+  <script src="{{ asset('sort.js') }}"></script>
+  {% block head %}{% endblock %}
+</head>
+<body>
+  {% set p = request.url.path %}
+  {% set section = "machines" if p.startswith("/settings/machines") or p.startswith("/machine/")
+     else "accounts" if p.startswith("/settings/accounts") or p.startswith("/account/")
+     else "dashboard" %}
+  <header>
+    <div class="header-inner">
+      <a class="brand" href="/">ccreport</a>
+      <nav>
+        <a href="/" {% if section == "dashboard" %}aria-current="page"{% endif %}>Dashboard</a>
+        <a href="/settings/machines" {% if section == "machines" %}aria-current="page"{% endif %}>Machines</a>
+        <a href="/settings/accounts" {% if section == "accounts" %}aria-current="page"{% endif %}>Accounts</a>
+      </nav>
+    </div>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

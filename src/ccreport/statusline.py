@@ -986,6 +986,52 @@ def _render_update(now: float) -> str:
             f"{SUBDUED} 'ccreport update --pull' {RST}\033[0;33mto update{RST}")
 
 
+_PUSH_CONFIG = Path.home() / ".config" / "ccreport" / "push.toml"
+"""Where `ccreport server connect` writes the machine's servers and tokens.
+
+Spelled here rather than imported from push.py, which imports sqlite3 and the
+account timeline: this file's whole job on the render path is one stat.
+"""
+
+
+def _spawn_push(now: float) -> None:
+    """Start the detached push, if the machine has a server and is due one.
+
+    Two gates before anything is spawned. No push.toml means the machine has
+    not opted in and nothing runs at all — one stat, on the slow path only. And
+    one meta key says when the next attempt is allowed, which the child writes
+    on every outcome, failure included: an unreachable server then costs one
+    process per interval rather than one per render.
+
+    That key is the whole of what this knows. How far the interval widens after
+    a failure, and which servers are due, are push.py's business — and push.py
+    is deliberately not imported here, since it brings sqlite3, the account
+    timeline and the override rules with it.
+    """
+    if not _on("PUSH") or not _PUSH_CONFIG.exists():
+        return
+    try:
+        from ccreport import cache_db
+
+        if now < cache_db.read_push_next_attempt():
+            return
+    except Exception:  # noqa: BLE001 — a busy database costs the push, not the render
+        return
+
+    import subprocess
+
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "ccreport.push"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=_refresh_env(),
+        )
+    except OSError:
+        pass
+
+
 # --- Rate limit history capture ---
 
 
@@ -2136,7 +2182,7 @@ class _Fetched(NamedTuple):
 
 # Cache-file layout guard: bump when _Fetched gains, loses or retypes a field,
 # so a render never rebuilds a NamedTuple from a stale shape.
-_FAST_CACHE_SCHEMA = 6
+_FAST_CACHE_SCHEMA = 8
 
 
 def _session_state_path(session_id: str, suffix: str = "") -> Path:
@@ -2351,6 +2397,9 @@ def _fetch_all(
         _snapshot_rate_limits(data, usage_data, now_epoch, test_mode=test_mode)
         sessions_str = _render_sessions(inp.cwd, now_epoch)
         update_str = _render_update(now_epoch)
+        # Renders nothing: the merged view is read with `ccreport --server`,
+        # not from here. It rides the slow path for the interval gate alone.
+        _spawn_push(now_epoch)
 
         # Cache stats and the session cost. Neither depends on a git result, so
         # both belong on this side of the join: the render costs the longer of

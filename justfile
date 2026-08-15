@@ -39,6 +39,27 @@ banners:
 bench:
     uv run python tools/benchmark_statusline_energy.py
 
+# serve the merged-records server with reload, one worker
+serve:
+    uv run python -m ccreport.server.fastapi_server --reload
+
+# Rebuilds first: the image carries the venv, and a uv.lock change is invisible
+# to `up` on its own. The source is bind-mounted, so an edit needs no rebuild.
+# start the server in docker on http://127.0.0.1:8787
+docker-up:
+    docker compose -f ./docker-compose.yml -p ccreport up -d --build --wait
+
+# stop the server and remove its container; the database volume survives
+docker-down:
+    docker compose -f ./docker-compose.yml -p ccreport down
+
+# Every machine, token and pushed record in the local server database goes with
+# it. Each machine then needs a token minted again, and `ccreport push --full`
+# to resend what its watermark now considers already sent.
+# stop the server and delete its database volume
+docker-remove:
+    docker compose -f ./docker-compose.yml -p ccreport down -v --remove-orphans
+
 # run tests
 test:
     uv run pytest --timeout 30 -n 8 tests

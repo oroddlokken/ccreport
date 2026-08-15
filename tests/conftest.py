@@ -16,6 +16,7 @@ CONFIGURED_BY_ENV = (
     "CLAUDE_CODE_PACE_DAYS",
     "CLAUDE_STATUSLINE_TIMESTAMP_EPOCH",
     "CLAUDE_STATUSLINE_TOTAL_TOKEN",
+    "CLAUDE_STATUSLINE_PUSH",
     "CLAUDE_STATUSLINE_USAGE_JSON",
 )
 """Every variable the code reads for configuration, as `just lint-all` sees them.

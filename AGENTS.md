@@ -1,5 +1,43 @@
 # Agent Instructions
 
+## Issue tracking
+
+**dcat** is the issue tracker. Run `dcat prime --opinionated` at session start
+and again after a compaction or a `/clear` — it prints the workflow rules and
+the command reference, and is safe to run repeatedly. Then `dcat list` for the
+backlog. Reserve `dcat list --agent-only` for autonomous runs with no human
+present: it hides `--manual` issues, and `--manual` means human-in-the-loop,
+not agent-skips.
+
+Work in this order: (1) high-priority bugs, (2) high-priority features,
+(3) standard bugs, (4) standard features. Ask the user which comes first when
+two issues sit in the same tier.
+
+Make separate parallel Bash tool calls for multiple `dcat` commands instead of
+chaining them with `&&` and `echo` separators.
+
+Mark an issue `in_progress` when you begin it and `in_review` when its work is
+done, one issue at a time, so the status reflects what you are working on right
+now. Working on several related issues at once is fine as long as each is
+marked as you reach it.
+
+When the user reports a bug or asks for a change, ask whether to create an
+issue before you write code. Set labels with `--labels` (`cli`, `api`, `docs`,
+`testing`, `refactor`, `ux`, `performance`). `--labels` takes one comma- or
+space-separated value and a second `--labels` flag overwrites the first,
+dropping labels silently — pass them all in one flag and confirm with
+`dcat show`.
+
+When research produces findings for an existing issue, ask as two separate
+questions in order: "Should I update issue [id] with these findings?" and then
+"Should I start working on the implementation?" — the user may want the issue
+updated without starting work.
+
+Wait for explicit user approval before closing an issue. When the work is done:
+run `dcat update <id> --status in_review`, ask the user to test, ask "Can I
+close issue [id] '[title]'?", and run `dcat close <id>` after they confirm.
+
+
 ## What is here
 
 Two tools over one SQLite cache at `~/.cache/ccreport/cache.db`:
@@ -11,10 +49,23 @@ Two tools over one SQLite cache at `~/.cache/ccreport/cache.db`:
 - `src/ccreport/ccu.py` — the quota dashboard. Runs `usage_api` as a subprocess
   and draws bars, reset countdowns and a weekly pace line from what it printed.
 
-`pricing.py`, `cache_db.py`, `exchange.py`, `project_identity.py` and
-`usage_api.py` are shared by both. `update_check.py` is spawned by the status
-line alone. `bin/` holds the wrappers that Claude Code's settings.json and a
-PATH entry point at.
+`src/ccreport/server/` is the merged database the machines push to: a FastAPI
+app over its own SQLite file, run by Granian (`just serve`), configured by
+`CCREPORT_SERVER_*` environment variables alone. `ingest.py` is the write side,
+`pages.py` the server-rendered UI that mints the tokens it checks, and
+`report_api.py` the merged reports `ccreport --server URL` renders.
+`dashboard.py` is the merged spend page it serves at `/`.
+`src/ccreport/push.py` is the other end: it sends this machine's records, run
+by `ccreport server push` (or its older spelling `ccreport push`) or by a
+detached spawn from the status line.
+
+`forecast.py` projects spend to a ceiling. It is pure and stdlib-light, because
+`ccu` and the status line read it.
+
+`pricing.py`, `cache_db.py`, `exchange.py`, `aggregate.py`,
+`project_identity.py` and `usage_api.py` are shared. `update_check.py` is
+spawned by the status line alone. `bin/` holds the wrappers that Claude Code's
+settings.json and a PATH entry point at.
 
 The status line renders on every frame, which is why it imports nothing outside
 the stdlib and defers `cache_db` (and with it sqlite3) into the functions that
@@ -60,6 +111,148 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   master is the release and the unit is a commit. `ccreport update` asks the
   same question inline, with no spawn and no interval, and writes its answer
   through the same keys
+- Which rows a report has is `aggregate.py`; what they look like is
+  `ccreport.py`. The row builders there are the one place the rollup path and
+  the full record path meet, and the server folds records through the same
+  functions, so nothing in `aggregate.py` may import rich. `tests/golden/`
+  holds the pre-split rendering of every report — a diff there means the split
+  changed output
+- A schema change reaches a database that already exists only through
+  `migrations.py`: a numbered `Step` appended to `MIGRATION_CHAIN` in
+  `cache_db.py` or `server/db.py`, one version above the last. `SCHEMA_VERSION`
+  is the chain head and is never hand-edited. The `CREATE ... IF NOT EXISTS`
+  scripts still carry a new table or index, and `Step(N, "name")` with no
+  callable is what moves the version that re-runs them — but a column added to a
+  table that is already there is skipped by the very `IF NOT EXISTS` that makes
+  the script safe to re-run, so it needs a step that does the `ALTER`. Steps run
+  inside a transaction with the stamp, so one may not `BEGIN`, `COMMIT` or turn
+  `foreign_keys` off, and needs no meta flag: its version is the flag. An entry
+  that has shipped is never edited — `migrations.run` records each step's source
+  hash and refuses to start where the recorded one no longer matches. The five
+  meta-flagged repairs in `cache_db._run_migrations` and `_ADDED_COLUMNS` are the
+  frozen pre-baseline bootstrap at 11, and nothing renumbers them
+- The server prices every record at ingest with its own `pricing.py` and stores
+  the client's cost, if the log carried one, in a separate column. A model it
+  has no price for fails that whole file with a reason in the response — never
+  a stored zero, which is a week of money that looks like an idle week. Only
+  the `<...>` pseudo-models cost a known zero
+- Ingest sits outside the web UI's network allowlist and the UI sits inside it,
+  wired in `factory.py`: a machine pushes from wherever it is and its token is
+  what admits it, while the pages are reachable from home and nowhere else.
+  `/static` is behind the gate with the pages it styles, through
+  `middleware.NetworkGated` rather than the dependency: `app.mount` takes no
+  `dependencies`, so the check has to sit one layer down in the ASGI app
+- The dashboard is `/`; everything that administers the server is under
+  `/settings` — machines, minting and account names, forms and redirects
+  included. `/tokens/{hash}/revoke` and `/delete` are the exception: they
+  redirect through Referer and are posted to from whichever page listed the
+  token
+- `/{dimension}/{key}` is one entity's page, for each of `dashboard.SCOPES`. It
+  is registered last in `pages.py` and matches whatever the named routes did
+  not, which is why `factory.py` mounts `/static` before the router — the
+  catch-all would otherwise answer 404 for every asset. The scope matches the
+  string the breakdown table shows, not a stored column, so an alias, a machine
+  label and a redacted project bucket each reach their own rows, and it is
+  never cached: `cached_build` holds the whole-server view per range, which is
+  the page a browser opens over and over
+- A day page is its own range and charts by hour, so it is the one build that
+  calls `reports.load` — `load_grouped` folds the hour away. It widens the ts
+  window by a day at each end and matches `day_key()` afterwards, because `day`
+  is the machine's calendar day and a machine on another clock keeps records
+  whose instant falls outside this server's day
+- A detail page draws four charts rather than one with a toggle, and each has
+  one scale: cost, cost by model, tokens by kind and calls do not share an
+  axis. Series colours come from `static/palette.js` in fixed order, so a
+  filter that drops one series never repaints the others, and the six hues are
+  validated as a set against the dark surface — re-run the dataviz validator
+  before changing a value. A seventh series folds into `Other` at
+  `dashboard.TRACE_LIMIT`
+- A stylesheet or script is linked through the `asset()` template global, never
+  as a bare `/static/…` path. It stamps the URL with the file's mtime, because
+  StaticFiles sends no Cache-Control and a browser is otherwise free to hold
+  yesterday's app.css against a page you just changed
+- The client resolves before it sends: the account from `account_events`
+  (`accounts.py`, shared with the CLI so a detached push needs no rich) and the
+  project name through this machine's own override rules. The server holds no
+  merge rules and treats the pushed name as final. Each record also carries the
+  machine's UTC offset at that instant, which is what makes `server_records.day`
+  the machine's calendar day rather than the server's
+- `~/.config/ccreport/push.toml` is the machine's whole push policy — server,
+  token, `restricted`, `allow`, `salt`, `networks` — written by
+  `ccreport server connect` at mode 0600, one `[server."URL"]` table each.
+  There are no environment variables for any of it. The mint page types the
+  networks and the opt-in list into the connect command it prints and stores
+  neither: the server never holds a machine's policy, only the line that sets
+  it. A `.restricted` marker
+  sits beside it and wins: a push.toml that lost its `restricted = true` to an
+  edit or an old backup redacts everything rather than reading as open
+- A restricted machine sends every record's counts and strips the identity of
+  any project outside `allow`: project, session, cwd and repo all become null.
+  A pseudonym per project would have drawn a row each, and the count of private
+  projects with a price on each is the shape of the work. `reports.project_display`
+  folds every null project into one bucket per account instead —
+  `<alias>-aggregated`, or `<account label>/aggregated` where nothing is named,
+  or `<uuid>/aggregated` where the record carried no label. The alias replaces
+  the whole account segment, slash included. `push.pseudonym` and
+  `pseudo_session` are kept with no caller, as is `salt`, so re-introducing a
+  grouping key needs no config migration
+- Changing `restricted`, `allow`, the local merge rules or
+  `push.REDACTION_SHAPE` moves `policy_hash`, which clears the watermark *and*
+  sets `replace` on every file — the server's skip is keyed on (mtime_ns, size),
+  and the logs that carried the old names are closed and will never change
+  again. REDACTION_SHAPE is what a change to `redact` has to move: the salt no
+  longer varies with the redaction, so nothing else in that material would
+- What the server calls an account is `reports.account_display`: the
+  `account_aliases` row, then `server_records.account_label`, then the uuid. The
+  /settings/accounts page writes it and `server_records` is never rewritten, so
+  the login email stays in the history and leaves the screen. `db.content_stamp` reads
+  that table for the same reason it reads `ingest_files` — a rename has no push
+  behind it and the dashboard's cache would otherwise keep drawing the email.
+  An alias also filters: `db.accounts_with_alias` widens the account clause so a
+  name typed off the dashboard selects what the email does
+- Revoking a token stamps `revoked_at`; deleting it removes the row. Both stop
+  the next push, and which one to reach for is whether the machine is still out
+  there. `POST /settings/machines/{id}/delete` takes the machine, its tokens,
+  its `ingest_files` and every record it pushed, through the ON DELETE CASCADE
+  those three declare — behind the machine id typed into a form field, because
+  this server is the only copy of those records once the machine's logs have
+  rotated
+- The network gate is `on_allowed_network`: a connected UDP socket per CIDR,
+  which picks a route without sending a packet, so a VPN handing out an address
+  in range counts as being on the network. Every CIDR is parsed before any is
+  probed, since a machine that matched the first one would otherwise never
+  reach the typo in the second. A blocked push writes no watermark and still
+  stamps the attempt
+- The push watermark is `push_state` in cache.db, written from the server's
+  response and never from having sent it, so a rejected file is retried. The
+  status line spawns `ccreport.push` but never imports it: its gate is one meta
+  key, `push_next_at`, that the child writes on every outcome. How far the
+  interval widens after a failure and which servers are due live in `push.py`,
+  and a 401 is terminal — a revoked token stops the machine rather than
+  knocking every interval
+- The attempt stamp moves on every outcome, so it cannot date a push. What
+  `ccreport server status` prints as `last push` is the separate `success`
+  stamp `write_push_attempt(succeeded=True)` writes on the success path alone,
+  and a failed attempt renders as itself with the `reason` stored beside it —
+  a count of failures cannot tell connection-refused from a 500
+- The dashboard folds grouped rows, never records: `reports.load_grouped` asks
+  SQL for one row per (machine, account, project, model, day) and hands back a
+  `UsageRecord` per group carrying its summed tokens, its summed cost and its
+  call count in `count` — the rollup trick the CLI plays, through the same
+  `aggregate.py`. Half a million calls reach Python as a few thousand groups.
+  The dedup repeats every filter but the date bounds: which copy of a synced
+  call survives depends on the set being deduped, and no ts bound can split a
+  pair. `dashboard.cached_build` then holds one view per range toggle against
+  `db.content_stamp` and the render's local date, so a page is rebuilt when a
+  push moved the records or the day rolled over, and not per request
+- The dashboard's chart library is vendored under
+  `server/static/vendor/`, not fetched from a CDN, so the page draws with no
+  internet. Nothing updates it: a new version is a deliberate copy plus an edit
+  to that directory's README, and `tests/test_dashboard.py` fails if any
+  template or asset grows a remote origin
+- `exchange.py` keeps the Norges Bank walk-back and the negative cache; where
+  the rows land is swappable through `use_rate_store`, which is how the server
+  converts against its own `exchange_rates` table instead of a client cache
 - All pricing data lives in `pricing.py` — update only this file when prices
   change. Source: the LiteLLM pricing database; update `LAST_CHECKED` after
   verifying
@@ -148,40 +341,3 @@ the rest discard uncommitted work that no reflog can return.
 
 Project creation runs `git init` without an initial commit, so `git log` and
 `git diff HEAD` fail until you make one.
-
-## Issue tracking
-
-**dcat** is the issue tracker. Run `dcat prime --opinionated` at session start
-and again after a compaction or a `/clear` — it prints the workflow rules and
-the command reference, and is safe to run repeatedly. Then `dcat list` for the
-backlog. Reserve `dcat list --agent-only` for autonomous runs with no human
-present: it hides `--manual` issues, and `--manual` means human-in-the-loop,
-not agent-skips.
-
-Work in this order: (1) high-priority bugs, (2) high-priority features,
-(3) standard bugs, (4) standard features. Ask the user which comes first when
-two issues sit in the same tier.
-
-Make separate parallel Bash tool calls for multiple `dcat` commands instead of
-chaining them with `&&` and `echo` separators.
-
-Mark an issue `in_progress` when you begin it and `in_review` when its work is
-done, one issue at a time, so the status reflects what you are working on right
-now. Working on several related issues at once is fine as long as each is
-marked as you reach it.
-
-When the user reports a bug or asks for a change, ask whether to create an
-issue before you write code. Set labels with `--labels` (`cli`, `api`, `docs`,
-`testing`, `refactor`, `ux`, `performance`). `--labels` takes one comma- or
-space-separated value and a second `--labels` flag overwrites the first,
-dropping labels silently — pass them all in one flag and confirm with
-`dcat show`.
-
-When research produces findings for an existing issue, ask as two separate
-questions in order: "Should I update issue [id] with these findings?" and then
-"Should I start working on the implementation?" — the user may want the issue
-updated without starting work.
-
-Wait for explicit user approval before closing an issue. When the work is done:
-run `dcat update <id> --status in_review`, ask the user to test, ask "Can I
-close issue [id] '[title]'?", and run `dcat close <id>` after they confirm.
