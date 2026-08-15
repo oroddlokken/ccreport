@@ -1145,6 +1145,53 @@ def _snapshot_rate_limits(
         pass
 
 
+# Layout guard on the quota file, matching quota_guard.QUOTA_FILE_SCHEMA — the
+# reader drops a shape it does not know. tests/test_quota_guard.py asserts the
+# two agree.
+_QUOTA_FILE_SCHEMA = 1
+
+
+def _save_quota_reading(session_id: str, data: dict, now: float, *, test_mode: bool) -> None:
+    """Stamp the stdin S/W reading for the quota guard hooks to read.
+
+    rate_limit_snapshots stores a row only when a reading moves, so its newest
+    ts dates the last change; the guard needs the last observation, and this
+    file is it.
+
+    Written only while CCQUOTA_STOP is set, which the hooks read from the same
+    claude process environment this render inherits — an unarmed session pays
+    one getenv.
+    """
+    if test_mode or not session_id or not os.environ.get("CCQUOTA_STOP"):
+        return
+    rl = data.get("rate_limits") or {}
+    windows = {}
+    for key, window in (("five_hour", "session"), ("seven_day", "week")):
+        w = rl.get(key) or {}
+        pct, resets = w.get("used_percentage"), w.get("resets_at")
+        if pct is None or not resets:
+            continue
+        try:
+            windows[window] = {"percent": float(pct), "resets_at": float(resets)}
+        except (TypeError, ValueError):
+            continue
+    # Written even with no windows under it: the stamp is what proves a render
+    # happened, and the guard falls back to the usage row from there.
+    path = _session_state_path(session_id, ".quota")
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(
+            json.dumps({"schema": _QUOTA_FILE_SCHEMA, "ts": now, "windows": windows}),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 # --- Section renderers ---
 
 
@@ -2395,6 +2442,7 @@ def _fetch_all(
         # usage_data — the native S/W merge happens later, in main, and would
         # not change what gets sampled here.
         _snapshot_rate_limits(data, usage_data, now_epoch, test_mode=test_mode)
+        _save_quota_reading(inp.session_id, data, now_epoch, test_mode=test_mode)
         sessions_str = _render_sessions(inp.cwd, now_epoch)
         update_str = _render_update(now_epoch)
         # Renders nothing: the merged view is read with `ccreport --server`,

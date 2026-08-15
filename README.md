@@ -97,6 +97,71 @@ session's context — and both exit 0 on anything they cannot parse. Exit 0 does
 double duty in the `ConfigChange` one: exit 2 there blocks the settings change
 itself.
 
+### The quota guard
+
+`bin/quota-guard.sh` stops a session before it crosses into extra usage. Wire it
+to both events; the verdict is the same for either, and only which turn it halts
+differs:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /path/to/ccreport/bin/quota-guard.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /path/to/ccreport/bin/quota-guard.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Wiring it arms nothing. `CCQUOTA_STOP` does, and the hook exits before any
+interpreter starts while it is unset, so a session without it pays one bash
+spawn per prompt. The environment is read at launch, which makes a launcher the
+way to use it:
+
+```bash
+alias claude-capped='CCQUOTA_WARN=85 CCQUOTA_STOP=95 claude'
+```
+
+Over the warn line, one `systemMessage` lands per window instance rather than
+per prompt. Over the stop line the hook answers `continue: false`, which halts
+the turn and leaves the session open for input — `UserPromptSubmit` before the
+prompt reaches the model, `PreToolUse` at the next tool call of a turn already
+running. No hook can exit the CLI, and the reason reaches you rather than
+Claude.
+
+Hook input carries no quota data, so the readings come from what a render
+stored: the stdin S/W percentages in a per-session `TMPDIR` file, and Sonnet and
+the scoped model limit from the usage row. Each source is trusted for as long as
+its own cadence: 15 minutes for the stdin reading a slow render writes, an hour
+for the API-only quotas, whose fetch the render skips while nothing on the line
+needs them. Where two sources disagree the fuller reading wins.
+
+An unknown reading blocks, and the message names `CCQUOTA_STOP` as the way out —
+unset it and relaunch. A quota the API nulls because the plan does not have it
+is a different answer: not applicable, and not watched. A machine with no usage
+row at all reads as unknown and blocks every prompt, so arm the guard on
+machines whose status line is running.
+
+The quota is per account; this stops the sessions on this machine that carry the
+variable, and nothing else.
+
 ## ccreport
 
 ![ccreport's daily, monthly and project tables in a terminal](assets/ccreport.png)

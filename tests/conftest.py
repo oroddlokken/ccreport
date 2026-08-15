@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 CONFIGURED_BY_ENV = (
+    "CCQUOTA_STOP",
+    "CCQUOTA_WARN",
     "CF_BADGE",
     "CLAUDE_CACHE_DB_TIMEOUT",
     "CLAUDE_CACHE_SANITY_ABORT",

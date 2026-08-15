@@ -48,6 +48,9 @@ Two tools over one SQLite cache at `~/.cache/ccreport/cache.db`:
   render. Reads the same cache and spawns `usage_api.py` detached to refresh it.
 - `src/ccreport/ccu.py` — the quota dashboard. Runs `usage_api` as a subprocess
   and draws bars, reset countdowns and a weekly pace line from what it printed.
+- `src/ccreport/quota_guard.py` — the verdict the `UserPromptSubmit` and
+  `PreToolUse` hooks in `bin/quota-guard.sh` share. Stops a session over
+  `CCQUOTA_STOP` and warns over `CCQUOTA_WARN`.
 
 `src/ccreport/server/` is the merged database the machines push to: a FastAPI
 app over its own SQLite file, run by Granian (`just serve`), configured by
@@ -102,6 +105,16 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   no later render need re-derive and so has no TTL: the DSP verdict, fixed once
   the session's `claude` was launched, and the `(mtime_ns, size)` of
   `~/.claude.json` that the last account capture parsed
+- The quota guard reads and never fetches. S and W come from the `.quota` file a
+  slow render writes while `CCQUOTA_STOP` is set — `rate_limit_snapshots` stores
+  a row only when a reading moves, so its newest ts dates the last change and
+  cannot date the last observation — and Sonnet and scoped come from the usage
+  row. Each source carries its own budget, `NATIVE_MAX_AGE_S` against a render's
+  cadence and `API_MAX_AGE_S` against `statusline.USAGE_HEARTBEAT_S`; past it the
+  window is unknown and blocks, while a null column on a row inside the budget is
+  the plan not having that quota and is not watched. `read_windows` opens its own
+  read-only connection rather than `cache_db.get_connection`, whose bootstrap and
+  daily snapshot do not belong before every tool call
 - The update line comes from `update_check.py`, spawned detached on slow renders
   when the stored stamp is older than `UPDATE_CHECK_INTERVAL_S` (12 h). The child
   writes that stamp on every outcome, failures included, so an unreachable API
