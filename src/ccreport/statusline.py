@@ -77,6 +77,9 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
                                               twice a day against GitHub's API
 
 Other environment variables:
+  CCQUOTA_STOP                              — the quota guard's stop percentage; while it is
+                                              set, the rate-limit group carries a Q segment
+  CCQUOTA_WARN                              — its warn percentage, rendered before the stop one
   CLAUDE_CODE_PACE_DAYS                     — pace window in days (1-7, default 7)
   CF_BADGE                                  — badge text after the model name, rendered cyan
                                               (set to CF/CO by the cf/co wrappers; legacy
@@ -1690,16 +1693,74 @@ def _scoped_model_in_use(usage: dict, scoped_model: str) -> bool:
     return isinstance(families, (list, tuple, set, frozenset)) and family in families
 
 
+# The four windows quota_guard.WINDOW_LABELS names, as this render holds them.
+_QUOTA_PERCENT_KEYS = ("session_percent", "week_percent", "sonnet_percent", "scoped_percent")
+
+
+def _quota_threshold(raw: str | None) -> float | None:
+    """A percentage from the environment, or None where it is unset or unusable.
+
+    quota_guard.threshold parses the same two variables; importing it here would
+    cost every render the tokenizing of that module, so tests/test_statusline.py
+    asserts the two agree.
+    """
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return float(raw.strip().rstrip("%"))
+    except ValueError:
+        return None
+
+
+def _quota_peak(usage: dict) -> float | None:
+    """The fullest window this render has a reading for, or None where it has none.
+
+    The guard blocks on the highest of the four, so the colour follows the same
+    one.
+    """
+    percents = []
+    for key in _QUOTA_PERCENT_KEYS:
+        try:
+            percents.append(float(_pct_str(usage, key)))
+        except ValueError:
+            continue
+    return max(percents) if percents else None
+
+
+def _render_quota_guard(usage: dict) -> str:
+    """The armed guard's thresholds, empty while CCQUOTA_STOP is unset.
+
+    A stop line that does not parse blocks every prompt in the guard, which is
+    what the red Q:! says.
+    """
+    raw_stop = os.environ.get("CCQUOTA_STOP", "")
+    if not raw_stop.strip():
+        return ""
+    stop = _quota_threshold(raw_stop)
+    if stop is None:
+        return _c("0;31", "Q:!")
+    warn = _quota_threshold(os.environ.get("CCQUOTA_WARN", ""))
+    label = f"Q:{warn:g}/{stop:g}" if warn is not None else f"Q:{stop:g}"
+    peak = _quota_peak(usage)
+    if peak is not None:
+        if peak >= stop:
+            return _c("0;31", label)
+        if warn is not None and peak >= warn:
+            return _c("0;33", label)
+    return f"{SUBDUED}{label}{RST}"
+
+
 def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool, bool]:
-    """Build rate-limit inner sections (S/W/So + TTL).
+    """Build rate-limit inner sections (S/W/So + TTL + Q).
 
     Returns (rl_inners, have_rate_limits, sc_shown). *have_rate_limits* may be
     set to False if data is too stale, even when it was True on entry.
     """
+    quota = _render_quota_guard(usage)
     s_pct = _pct_str(usage, "session_percent")
     w_pct = _pct_str(usage, "week_percent")
     if not (s_pct or w_pct):
-        return [], False, False
+        return ([quota] if quota else []), False, False
 
     rl_inners: list[str] = []
 
@@ -1792,6 +1853,11 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool, bool]
                 rl_inners.insert(0, f"\033[0;31mstale:{age_s // 60}m\033[0m")
         elif age_s >= STALE_THRESHOLD_S and (so_shown or sc_shown or _extra_is_material(usage)):
             rl_inners.insert(0, f"\033[0;31mstale:{age_s // 60}m\033[0m")
+
+    # After the staleness clear above: the guard is armed whatever the readings
+    # say, and a session whose S/W went stale is one it blocks.
+    if quota:
+        rl_inners.append(quota)
 
     return rl_inners, have_rate_limits, sc_shown
 

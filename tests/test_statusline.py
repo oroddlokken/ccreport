@@ -2066,3 +2066,111 @@ class TestRenderElapsed:
 
         out = self._plain(monkeypatch, "__SL_TOTAL__")
         assert re.fullmatch(r"\d\.\d{3}s/__SL_TOTAL__", out)
+
+
+class TestQuotaGuardSegment:
+    """A session armed with CCQUOTA_STOP looks like an unarmed one without this.
+
+    The thresholds are parsed here rather than read from quota_guard, so the two
+    parses are pinned against each other below.
+    """
+
+    NOW = 1785000000.0
+    RED = "\033[0;31m"
+    YELLOW = "\033[0;33m"
+
+    def _usage(self, **percents):
+        reset = dt.datetime.fromtimestamp(self.NOW + 3600, dt.UTC).isoformat()
+        usage = {
+            "session_percent": "10",
+            "session_reset": reset,
+            "week_percent": "20",
+            "week_reset": reset,
+            "_native_rl": True,
+        }
+        usage.update(percents)
+        return usage
+
+    def _segment(self, monkeypatch, stop="95", warn=None, **percents):
+        """The last inner section, ANSI intact."""
+        if stop is not None:
+            monkeypatch.setenv("CCQUOTA_STOP", stop)
+        if warn is not None:
+            monkeypatch.setenv("CCQUOTA_WARN", warn)
+        inners, _, _ = sl._render_rate_limits(self._usage(**percents), self.NOW)
+        return inners[-1]
+
+    def _plain(self, segment):
+        return re.sub(r"\x1b\[[0-9;]*m", "", segment)
+
+    @pytest.mark.parametrize("stop", ["", "   "])
+    def test_an_unarmed_session_renders_nothing(self, monkeypatch, stop):
+        monkeypatch.setenv("CCQUOTA_STOP", stop)
+        monkeypatch.setenv("CCQUOTA_WARN", "85")
+        inners, _, _ = sl._render_rate_limits(self._usage(), self.NOW)
+        assert not any("Q:" in self._plain(i) for i in inners)
+
+    def test_both_lines_render_as_a_pair(self, monkeypatch):
+        assert self._plain(self._segment(monkeypatch, warn="85")) == "Q:85/95"
+
+    def test_the_stop_line_alone_renders_alone(self, monkeypatch):
+        assert self._plain(self._segment(monkeypatch)) == "Q:95"
+
+    def test_a_fractional_line_keeps_its_decimal(self, monkeypatch):
+        assert self._plain(self._segment(monkeypatch, stop="92.5", warn="80")) == "Q:80/92.5"
+
+    def test_below_the_warn_line_it_stays_subdued(self, monkeypatch):
+        assert self._segment(monkeypatch, warn="85").startswith(sl.SUBDUED)
+
+    def test_at_the_warn_line_it_turns_yellow(self, monkeypatch):
+        assert self._segment(monkeypatch, warn="85", week_percent="85").startswith(self.YELLOW)
+
+    def test_at_the_stop_line_it_turns_red(self, monkeypatch):
+        assert self._segment(monkeypatch, warn="85", week_percent="96").startswith(self.RED)
+
+    def test_a_warn_line_of_its_own_still_colours_nothing_below_it(self, monkeypatch):
+        """Without CCQUOTA_WARN there is no yellow state, only subdued and red."""
+        assert self._segment(monkeypatch, week_percent="90").startswith(sl.SUBDUED)
+
+    @pytest.mark.parametrize("window", ["sonnet_percent", "scoped_percent"])
+    def test_any_window_can_drive_the_colour(self, monkeypatch, window):
+        """The guard blocks on the highest of the four, hidden segments included."""
+        segment = self._segment(monkeypatch, warn="85", **{window: "97"})
+        assert segment.startswith(self.RED)
+
+    def test_an_unparseable_stop_line_renders_red(self, monkeypatch):
+        """It blocks every prompt in the guard, so it cannot render as armed-and-fine."""
+        segment = self._segment(monkeypatch, stop="ninety", warn="85")
+        assert self._plain(segment) == "Q:!"
+        assert segment.startswith(self.RED)
+
+    def test_it_renders_before_any_window_has_a_reading(self, monkeypatch):
+        """Claude Code sends no rate_limits until the session's first response."""
+        monkeypatch.setenv("CCQUOTA_STOP", "95")
+        inners, have_rl, _ = sl._render_rate_limits({}, self.NOW)
+        assert [self._plain(i) for i in inners] == ["Q:95"]
+        assert not have_rl
+
+    def test_stale_readings_do_not_disarm_it(self, monkeypatch):
+        """The stale clear drops S/W; the guard is armed regardless, and blocks."""
+        monkeypatch.setenv("CCQUOTA_STOP", "95")
+        usage = self._usage(last_updated=_iso_offset(-sl.STALE_THRESHOLD_S - 60))
+        usage["_native_rl"] = False
+        inners, have_rl, _ = sl._render_rate_limits(usage, time.time())
+        assert [self._plain(i) for i in inners] == ["Q:95"]
+        assert not have_rl
+
+    @pytest.mark.parametrize(
+        "raw",
+        [None, "", "   ", "95", " 95 ", "95%", " 92.5 % ", "0", "ninety", "9 5", "%"],
+    )
+    def test_the_inline_parse_agrees_with_the_guard(self, raw):
+        """quota_guard.threshold reads the same two variables in the hooks."""
+        from ccreport import quota_guard
+
+        assert sl._quota_threshold(raw) == quota_guard.threshold(raw)
+
+    def test_the_statusline_never_imports_the_guard(self):
+        """A per-render import costs every frame the tokenizing of that module."""
+        src = Path(sl.__file__).read_text(encoding="utf-8")
+        assert re.search(r"^\s*(?:from|import)\b.*quota_guard", src, re.MULTILINE) is None
