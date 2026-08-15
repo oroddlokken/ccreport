@@ -4,14 +4,20 @@ It pointed at tools/statusline_command.py for as long as it took someone to run
 `just bench` again — the file had moved to src/ and been renamed, and main()'s
 exists() guard turned that into a quiet `return 1`. These assert the target is
 there and runnable the way the benchmark invokes it, `[str(STATUSLINE), "-t"]`.
+
+Phase 4 is here too: it counts processes the benchmark's own os.wait4 cannot
+see, and what it counts depends on a private HOME leaving all three spawn gates
+cold.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -52,3 +58,66 @@ class TestBenchmarkTarget:
         )
         assert out.returncode == 0
         assert out.stdout.strip()
+
+
+class TestProcessLabels:
+    def test_a_module_spawn_is_named_by_its_module(self, bench):
+        cmd = "/repo/.venv/bin/python -m ccreport.usage_api --session mock --cwd /repo"
+        assert bench.label_of(cmd) == "ccreport.usage_api"
+
+    def test_a_plain_program_is_named_by_its_basename(self, bench):
+        assert bench.label_of("/usr/bin/git remote get-url origin") == "git"
+
+    def test_an_accounting_only_process_keeps_its_name(self, bench):
+        """ps parenthesizes a command it could only read back from the kernel."""
+        assert bench.label_of("(security)") == "security"
+
+    def test_a_process_that_ended_before_ps_read_it_is_marked(self, bench):
+        assert bench.label_of("") == bench.UNNAMED
+
+    def test_repeats_fold_into_a_count(self, bench):
+        assert bench.tally(["security", "git", "security"]) == "security x2, git"
+
+    def test_nothing_counted_says_so(self, bench):
+        assert bench.tally([]) == "none"
+
+
+class TestBenchHome:
+    def test_it_hands_the_render_a_push_config_to_find(self, bench):
+        """No push.toml and _spawn_push returns before it reads any gate."""
+        home = Path(bench._bench_home())
+        try:
+            cfg = home / ".config" / "ccreport" / "push.toml"
+            entries = tomllib.loads(cfg.read_text())["server"]
+            assert all(e["token"] for e in entries.values())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_it_holds_no_cache_so_every_gate_is_cold(self, bench):
+        home = Path(bench._bench_home())
+        try:
+            assert not (home / ".cache" / "ccreport" / "cache.db").exists()
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="the ps flags and the wrapper are macOS-only")
+class TestDetachedChildren:
+    def test_the_process_table_answers_for_this_process(self, bench):
+        ppid, pgid, state = bench._proc_table()[os.getpid()]
+        assert (ppid, pgid) == (os.getppid(), os.getpgid(0))
+        assert state
+
+    @pytest.mark.slow
+    def test_a_cold_render_is_seen_spawning_all_three(self, bench):
+        """The three spawns are interval-gated, so only a render against a cold
+        HOME makes them at all — which is what this phase exists to arrange.
+        """
+        # Two renders, not one: ps is a sampler, and measure_detached reports
+        # the run that saw the most.
+        seen = bench.measure_detached(2)
+        assert seen["failed_renders"] == 0
+        assert set(seen["detached"]) == {
+            "ccreport.usage_api", "ccreport.update_check", "ccreport.push",
+        }
+        assert seen["peak_live"] >= 3

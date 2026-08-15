@@ -35,7 +35,7 @@ vulture:
 banners:
     uv run python tools/banner_demo.py
 
-# measure what a status line render costs in wall time and energy
+# measure what a status line render costs in wall time, energy and processes
 bench:
     uv run python tools/benchmark_statusline_energy.py
 
