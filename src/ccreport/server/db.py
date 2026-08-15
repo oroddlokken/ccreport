@@ -136,6 +136,19 @@ CREATE TABLE IF NOT EXISTS account_aliases (
     updated_at   REAL NOT NULL
 ) WITHOUT ROWID;
 
+-- What this server calls a project. Two machines that checked the same repo
+-- out under different names push two names, and the dashboard draws a row
+-- each; typing one alias for both pairs folds them into one row. Keyed on the
+-- machine as well as the name, so two machines that use one name for different
+-- repos stay separable. A pair with no row here renders as the name it pushed.
+CREATE TABLE IF NOT EXISTS project_aliases (
+    machine_id TEXT NOT NULL REFERENCES machines(machine_id) ON DELETE CASCADE,
+    project    TEXT NOT NULL,
+    alias      TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (machine_id, project)
+) WITHOUT ROWID;
+
 -- The same shape exchange.py already caches on every client, because the
 -- server converts to NOK for all of them and reuses that module's Norges Bank
 -- walk-back and negative cache rather than owning a second copy of either.
@@ -199,6 +212,7 @@ def _add_label_updated_at(conn: sqlite3.Connection) -> None:
 
 MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(4, "machines.label_updated_at", _add_label_updated_at),
+    migrations.Step(5, "project_aliases"),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 
@@ -464,6 +478,88 @@ def account_overview(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
+def project_aliases(conn: sqlite3.Connection) -> dict[tuple[str, str], str]:
+    """Every project alias set, keyed by the (machine, pushed name) pair.
+
+    Read once per report and handed to the row builders, for the reason
+    account_aliases is: a merged corpus is one query's worth of projects and
+    hundreds of thousands of records.
+    """
+    rows = conn.execute("SELECT machine_id, project, alias FROM project_aliases").fetchall()
+    return {(row[0], row[1]): row[2] for row in rows}
+
+
+def projects_with_alias(conn: sqlite3.Connection, alias: str | None) -> tuple[tuple[str, str], ...]:
+    """The (machine, project) pairs *alias* names, so a filter typed as an alias matches.
+
+    Several pairs by design: folding two machines' names into one is what the
+    table is for, and a filter that picked one of them would report half the
+    spend.
+    """
+    if not alias:
+        return ()
+    rows = conn.execute(
+        "SELECT machine_id, project FROM project_aliases WHERE alias = ?", (alias,),
+    ).fetchall()
+    return tuple((row[0], row[1]) for row in rows)
+
+
+def set_project_alias(
+    conn: sqlite3.Connection, machine_id: str, project: str, alias: str, now: float,
+) -> None:
+    """Name one machine's project, or clear the name when *alias* is blank."""
+    alias = alias.strip()
+    if not alias:
+        conn.execute(
+            "DELETE FROM project_aliases WHERE machine_id = ? AND project = ?",
+            (machine_id, project),
+        )
+        return
+    conn.execute(
+        "INSERT INTO project_aliases (machine_id, project, alias, updated_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(machine_id, project) DO UPDATE SET "
+        "alias = excluded.alias, updated_at = excluded.updated_at",
+        (machine_id, project, alias, now),
+    )
+
+
+def project_overview(conn: sqlite3.Connection) -> list[dict]:
+    """Every (machine, project) pair with records here, its spend and its alias.
+
+    A record whose project is NULL is left out: a restricted machine stripped
+    the name, and the bucket those rows fold into is named off the account.
+    """
+    rows = conn.execute("""
+        SELECT r.machine_id, r.project,
+               (SELECT m.label FROM machines m WHERE m.machine_id = r.machine_id),
+               COUNT(*), COALESCE(SUM(r.cost), 0),
+               (SELECT p.alias FROM project_aliases p
+                 WHERE p.machine_id = r.machine_id AND p.project = r.project)
+          FROM server_records r
+         WHERE r.project IS NOT NULL
+      GROUP BY r.machine_id, r.project
+      ORDER BY SUM(r.cost) DESC
+    """).fetchall()
+    return [
+        {"machine_id": row[0], "project": row[1], "machine": row[2] or row[0],
+         "records": row[3], "cost": row[4], "alias": row[5]}
+        for row in rows
+    ]
+
+
+def project_exists(conn: sqlite3.Connection, machine_id: str, project: str) -> bool:
+    """Whether that machine has pushed a record under that project name.
+
+    What the rename route checks before storing anything: a pair nobody pushed
+    is a mistyped form, and its row would sit in the table naming nothing while
+    the page that lists pushed pairs never draws it.
+    """
+    return conn.execute(
+        "SELECT 1 FROM server_records WHERE machine_id = ? AND project = ? LIMIT 1",
+        (machine_id, project),
+    ).fetchone() is not None
+
+
 def record_count(conn: sqlite3.Connection, machine_id: str) -> int:
     """How many records the server holds for one machine."""
     return conn.execute(
@@ -498,6 +594,10 @@ def content_stamp(conn: sqlite3.Connection) -> tuple:
     one part rather than two: a rename writes the stamp whether it names the
     machine or clears it back to the id, and the row itself outlives both.
 
+    project_aliases is account_aliases' case again, down to needing both parts:
+    the row is created and deleted by the same field, so a cleared name moves
+    the count where a re-typed one moves the max.
+
     A rate arriving in exchange_rates is deliberately not in it: nothing here
     would notice a rate updated in place, and the NOK column it moves is
     re-derived on the next push or the next day anyway.
@@ -506,7 +606,9 @@ def content_stamp(conn: sqlite3.Connection) -> tuple:
         SELECT COUNT(*), COALESCE(MAX(updated_at), 0), COALESCE(SUM(n_records), 0),
                (SELECT COUNT(*) FROM account_aliases),
                (SELECT COALESCE(MAX(updated_at), 0) FROM account_aliases),
-               (SELECT COALESCE(MAX(label_updated_at), 0) FROM machines)
+               (SELECT COALESCE(MAX(label_updated_at), 0) FROM machines),
+               (SELECT COUNT(*) FROM project_aliases),
+               (SELECT COALESCE(MAX(updated_at), 0) FROM project_aliases)
           FROM ingest_files
     """).fetchone()
 

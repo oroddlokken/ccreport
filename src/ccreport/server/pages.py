@@ -179,6 +179,40 @@ def set_alias(request: Request, account_uuid: str, alias: str = Form("")):
     return RedirectResponse(url="/settings/accounts", status_code=303)
 
 
+@router.get("/settings/projects", response_class=HTMLResponse)
+def projects(request: Request):
+    """Every (machine, project) pair that has pushed, each a field for its name.
+
+    One row per pair rather than per name: a project name is only unique within
+    the machine that pushed it, and folding two machines' names into one row is
+    what typing the same name in both fields does.
+    """
+    conn = request.app.state.db.connect()
+    return templates.TemplateResponse(
+        request, "projects.html", {"projects": db.project_overview(conn)},
+    )
+
+
+@router.post("/settings/projects/alias")
+def set_project_alias(request: Request, machine_id: str = Form(...), project: str = Form(...),
+                      alias: str = Form("")):
+    """Name one machine's project, or clear the name back to what it pushed.
+
+    The machine and the project ride in the form rather than in the path: a
+    project name is free text and carries slashes often enough that a path
+    segment would have to be decoded before it could be matched.
+
+    The stored records are untouched, and the dashboard picks the name up
+    because db.content_stamp reads project_aliases.
+    """
+    conn = request.app.state.db.connect()
+    if not db.project_exists(conn, machine_id, project):
+        raise HTTPException(status_code=404, detail=f"No project {project!r} on {machine_id}.")
+    db.set_project_alias(conn, machine_id, project, alias, time.time())
+    conn.commit()
+    return RedirectResponse(url="/settings/projects", status_code=303)
+
+
 def _bad_cidr(networks: str) -> str | None:
     """The first CIDR that will not parse, or None.
 

@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Projects</h1>
+<p class="hint">A name replaces the one that machine pushed everywhere this server draws — the
+dashboard, its breakdowns and <span class="mono">ccreport --server</span>. Type the same name on
+two rows to draw them as one project. The records keep the names they arrived with. Save an empty
+field to go back to them.</p>
+
+{% if projects %}
+<table>
+  <thead>
+    <tr>
+      <th scope="col">Machine</th><th scope="col">Pushed as</th>
+      <th scope="col" class="num">Records</th><th scope="col" class="num">Cost</th>
+      <th scope="col">Name</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for p in projects %}
+    <tr>
+      <td>{{ p.machine }}</td>
+      <td class="mono">{{ p.project }}</td>
+      <td class="num" data-int="{{ p.records }}">{{ "{:,}".format(p.records) }}</td>
+      <td class="num" data-usd="{{ p.cost }}">{{ "${:,.2f}".format(p.cost) }}</td>
+      <td>
+        <form method="post" action="/settings/projects/alias" class="rename">
+          <input type="hidden" name="machine_id" value="{{ p.machine_id }}">
+          <input type="hidden" name="project" value="{{ p.project }}">
+          <input name="alias" value="{{ p.alias or '' }}" autocomplete="off"
+                 aria-label="Name for {{ p.project }} on {{ p.machine }}"
+                 placeholder="{{ p.project }}">
+          <button type="submit" class="ghost">Save</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="dim">No machine has pushed a named project yet.</p>
+{% endif %}
+{% endblock %}

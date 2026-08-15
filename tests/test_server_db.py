@@ -243,6 +243,65 @@ class TestWholeFileIngest:
         assert db.file_fingerprint(conn, "m1", "/p/never.jsonl") is None
 
 
+class TestProjectAliases:
+    """The table that folds two machines' names for one repo into one project."""
+
+    def _pushed(self, conn, machine_id="m1", project: str | None = "proj", path="/p/a.jsonl"):
+        db.upsert_machine(conn, machine_id, machine_id, 100.0)
+        db.replace_file_records(
+            conn, machine_id, path, 1, 10,
+            [db.record_to_row(_record(machine_id=machine_id, project=project, file_path=path))],
+            500.0,
+        )
+
+    def test_a_name_is_keyed_on_the_machine_as_well_as_the_project(self, conn):
+        self._pushed(conn)
+        self._pushed(conn, machine_id="m2", project="other")
+        db.set_project_alias(conn, "m1", "proj", "shared", 700.0)
+        db.set_project_alias(conn, "m2", "other", "shared", 700.0)
+        assert db.project_aliases(conn) == {("m1", "proj"): "shared", ("m2", "other"): "shared"}
+
+    def test_a_blank_name_deletes_the_row(self, conn):
+        self._pushed(conn)
+        db.set_project_alias(conn, "m1", "proj", "shared", 700.0)
+        db.set_project_alias(conn, "m1", "proj", "  ", 800.0)
+        assert db.project_aliases(conn) == {}
+
+    def test_the_pairs_a_name_covers_come_back_for_a_filter(self, conn):
+        self._pushed(conn)
+        self._pushed(conn, machine_id="m2", project="other")
+        db.set_project_alias(conn, "m1", "proj", "shared", 700.0)
+        db.set_project_alias(conn, "m2", "other", "shared", 700.0)
+        assert sorted(db.projects_with_alias(conn, "shared")) == [("m1", "proj"), ("m2", "other")]
+        assert db.projects_with_alias(conn, None) == ()
+        assert db.projects_with_alias(conn, "nobody") == ()
+
+    def test_the_overview_lists_every_pushed_pair_with_its_name(self, conn):
+        self._pushed(conn)
+        db.set_project_alias(conn, "m1", "proj", "shared", 700.0)
+        rows = db.project_overview(conn)
+        assert [(r["machine_id"], r["project"], r["alias"], r["records"]) for r in rows] == [
+            ("m1", "proj", "shared", 1),
+        ]
+
+    def test_a_redacted_record_is_not_a_row_to_name(self, conn):
+        """Its project was stripped; the bucket it folds into is named off the account."""
+        self._pushed(conn, project=None)
+        assert db.project_overview(conn) == []
+
+    def test_only_a_pair_that_pushed_exists(self, conn):
+        self._pushed(conn)
+        assert db.project_exists(conn, "m1", "proj") is True
+        assert db.project_exists(conn, "m1", "typo") is False
+        assert db.project_exists(conn, "m2", "proj") is False
+
+    def test_deleting_the_machine_takes_its_names_with_it(self, conn):
+        self._pushed(conn)
+        db.set_project_alias(conn, "m1", "proj", "shared", 700.0)
+        db.delete_machine(conn, "m1")
+        assert db.project_aliases(conn) == {}
+
+
 class TestContentStamp:
     """What the dashboard holds a cached page against."""
 
@@ -250,7 +309,23 @@ class TestContentStamp:
         db.replace_file_records(conn, "m1", path, mtime_ns, size, rows, now)
 
     def test_an_empty_database_stamps_without_raising(self, conn):
-        assert db.content_stamp(conn) == (0, 0, 0, 0, 0, 0)
+        assert db.content_stamp(conn) == (0, 0, 0, 0, 0, 0, 0, 0)
+
+    def test_naming_a_project_moves_it(self, conn):
+        """A project name is a rename with no push behind it, like the other two."""
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        self._push(conn, [db.record_to_row(_record())])
+        before = db.content_stamp(conn)
+        db.set_project_alias(conn, "m1", "proj", "shared", 700.0)
+        assert db.content_stamp(conn) != before
+
+    def test_clearing_a_project_name_moves_it_back_off(self, conn):
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        self._push(conn, [db.record_to_row(_record())])
+        db.set_project_alias(conn, "m1", "proj", "shared", 700.0)
+        named = db.content_stamp(conn)
+        db.set_project_alias(conn, "m1", "proj", "", 800.0)
+        assert db.content_stamp(conn) != named
 
     def test_naming_an_account_moves_it(self, conn):
         """A rename has no push behind it, and it changes every rendered name."""

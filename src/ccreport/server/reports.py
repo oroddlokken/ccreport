@@ -57,9 +57,15 @@ AGGREGATED = "aggregated"
 
 
 def project_display(
-    project: str | None, account_uuid: str, account_label: str | None, aliases: dict[str, str],
+    project: str | None, machine_id: str, account_uuid: str, account_label: str | None,
+    aliases: dict[str, str], project_aliases: dict[tuple[str, str], str],
 ) -> str:
     """A record's project, or the bucket its account's redacted spend folds into.
+
+    A named project is drawn under its alias where this server has one for that
+    (machine, name) pair. Two machines that checked one repo out under
+    different names are one row once both pairs carry the same alias, and the
+    stored records keep the names they arrived with.
 
     A restricted machine sends a NULL project for everything it has not opted
     in to, and every one of those rows lands under one name per account: how
@@ -75,7 +81,7 @@ def project_display(
     one today; the day something does, this needs a column to key on instead.
     """
     if project:
-        return project
+        return project_aliases.get((machine_id, project)) or project
     alias = aliases.get(account_uuid)
     if alias:
         return f"{alias}-{AGGREGATED}"
@@ -84,6 +90,7 @@ def project_display(
 
 def _clauses(
     filters: Filters, table: str = "", aliased: tuple[str, ...] = (),
+    pairs: tuple[tuple[str, str], ...] = (),
 ) -> tuple[list[str], list]:
     """One condition per set filter, qualified by *table*, and their parameters.
 
@@ -93,6 +100,9 @@ def _clauses(
 
     *aliased* is the accounts whose alias the account filter spells, so a name
     typed off the dashboard selects the same rows the stored email does.
+    *pairs* is the same for projects: the (machine, pushed name) pairs the
+    project filter's alias names, each matched on both halves because a name is
+    only unique within the machine that pushed it.
     """
     at = f"{table}." if table else ""
     clauses, params = [], []
@@ -103,8 +113,12 @@ def _clauses(
         clauses.append(f"{at}ts < ?")
         params.append(filters.until.timestamp())
     if filters.project is not None:
-        clauses.append(f"{at}project = ?")
+        matches = [f"{at}project = ?"]
         params.append(filters.project)
+        for machine_id, project in pairs:
+            matches.append(f"({at}machine_id = ? AND {at}project = ?)")
+            params += [machine_id, project]
+        clauses.append("(" + " OR ".join(matches) + ")")
     if filters.account is not None:
         matches = [f"{at}account_label = ?", f"{at}account_uuid = ?"]
         params += [filters.account, filters.account]
@@ -117,9 +131,11 @@ def _clauses(
     return clauses, params
 
 
-def _where(filters: Filters, aliased: tuple[str, ...] = ()) -> tuple[str, list]:
+def _where(
+    filters: Filters, aliased: tuple[str, ...] = (), pairs: tuple[tuple[str, str], ...] = (),
+) -> tuple[str, list]:
     """The filter clause and its parameters, or an empty clause."""
-    clauses, params = _clauses(filters, aliased=aliased)
+    clauses, params = _clauses(filters, aliased=aliased, pairs=pairs)
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
 
@@ -137,7 +153,11 @@ def load(conn: sqlite3.Connection, filters: Filters | None = None) -> list[Merge
     """
     filters = filters or Filters()
     aliases = db.account_aliases(conn)
-    clause, params = _where(filters, db.accounts_with_alias(conn, filters.account))
+    proj_aliases = db.project_aliases(conn)
+    clause, params = _where(
+        filters, db.accounts_with_alias(conn, filters.account),
+        db.projects_with_alias(conn, filters.project),
+    )
     rows = conn.execute(
         f"SELECT machine_id, {_SELECT} FROM server_records{clause} ORDER BY id",  # noqa: S608
         params,
@@ -152,12 +172,15 @@ def load(conn: sqlite3.Connection, filters: Filters | None = None) -> list[Merge
         if rec["dk"] and key in seen:
             continue
         seen.add(key)
-        merged.append(_as_merged(rec, labels.get(machine_id, machine_id), aliases))
+        merged.append(_as_merged(rec, labels.get(machine_id, machine_id), aliases, proj_aliases))
     merged.sort(key=lambda m: m.record.timestamp)
     return merged
 
 
-def _as_merged(rec: dict, machine_label: str, aliases: dict[str, str]) -> MergedRecord:
+def _as_merged(
+    rec: dict, machine_label: str, aliases: dict[str, str],
+    proj_aliases: dict[tuple[str, str], str],
+) -> MergedRecord:
     """One stored row as the record the aggregation understands.
 
     day and oslo_date travel on the record rather than being re-derived: they
@@ -174,7 +197,10 @@ def _as_merged(rec: dict, machine_label: str, aliases: dict[str, str]) -> Merged
         ),
         timestamp=datetime.fromtimestamp(rec["ts"], tz=UTC),
         session_id=rec["sid"] or "",
-        project=project_display(rec["project"], rec["account_uuid"], rec["account_label"], aliases),
+        project=project_display(
+            rec["project"], rec["machine_id"], rec["account_uuid"], rec["account_label"],
+            aliases, proj_aliases,
+        ),
         # The server's own price, always. cost_usd is the field the aggregation
         # reads as "already known", which here it is: the server computed it at
         # ingest with its own pricing.py and stored it NOT NULL.
@@ -194,7 +220,9 @@ GROUP_COLS = ("machine_id", "account_uuid", "account_label", "project", "model",
 """What one grouped row stands for. Every column a merged report groups on
 except the session, which no page folding these rows breaks down by."""
 
-def _dedup_clause(filters: Filters, aliased: tuple[str, ...] = ()) -> tuple[str, list]:
+def _dedup_clause(
+    filters: Filters, aliased: tuple[str, ...] = (), pairs: tuple[tuple[str, str], ...] = (),
+) -> tuple[str, list]:
     """load()'s dedup, stated in SQL, and the parameters it binds.
 
     The lowest id per (account, dedup key) wins and a record with no key is
@@ -212,7 +240,9 @@ def _dedup_clause(filters: Filters, aliased: tuple[str, ...] = ()) -> tuple[str,
     cannot split a pair — two copies of one call carry the ts their log gave
     them — and repeating them doubles what the all-time range costs.
     """
-    clauses, params = _clauses(replace(filters, since=None, until=None), aliased=aliased)
+    clauses, params = _clauses(
+        replace(filters, since=None, until=None), aliased=aliased, pairs=pairs,
+    )
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     inner = f"SELECT MIN(id) FROM server_records{where} GROUP BY account_uuid, dk"  # noqa: S608
     return f"(a.dk IS NULL OR a.dk = '' OR a.id IN ({inner}))", params
@@ -245,20 +275,25 @@ def load_grouped(conn: sqlite3.Connection, filters: Filters | None = None) -> li
     """
     filters = filters or Filters()
     aliases = db.account_aliases(conn)
+    proj_aliases = db.project_aliases(conn)
     aliased = db.accounts_with_alias(conn, filters.account)
-    dedup, dedup_params = _dedup_clause(filters, aliased)
-    clauses, params = _clauses(filters, table="a", aliased=aliased)
+    pairs = db.projects_with_alias(conn, filters.project)
+    dedup, dedup_params = _dedup_clause(filters, aliased, pairs)
+    clauses, params = _clauses(filters, table="a", aliased=aliased, pairs=pairs)
     rows = conn.execute(
         _GROUPED_SQL % " AND ".join([dedup, *clauses]), dedup_params + params,
     ).fetchall()
 
     labels = dict(conn.execute("SELECT machine_id, label FROM machines").fetchall())
-    merged = [_as_grouped(row, labels, aliases) for row in rows]
+    merged = [_as_grouped(row, labels, aliases, proj_aliases) for row in rows]
     merged.sort(key=lambda m: m.record.timestamp)
     return merged
 
 
-def _as_grouped(row: tuple, labels: dict, aliases: dict[str, str]) -> MergedRecord:
+def _as_grouped(
+    row: tuple, labels: dict, aliases: dict[str, str],
+    proj_aliases: dict[tuple[str, str], str],
+) -> MergedRecord:
     """One grouped row as the record the aggregation understands."""
     machine_id: str = row[0]
     account_uuid, account_label, project, model, day, oslo_date = row[1:len(GROUP_COLS)]
@@ -275,7 +310,9 @@ def _as_grouped(row: tuple, labels: dict, aliases: dict[str, str]) -> MergedReco
         # would — and the dashboard's cache-reads tile asks for nothing else.
         timestamp=datetime.fromtimestamp(first_ts, tz=UTC),
         session_id="",
-        project=project_display(project, account_uuid, account_label, aliases),
+        project=project_display(
+            project, machine_id, account_uuid, account_label, aliases, proj_aliases,
+        ),
         cost_usd=cost,
         count=calls,
         account=account,

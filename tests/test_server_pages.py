@@ -13,7 +13,8 @@ from fastapi.testclient import TestClient
 from ccreport.server import pages, tokens
 from ccreport.server.factory import create_app
 
-UI_ROUTES = ["/", "/settings/machines", "/settings/machines/laptop-1", "/settings/accounts"]
+UI_ROUTES = ["/", "/settings/machines", "/settings/machines/laptop-1", "/settings/accounts",
+             "/settings/projects"]
 
 
 @pytest.fixture(autouse=True)
@@ -412,6 +413,112 @@ class TestAccountsPage:
         gated = TestClient(create_app(sf.config(tmp_path, networks=sf.ELSEWHERE)))
         assert gated.get("/settings/accounts").status_code == 403
         assert gated.post("/settings/accounts/acct-1/alias", data={"alias": "x"}).status_code == 403
+
+
+class TestProjectsPage:
+    """Where one repo checked out under two names becomes one project."""
+
+    def _push(self, client, machine_id, project, **over):
+        """One record from *machine_id* under *project*, stamped now.
+
+        Distinct mid and dk per machine: the read-time dedup collapses two
+        copies of one call, and these are two calls that happen to share a repo.
+        """
+        token = _token_from(_mint(client, machine_id=machine_id, label=machine_id).text)
+        over.setdefault("ts", time.time())
+        rec = sf.record(
+            project=project, mid=f"msg-{machine_id}", dk=f"msg-{machine_id}:req", **over,
+        )
+        return client.post(
+            "/v1/ingest", json=sf.batch([rec], path=f"/p/{machine_id}.jsonl"),
+            headers=sf.auth(token),
+        )
+
+    def _both(self, client):
+        self._push(client, "neo", "project1")
+        self._push(client, "mbp", "project2")
+
+    def test_an_empty_server_says_so(self, client):
+        assert "No machine has pushed a named project yet." in client.get("/settings/projects").text
+
+    def test_it_lists_each_machines_project_with_a_field(self, client):
+        self._both(client)
+        body = client.get("/settings/projects").text
+        assert "project1" in body
+        assert "project2" in body
+        assert 'name="alias"' in body
+
+    def test_the_nav_reaches_it(self, client):
+        assert 'href="/settings/projects"' in client.get("/settings/machines").text
+
+    def test_one_name_on_both_rows_draws_one_project(self, client):
+        self._both(client)
+        self._rename(client, "neo", "project1", "shared")
+        self._rename(client, "mbp", "project2", "shared")
+        body = client.get("/?by=project").text
+        assert "shared" in body
+        assert "project1" not in body
+        assert "project2" not in body
+
+    def _rename(self, client, machine_id, project, alias):
+        return client.post("/settings/projects/alias", data={
+            "machine_id": machine_id, "project": project, "alias": alias,
+        })
+
+    def test_the_field_comes_back_holding_what_was_set(self, client):
+        self._both(client)
+        self._rename(client, "neo", "project1", "shared")
+        assert 'value="shared"' in client.get("/settings/projects").text
+
+    def test_naming_one_side_leaves_the_other_alone(self, client):
+        """The key is the pair, so two machines using one name stay separable."""
+        self._both(client)
+        self._rename(client, "neo", "project1", "shared")
+        body = client.get("/?by=project").text
+        assert "shared" in body
+        assert "project2" in body
+
+    def test_clearing_it_puts_the_pushed_name_back(self, client):
+        self._both(client)
+        self._rename(client, "neo", "project1", "shared")
+        self._rename(client, "neo", "project1", "  ")
+        assert "project1" in client.get("/?by=project").text
+        assert client.app.state.db.connect().execute(
+            "SELECT COUNT(*) FROM project_aliases").fetchone()[0] == 0
+
+    def test_a_pair_nobody_pushed_is_a_404(self, client):
+        self._both(client)
+        assert self._rename(client, "neo", "project2", "shared").status_code == 404
+
+    def test_the_merged_report_folds_both_machines_into_the_name(self, client):
+        self._both(client)
+        self._rename(client, "neo", "project1", "shared")
+        self._rename(client, "mbp", "project2", "shared")
+        payload = client.get("/v1/report/project").json()
+        assert [row["key"] for row in payload["rows"]] == ["shared"]
+        assert payload["machines"] == ["mbp", "neo"]
+
+    def test_the_name_selects_both_machines_rows_as_a_filter(self, client):
+        self._both(client)
+        self._rename(client, "neo", "project1", "shared")
+        self._rename(client, "mbp", "project2", "shared")
+        payload = client.get("/v1/report/project", params={"project": "shared"}).json()
+        assert [row["key"] for row in payload["rows"]] == ["shared"]
+        assert payload["machines"] == ["mbp", "neo"]
+
+    def test_the_detail_page_is_about_both_machines(self, client):
+        self._both(client)
+        self._rename(client, "neo", "project1", "shared")
+        self._rename(client, "mbp", "project2", "shared")
+        body = client.get("/project/shared").text
+        assert "neo" in body
+        assert "mbp" in body
+
+    def test_a_disallowed_address_cannot_read_or_set_one(self, tmp_path):
+        gated = TestClient(create_app(sf.config(tmp_path, networks=sf.ELSEWHERE)))
+        assert gated.get("/settings/projects").status_code == 403
+        assert gated.post("/settings/projects/alias", data={
+            "machine_id": "neo", "project": "project1", "alias": "x"}).status_code == 403
 
 
 class TestRenamingAMachine:

@@ -232,6 +232,16 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   `label_updated_at` for the same reason an alias stamps `updated_at`, and
   `content_stamp` reads it; a blank field stores the machine_id rather than an
   empty label, which every reader would draw as a machine with no name
+- What it calls a project is `project_aliases`, keyed on (machine_id, project)
+  and typed on the /settings/projects page: two machines that checked one repo
+  out under different names are one row once both pairs carry the same alias,
+  and a name is only unique within the machine that pushed it, so the key
+  cannot be the name alone. `reports.project_display` reads it,
+  `db.projects_with_alias` widens the project clause in `_clauses` *and* in
+  `_dedup_clause`, and `content_stamp` reads both its count and its max. The
+  pair rides in form fields rather than the path — a project name carries
+  slashes. A NULL project has no row here: it is a restricted machine's
+  redacted bucket, named off the account
 - Revoking a token stamps `revoked_at`; deleting it removes the row. Both stop
   the next push, and which one to reach for is whether the machine is still out
   there. `POST /settings/machines/{id}/delete` takes the machine, its tokens,

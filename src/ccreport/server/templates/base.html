@@ -15,6 +15,7 @@
   {% set p = request.url.path %}
   {% set section = "machines" if p.startswith("/settings/machines") or p.startswith("/machine/")
      else "accounts" if p.startswith("/settings/accounts") or p.startswith("/account/")
+     else "projects" if p.startswith("/settings/projects") or p.startswith("/project/")
      else "dashboard" %}
   <header>
     <div class="header-inner">
@@ -23,6 +24,7 @@
         <a href="/" {% if section == "dashboard" %}aria-current="page"{% endif %}>Dashboard</a>
         <a href="/settings/machines" {% if section == "machines" %}aria-current="page"{% endif %}>Machines</a>
         <a href="/settings/accounts" {% if section == "accounts" %}aria-current="page"{% endif %}>Accounts</a>
+        <a href="/settings/projects" {% if section == "projects" %}aria-current="page"{% endif %}>Projects</a>
       </nav>
     </div>
   </header>
