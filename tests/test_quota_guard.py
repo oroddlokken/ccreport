@@ -50,6 +50,15 @@ def _quota_file(windows: dict, ts: float = NOW, schema: int = qg.QUOTA_FILE_SCHE
     )
 
 
+def _snapshot(
+    window: str, percent: float, ts: float, resets_in: float = 3600.0, source: str = "stdin",
+) -> None:
+    """One rate_limit_snapshots row, stamped at *ts* rather than at now."""
+    cache_db.record_rate_limit_snapshots(
+        [cache_db.RateLimitSample(window, percent, NOW + resets_in, None, source)], ts,
+    )
+
+
 def _window(percent: float, resets_in: float = 3600.0) -> dict:
     return {"percent": percent, "resets_at": NOW + resets_in}
 
@@ -221,6 +230,51 @@ class TestReadWindows:
 
     def test_an_empty_machine_reads_nothing(self):
         assert qg.read_windows(SESSION, NOW) == []
+
+
+class TestSnapshotReadings:
+    """One grouped query stands in for four, so each window keeps its own row."""
+
+    def test_a_window_with_no_rows_contributes_nothing(self):
+        """A fresh usage row with every quota null is the plan lacking them, so
+        only the window the snapshot covers is watched."""
+        _usage_row()
+        _snapshot("session", 55.0, ts=NOW)
+        assert [s.window for s in qg.read_windows(SESSION, NOW)] == ["session"]
+
+    def test_a_row_past_its_budget_reads_unknown(self):
+        _snapshot("session", 55.0, ts=NOW - qg.NATIVE_MAX_AGE_S - 60)
+        states = {s.window: s.percent for s in qg.read_windows(SESSION, NOW)}
+        assert states == {"session": None}
+
+    def test_each_window_is_measured_against_its_own_source(self):
+        """stdin takes NATIVE_MAX_AGE_S and api takes API_MAX_AGE_S, off one row
+        each at the same age."""
+        ts = NOW - qg.NATIVE_MAX_AGE_S - 60
+        _snapshot("session", 55.0, ts=ts)
+        _snapshot("sonnet", 66.0, ts=ts, source="api")
+        states = {s.window: s.percent for s in qg.read_windows(SESSION, NOW)}
+        assert states == {"session": None, "sonnet": 66.0}
+
+    def test_four_windows_each_keep_their_newest_row(self):
+        """Every window carries an older row at a higher percent, so a group
+        that picked the wrong row reads too high."""
+        for i, window in enumerate(qg.WINDOW_LABELS):
+            _snapshot(window, 90.0 + i, ts=NOW - 5000 - i, resets_in=1800 + i)
+            _snapshot(window, 10.0 + i, ts=NOW - 100 - i, resets_in=3600 + i)
+        states = {s.window: (s.percent, s.resets_at) for s in qg.read_windows(SESSION, NOW)}
+        assert states == {
+            window: (10.0 + i, NOW + 3600 + i) for i, window in enumerate(qg.WINDOW_LABELS)
+        }
+
+    def test_a_newest_row_per_window_carries_its_own_ts(self):
+        """The four newest rows differ in age, and the budget cuts between two
+        of them."""
+        for i, window in enumerate(qg.WINDOW_LABELS):
+            _snapshot(window, 40.0 + i, ts=NOW - 300 * i)
+        later = NOW + qg.NATIVE_MAX_AGE_S - 450
+        states = {s.window: s.percent for s in qg.read_windows(SESSION, later)}
+        assert states == {"session": 40.0, "week": 41.0, "sonnet": None, "scoped": None}
 
 
 class TestHookOutput:

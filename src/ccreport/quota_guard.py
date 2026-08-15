@@ -245,16 +245,17 @@ def _snapshot_readings(conn: Any, now: float, out: dict[str, list[Reading]]) -> 
     the last change and not the last observation — which is why the file above
     exists and this is the fallback.
     """
-    for window in WINDOW_LABELS:
-        row = conn.execute(
-            "SELECT used_pct, resets_at, ts, source FROM rate_limit_snapshots "
-            "WHERE window = ? ORDER BY ts DESC LIMIT 1",
-            (window,),
-        ).fetchone()
-        if row is None:
-            continue
-        budget = NATIVE_MAX_AGE_S if row[3] == "stdin" else API_MAX_AGE_S
-        reading = _reading(row[0], row[1], row[2], now, budget)
+    # used_pct, resets_at and source are bare columns beside MAX(ts), which
+    # SQLite takes from the row that supplied the maximum — the guarantee that
+    # lets one grouped query answer what four ORDER BY ts DESC LIMIT 1 did.
+    rows = conn.execute(
+        "SELECT window, used_pct, resets_at, MAX(ts), source FROM rate_limit_snapshots "  # noqa: S608
+        f"WHERE window IN ({', '.join('?' * len(WINDOW_LABELS))}) GROUP BY window",
+        tuple(WINDOW_LABELS),
+    ).fetchall()
+    for window, used_pct, resets_at, ts, source in rows:
+        budget = NATIVE_MAX_AGE_S if source == "stdin" else API_MAX_AGE_S
+        reading = _reading(used_pct, resets_at, ts, now, budget)
         if reading:
             out.setdefault(window, []).append(reading)
 
