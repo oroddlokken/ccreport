@@ -15,13 +15,19 @@ Four phases:
   3. Derived energy — J/render estimate and Wh per hour at various render
      rates, expressed as % of battery.
   4. Detached children — how many processes a render starts with
-     start_new_session, and how many those start in turn.
+     start_new_session, how many those start in turn, and what each group
+     costs in CPU and wall seconds.
 
 Run on an otherwise quiescent machine; the idle baseline is ambient.
 The three detached spawns (ccreport.usage_api, ccreport.update_check,
 ccreport.push) escape the process tree, so os.wait4 never sees them and
 phase 1 does not count them. Phase 4 counts them by watching the process
 table instead; it runs last so its forced spawns cannot reach phase 2.
+
+Every phase-4 figure is a floor. CPU comes from ps at 10 ms resolution and
+wall from the poll interval, so a process that lives and dies between two
+samples costs zero here; and the push runs against a closed port, which is
+cheaper than one that reaches a server.
 
 Usage: ./benchmark_statusline_energy.py [--runs N] [--samples N]
        [--battery-wh F] [--child-runs N] [--json]
@@ -40,7 +46,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterable
 from pathlib import Path
+from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 # The wrapper, not the module: it is what Claude Code's settings.json invokes,
@@ -110,27 +118,51 @@ CHILD_SETTLE_S = 2.0     # after the render exits, wait this long for a late spa
 _ENV_TOKEN = re.compile(r" [A-Z_][A-Z0-9_]*=")
 
 
-def _proc_table() -> dict[int, tuple[int, int, str]]:
-    """pid -> (ppid, pgid, state) for every process, command column omitted.
+class Proc(NamedTuple):
+    ppid: int
+    pgid: int
+    state: str
+    cpu_s: float
+
+
+def parse_cpu_time(text: str) -> float:
+    """ps `time`, [[hh:]mm:]ss.ff, as seconds; 0.0 for anything unparseable.
+
+    The field is printed to hundredths, so a process under 10 ms of CPU reads
+    as 0.00 and cannot be told from one that never ran.
+    """
+    total = 0.0
+    try:
+        for part in text.split(":"):
+            total = total * 60 + float(part)
+    except ValueError:
+        return 0.0
+    return total
+
+
+def _proc_table() -> dict[int, Proc]:
+    """pid -> ppid, pgid, state and CPU seconds for every process.
 
     Formatting commands costs ps another ~6 ms per call, which is most of the
     lifetime of a grandchild like `git remote get-url` — poll with it and the
     grandchild is gone between two samples. Commands are read per pid instead,
-    once, when a pid first appears.
+    once, when a pid first appears. The time column costs ~2 ms and is the only
+    reading of a detached child's CPU the bench can take, since it never
+    reaped one.
     """
     out = subprocess.run(
-        ["ps", "-A", "-o", "pid=,ppid=,pgid=,state="], capture_output=True, text=True,
+        ["ps", "-A", "-o", "pid=,ppid=,pgid=,state=,time="], capture_output=True, text=True,
     ).stdout
-    table: dict[int, tuple[int, int, str]] = {}
+    table: dict[int, Proc] = {}
     for line in out.splitlines():
-        parts = line.split(None, 3)
-        if len(parts) < 4:
+        parts = line.split(None, 4)
+        if len(parts) < 5:
             continue
         try:
             pid, ppid, pgid = int(parts[0]), int(parts[1]), int(parts[2])
         except ValueError:
             continue
-        table[pid] = (ppid, pgid, parts[3])
+        table[pid] = Proc(ppid, pgid, parts[3], parse_cpu_time(parts[4]))
     return table
 
 
@@ -201,6 +233,8 @@ def _detached_run(tag: str) -> dict:
     roots: dict[int, str] = {}
     kin: dict[int, tuple[int, str]] = {}   # pid -> (pgid, name)
     tested: set[int] = set()               # leaders whose environment has been read once
+    cpu_seen: dict[int, float] = {}        # pid -> highest CPU seconds ps printed for it
+    span: dict[int, tuple[float, float]] = {}   # pgid -> first and last sighting, monotonic
     peak = 0
     exited_at = None
     deadline = time.monotonic() + CHILD_TIMEOUT_S
@@ -209,7 +243,7 @@ def _detached_run(tag: str) -> dict:
         to_name: list[int] = []
         to_test: list[int] = []
         for pid in sorted(table):     # a group's leader has the lower pid of the two
-            ppid, pgid, _ = table[pid]
+            ppid, pgid = table[pid].ppid, table[pid].pgid
             if pid in baseline or pid in kin or pid == proc.pid:
                 continue
             if pgid == proc.pid:
@@ -237,20 +271,31 @@ def _detached_run(tag: str) -> dict:
             cmd, _ = _describe(pid, tag)
             if cmd:
                 kin[pid] = (kin[pid][0], label_of(cmd))
+        now = time.monotonic()
+        for pid, entry in table.items():
+            group = kin.get(pid, (0, ""))[0]
+            if group not in roots:
+                continue
+            # A zombie's CPU total is final and worth reading; its wall clock
+            # stopped at exit, so only a running sighting moves the group's end.
+            cpu_seen[pid] = max(cpu_seen.get(pid, 0.0), entry.cpu_s)
+            if not entry.state.startswith("Z"):
+                first, _ = span.get(group, (now, now))
+                span[group] = (first, now)
         # Concurrency, not headcount: what these processes compete for is cores,
         # and a zombie holds none. The render's own tree is in the figure because
         # the question is how many of its processes are ever runnable at once.
         live = sum(
-            1 for pid, (_, pgid, state) in table.items()
-            if pid in kin and not state.startswith("Z")
-            and (pgid == proc.pid or pgid in roots)
+            1 for pid, entry in table.items()
+            if pid in kin and not entry.state.startswith("Z")
+            and (entry.pgid == proc.pid or entry.pgid in roots)
         )
         peak = max(peak, live)
         if proc.poll() is not None:
             if exited_at is None:
                 exited_at = time.monotonic()
             outstanding = any(
-                pid in table and not table[pid][2].startswith("Z")
+                pid in table and not table[pid].state.startswith("Z")
                 for pid in kin if kin[pid][0] in roots or pid in roots
             )
             if not outstanding and time.monotonic() - exited_at >= CHILD_SETTLE_S:
@@ -258,9 +303,20 @@ def _detached_run(tag: str) -> dict:
     proc.wait()
     survivors = [pid for pid in roots if pid in _proc_table()]
     shutil.rmtree(home, ignore_errors=True)
+    groups: dict[str, dict] = {}
+    for pgid, name in roots.items():
+        members = [pid for pid in kin if kin[pid][0] == pgid]
+        first, last = span.get(pgid, (0.0, 0.0))
+        # Two roots can carry one name — UNNAMED does whenever two spawns both
+        # outran ps — and what the report wants under it is both of them.
+        acc = groups.setdefault(name, {"cpu_s": 0.0, "wall_s": 0.0, "procs": 0})
+        acc["cpu_s"] += sum(cpu_seen.get(pid, 0.0) for pid in members)
+        acc["wall_s"] = max(acc["wall_s"], last - first)
+        acc["procs"] += len(members)
     return {
         "returncode": proc.returncode,
         "detached": sorted(roots.values()),
+        "groups": groups,
         # A grandchild can outlive its first sighting by less than the one ps
         # call it takes to name it. Its parent is still known, and "one more
         # process under update_check" is the part of it this phase is counting.
@@ -300,6 +356,25 @@ def tally(names: list[str]) -> str:
     return ", ".join(n if c == 1 else f"{n} x{c}" for n, c in ordered) or "none"
 
 
+def fold_groups(runs: Iterable[dict[str, dict]]) -> dict[str, dict]:
+    """One entry per spawn name, each field the highest any run read for it.
+
+    Same reason the counts take the widest run: a sample can only miss CPU that
+    was spent, so between two readings of one group the larger is the nearer.
+    """
+    folded: dict[str, dict] = {}
+    for groups in runs:
+        for name, m in groups.items():
+            acc = folded.setdefault(name, {"cpu_s": 0.0, "wall_s": 0.0, "procs": 0})
+            for field, value in m.items():
+                acc[field] = max(acc[field], value)
+    return folded
+
+
+def total_cpu(groups: dict[str, dict]) -> float:
+    return sum(m["cpu_s"] for m in groups.values())
+
+
 def measure_detached(runs: int) -> dict:
     """The widest fan-out seen over *runs* cold renders.
 
@@ -314,6 +389,7 @@ def measure_detached(runs: int) -> dict:
         "runs": runs,
         "detached": widest["detached"],
         "descendants": widest["descendants"],
+        "groups": fold_groups(r["groups"] for r in observed),
         # Which spawns exist, as against how many one render was seen making.
         # A miss is the only error a sampler makes, so a name any run saw is a
         # name every run made — the counts above stay one render's.
@@ -423,6 +499,17 @@ def main() -> int:
         for r in rates
     ]
 
+    # The detached CPU is charged to the slow render that spawned it, not spread
+    # over every render: three of these run per interval, not per frame.
+    detached_j = None
+    if detached and detached["groups"]:
+        detached_cpu = total_cpu(detached["groups"])
+        detached_j = {
+            "cpu_s": detached_cpu,
+            "low": detached_cpu * CORE_W_LOW,
+            "high": detached_cpu * CORE_W_HIGH,
+        }
+
     result = {
         "full_render": full,
         "idle_power": idle,
@@ -432,6 +519,7 @@ def main() -> int:
         "scenarios": scenarios,
         "battery_wh": args.battery_wh,
         "detached_children": detached,
+        "joules_detached_est": detached_j,
     }
 
     if args.as_json:
@@ -458,6 +546,15 @@ def main() -> int:
         print(f"  {'spawned by those':<22} {len(detached['descendants']):>2}   {kin}")
         print(f"  {'peak live at once':<22} {detached['peak_live']:>2}   "
               "(sampled, the reaped tree included)")
+        if detached["groups"]:
+            print(f"  cost per group (highest of {detached['runs']}, cpu from ps at 10ms):")
+            for name, m in sorted(detached["groups"].items(), key=lambda kv: -kv[1]["cpu_s"]):
+                print(f"    {name:<22} cpu {m['cpu_s']:5.2f}s   wall {m['wall_s']:5.2f}s   "
+                      f"{m['procs']} proc")
+            if any(m["cpu_s"] < 0.005 or m["wall_s"] < 0.005 for m in detached["groups"].values()):
+                print("    a 0.00s reading is one sample tick, not a free process")
+            if "ccreport.push" in detached["groups"]:
+                print("    this push fails against a closed port; a real one costs more")
         if detached["failed_renders"]:
             print(f"  {detached['failed_renders']} of these renders exited non-zero — "
                   "the counts below them are not a render's")
@@ -479,6 +576,10 @@ def main() -> int:
     print(f"energy per render: ~{j_low:.1f}–{j_high:.1f} J "
           f"(cpu {cpu_s:.2f}s x {CORE_W_LOW:.0f}–{CORE_W_HIGH:.0f}W/core), "
           f"using {j_mid:.1f} J below")
+    if detached_j:
+        print(f"  plus detached: ~{detached_j['low']:.1f}–{detached_j['high']:.1f} J on a "
+              f"slow render (cpu {detached_j['cpu_s']:.2f}s), a floor, and not in the "
+              "scenarios below")
     print()
     print(f"hourly scenarios ({args.battery_wh:.0f}Wh battery):")
     for s in scenarios:
