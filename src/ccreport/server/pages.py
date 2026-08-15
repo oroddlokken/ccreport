@@ -140,6 +140,22 @@ def machine(request: Request, machine_id: str):
     return _machine_page(request, machine_id)
 
 
+@router.post("/settings/machines/{machine_id}/label")
+def rename_machine(request: Request, machine_id: str, label: str = Form("")):
+    """Name one machine, or clear the name back to its id.
+
+    The records are untouched: what changes is the string every server view
+    resolves a machine through, and the dashboard picks it up because
+    db.content_stamp reads the stamp this writes. An id nothing was minted for
+    is a 404 rather than a silent no-op, as the machine page already is.
+    """
+    conn = request.app.state.db.connect()
+    if not db.set_machine_label(conn, machine_id, label, time.time()):
+        raise HTTPException(status_code=404, detail=f"No machine {machine_id}.")
+    conn.commit()
+    return RedirectResponse(url="/settings/machines", status_code=303)
+
+
 @router.get("/settings/accounts", response_class=HTMLResponse)
 def accounts(request: Request):
     """Every account that has pushed, each row a field for the name to draw it under."""

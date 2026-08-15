@@ -227,6 +227,11 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   behind it and the dashboard's cache would otherwise keep drawing the email.
   An alias also filters: `db.accounts_with_alias` widens the account clause so a
   name typed off the dashboard selects what the email does
+- What it calls a machine is `machines.label`, typed on the /settings/machines
+  page and never touched by a push. `db.set_machine_label` stamps
+  `label_updated_at` for the same reason an alias stamps `updated_at`, and
+  `content_stamp` reads it; a blank field stores the machine_id rather than an
+  empty label, which every reader would draw as a machine with no name
 - Revoking a token stamps `revoked_at`; deleting it removes the row. Both stop
   the next push, and which one to reach for is whether the machine is still out
   there. `POST /settings/machines/{id}/delete` takes the machine, its tokens,

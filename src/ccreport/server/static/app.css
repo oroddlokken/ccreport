@@ -172,7 +172,10 @@ button.ghost:hover { color: var(--accent); border-color: var(--accent); }
 td.actions form { margin: 0; }
 
 form.rename { margin: 0; gap: .4rem; align-items: center; flex-wrap: nowrap; }
-form.rename input { min-width: 9rem; }
+/* Sized to a name rather than to the input's default 20 characters: the column
+   is last and takes the table's slack, and a field that grew with it read as
+   the row's main event next to the counts it sits beside. */
+form.rename input { width: 11rem; min-width: 0; padding: .3rem .5rem; }
 
 form.mint { display: block; }
 form.mint .fields { display: flex; gap: .75rem; flex-wrap: wrap; }
@@ -215,7 +218,9 @@ form.confirm input { flex: 1 1 12rem; }
 
 .hint { color: var(--dim); font-size: .75rem; line-height: 1.45; margin: .35rem 0 0; max-width: 64ch; }
 .hint.note { border-top: 1px solid var(--line); margin-top: 1rem; padding-top: .7rem; }
-.hint .mono { font-size: inherit; color: var(--text); }
+/* A command breaks across a line as "ccreport --" / "server", which reads as
+   two flags. */
+.hint .mono { font-size: inherit; color: var(--text); white-space: nowrap; }
 
 .command-box {
   background: var(--panel);

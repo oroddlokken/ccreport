@@ -30,12 +30,15 @@ script, and that script cannot add a column to a table it finds already there.
 _SCHEMA_SQL = """\
 -- A machine is what a token maps to and what a record is attributed to. The
 -- label is what the web UI shows and is free to change; machine_id is what
--- rows key on and never does.
+-- rows key on and never does. label_updated_at is when the label was last
+-- typed, which content_stamp reads: a rename has no push behind it, and
+-- without it the dashboard keeps drawing the old name until one arrives.
 CREATE TABLE IF NOT EXISTS machines (
-    machine_id TEXT PRIMARY KEY,
-    label      TEXT NOT NULL,
-    first_seen REAL NOT NULL,
-    last_seen  REAL NOT NULL
+    machine_id       TEXT PRIMARY KEY,
+    label            TEXT NOT NULL,
+    first_seen       REAL NOT NULL,
+    last_seen        REAL NOT NULL,
+    label_updated_at REAL
 ) WITHOUT ROWID;
 
 -- One token per machine, minted in the web UI and stored only as a hash: the
@@ -182,7 +185,21 @@ def row_to_record(row: tuple) -> dict:
     return rec
 
 
-MIGRATION_CHAIN: tuple[migrations.Step, ...] = ()
+def _add_label_updated_at(conn: sqlite3.Connection) -> None:
+    """Give an existing machines table the column content_stamp reads.
+
+    A database this build created has it from the CREATE script and reaches
+    here anyway, where a bare ALTER raises on the duplicate and takes the whole
+    bootstrap down with it.
+    """
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(machines)")]
+    if "label_updated_at" not in cols:
+        conn.execute("ALTER TABLE machines ADD COLUMN label_updated_at REAL")
+
+
+MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
+    migrations.Step(4, "machines.label_updated_at", _add_label_updated_at),
+)
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 
 Append only, one version above the last. A step that adds a column is what
@@ -369,6 +386,23 @@ def machine_tokens(conn: sqlite3.Connection, machine_id: str) -> list[dict]:
     ]
 
 
+def set_machine_label(conn: sqlite3.Connection, machine_id: str, label: str, now: float) -> bool:
+    """Rename a machine. False when nothing was minted under *machine_id*.
+
+    A blank *label* stores the machine_id itself rather than an empty string.
+    Every reader falls back to the id for a machine it has no label for, but a
+    row holding "" is a label, and the dashboard would draw a machine with no
+    name at all.
+
+    The stamp goes on with it, because a rename changes what every view draws
+    and no push follows it.
+    """
+    return conn.execute(
+        "UPDATE machines SET label = ?, label_updated_at = ? WHERE machine_id = ?",
+        (label.strip() or machine_id, now, machine_id),
+    ).rowcount > 0
+
+
 def account_aliases(conn: sqlite3.Connection) -> dict[str, str]:
     """Every alias set, keyed by account uuid.
 
@@ -460,6 +494,10 @@ def content_stamp(conn: sqlite3.Connection) -> tuple:
     showing the email until the next machine pushes. Setting or re-setting an
     alias moves the max, clearing one moves the count.
 
+    machines.label_updated_at is the same case for a renamed machine, and needs
+    one part rather than two: a rename writes the stamp whether it names the
+    machine or clears it back to the id, and the row itself outlives both.
+
     A rate arriving in exchange_rates is deliberately not in it: nothing here
     would notice a rate updated in place, and the NOK column it moves is
     re-derived on the next push or the next day anyway.
@@ -467,7 +505,8 @@ def content_stamp(conn: sqlite3.Connection) -> tuple:
     return conn.execute("""
         SELECT COUNT(*), COALESCE(MAX(updated_at), 0), COALESCE(SUM(n_records), 0),
                (SELECT COUNT(*) FROM account_aliases),
-               (SELECT COALESCE(MAX(updated_at), 0) FROM account_aliases)
+               (SELECT COALESCE(MAX(updated_at), 0) FROM account_aliases),
+               (SELECT COALESCE(MAX(label_updated_at), 0) FROM machines)
           FROM ingest_files
     """).fetchone()
 

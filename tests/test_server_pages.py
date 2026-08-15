@@ -414,6 +414,51 @@ class TestAccountsPage:
         assert gated.post("/settings/accounts/acct-1/alias", data={"alias": "x"}).status_code == 403
 
 
+class TestRenamingAMachine:
+    """The name a machine was minted under is not the one it keeps."""
+
+    def _push(self, client, **over):
+        """One record stamped now, so the dashboard's default range covers it."""
+        token = _token_from(_mint(client).text)
+        over.setdefault("ts", time.time())
+        return client.post(
+            "/v1/ingest", json=sf.batch([sf.record(**over)]), headers=sf.auth(token),
+        )
+
+    def test_the_table_offers_a_field_per_machine(self, client):
+        _mint(client)
+        body = client.get("/settings/machines").text
+        assert 'action="/settings/machines/laptop-1/label"' in body
+        assert 'value="Laptop"' in body
+
+    def test_a_rename_redraws_the_dashboard_without_a_push(self, client):
+        self._push(client)
+        resp = client.post("/settings/machines/laptop-1/label", data={"label": "workstation"})
+        assert resp.status_code == 200
+        body = client.get("/?by=machine").text
+        assert "workstation" in body
+        assert "Laptop" not in body
+
+    def test_clearing_it_puts_the_id_back(self, client):
+        _mint(client)
+        client.post("/settings/machines/laptop-1/label", data={"label": "  "})
+        assert "laptop-1" in client.get("/settings/machines").text
+
+    def test_the_merged_report_reads_the_same_name(self, client):
+        self._push(client)
+        client.post("/settings/machines/laptop-1/label", data={"label": "workstation"})
+        assert client.get("/v1/report/day").json()["machines"] == ["workstation"]
+
+    def test_a_machine_that_was_never_minted_is_a_404(self, client):
+        assert client.post(
+            "/settings/machines/ghost/label", data={"label": "x"}).status_code == 404
+
+    def test_a_disallowed_address_cannot_set_one(self, tmp_path):
+        gated = TestClient(create_app(sf.config(tmp_path, networks=sf.ELSEWHERE)))
+        assert gated.post(
+            "/settings/machines/laptop-1/label", data={"label": "x"}).status_code == 403
+
+
 class TestDeletingATokenAndAMachine:
     """Revoking is for a machine still out there; deleting is for a mistake."""
 

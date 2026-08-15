@@ -53,6 +53,11 @@ docker-up:
 docker-down:
     docker compose -f ./docker-compose.yml -p ccreport down
 
+# runs docker-down and docker-up
+docker-restart:
+    just docker-down
+    just docker-up
+
 # Every machine, token and pushed record in the local server database goes with
 # it. Each machine then needs a token minted again, and `ccreport push --full`
 # to resend what its watermark now considers already sent.

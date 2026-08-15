@@ -44,7 +44,7 @@ class TestSchema:
     @pytest.mark.parametrize(
         ("table", "cols"),
         [
-            ("machines", ["machine_id", "label", "first_seen", "last_seen"]),
+            ("machines", ["machine_id", "label", "first_seen", "last_seen", "label_updated_at"]),
             ("machine_tokens",
              ["token_hash", "machine_id", "created_at", "last_used_at", "revoked_at"]),
             ("ingest_files",
@@ -102,8 +102,11 @@ class TestSchema:
         def add_region(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE server_records ADD COLUMN region TEXT")
 
-        step = migrations.Step(db.MIGRATION_BASELINE + 1, "record region", add_region)
-        monkeypatch.setattr(db, "MIGRATION_CHAIN", (step,))
+        # One slot above the shipped chain, with that chain kept: the first
+        # connect applied it, and a fake step in a slot already stamped is a
+        # database at the head with nothing left to run.
+        step = migrations.Step(db.SCHEMA_VERSION + 1, "record region", add_region)
+        monkeypatch.setattr(db, "MIGRATION_CHAIN", (*db.MIGRATION_CHAIN, step))
         monkeypatch.setattr(db, "SCHEMA_VERSION", step.version)
 
         second = db.connect(path)
@@ -162,6 +165,21 @@ class TestMachinesAndTokens:
         db.upsert_machine(conn, "m1", "hostname-of-the-week", 200.0)
         row = conn.execute("SELECT label, first_seen, last_seen FROM machines").fetchone()
         assert row == ("laptop", 100.0, 200.0)
+
+    def test_a_rename_replaces_the_label_and_stamps_when(self, conn):
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        assert db.set_machine_label(conn, "m1", " workstation ", 700.0) is True
+        assert conn.execute(
+            "SELECT label, label_updated_at FROM machines").fetchone() == ("workstation", 700.0)
+
+    def test_a_blank_name_stores_the_id_rather_than_an_empty_label(self, conn):
+        """Every reader falls back to the id, but "" is a label and would draw as one."""
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        db.set_machine_label(conn, "m1", "   ", 700.0)
+        assert db.machine_label(conn, "m1") == "m1"
+
+    def test_naming_a_machine_that_was_never_minted_says_so(self, conn):
+        assert db.set_machine_label(conn, "never-minted", "laptop", 700.0) is False
 
     def test_a_token_resolves_to_its_own_machine(self, conn):
         db.upsert_machine(conn, "m1", "laptop", 100.0)
@@ -232,7 +250,7 @@ class TestContentStamp:
         db.replace_file_records(conn, "m1", path, mtime_ns, size, rows, now)
 
     def test_an_empty_database_stamps_without_raising(self, conn):
-        assert db.content_stamp(conn) == (0, 0, 0, 0, 0)
+        assert db.content_stamp(conn) == (0, 0, 0, 0, 0, 0)
 
     def test_naming_an_account_moves_it(self, conn):
         """A rename has no push behind it, and it changes every rendered name."""
@@ -248,6 +266,22 @@ class TestContentStamp:
         db.set_account_alias(conn, "acct-1", "personal", 700.0)
         named = db.content_stamp(conn)
         db.set_account_alias(conn, "acct-1", "", 800.0)
+        assert db.content_stamp(conn) != named
+
+    def test_renaming_a_machine_moves_it(self, conn):
+        """Same case as an account name: nothing pushes after a rename."""
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        self._push(conn, [db.record_to_row(_record())])
+        before = db.content_stamp(conn)
+        db.set_machine_label(conn, "m1", "workstation", 700.0)
+        assert db.content_stamp(conn) != before
+
+    def test_clearing_a_machine_name_moves_it_back_off(self, conn):
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        self._push(conn, [db.record_to_row(_record())])
+        db.set_machine_label(conn, "m1", "workstation", 700.0)
+        named = db.content_stamp(conn)
+        db.set_machine_label(conn, "m1", "", 800.0)
         assert db.content_stamp(conn) != named
 
     def test_reading_it_twice_gives_the_same_answer(self, conn):

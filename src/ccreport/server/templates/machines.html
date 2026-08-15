@@ -1,28 +1,40 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>Machines</h1>
+<p class="hint">The name shows instead of the machine id on the dashboard and in
+<span class="mono">ccreport --server</span>. Leave it empty to go back to the id.</p>
 {% if note %}<p class="notice">{{ note }}</p>{% endif %}
 
 {% if machines %}
 <table>
   <thead>
     <tr>
-      <th scope="col">Machine</th><th scope="col">ID</th><th scope="col">Last seen</th>
+      <th scope="col">Machine</th><th scope="col">Last seen</th>
       <th scope="col">Token last used</th><th scope="col" class="num">Records</th>
-      <th scope="col">Token</th>
+      <th scope="col">Token</th><th scope="col">Name</th>
     </tr>
   </thead>
   <tbody>
     {% for m in machines %}
     <tr>
-      <td><a href="/settings/machines/{{ m.machine_id | urlencode }}">{{ m.label }}</a></td>
-      <td class="mono dim">{{ m.machine_id }}</td>
+      <td class="mono">
+        <a href="/settings/machines/{{ m.machine_id | urlencode }}">{{ m.machine_id }}</a>
+      </td>
       <td data-ts="{{ m.last_seen or '' }}">{{ m.last_seen | when }}</td>
       <td data-ts="{{ m.last_used_at or '' }}">{{ m.last_used_at | when }}</td>
       <td class="num" data-int="{{ m.records }}">{{ "{:,}".format(m.records) }}</td>
       <td>
         {% if m.active_tokens %}<span class="ok">active</span>
         {% else %}<span class="off">revoked</span>{% endif %}
+      </td>
+      <td>
+        <form method="post" action="/settings/machines/{{ m.machine_id | urlencode }}/label"
+              class="rename">
+          <input name="label" value="{{ m.label }}" autocomplete="off"
+                 aria-label="Name for {{ m.machine_id }}"
+                 placeholder="{{ m.machine_id }}">
+          <button type="submit" class="ghost">Save</button>
+        </form>
       </td>
     </tr>
     {% endfor %}
