@@ -9,6 +9,7 @@ import os
 import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -1980,6 +1981,17 @@ class TestSanityCheck:
         cache_db._sanity_check(snapshotted)
         assert capsys.readouterr().err == ""
 
+    def test_a_compressed_snapshot_is_never_the_one_it_opens(self, snapshotted, capsys):
+        """Two COUNT(*) queries do not justify decompressing a whole snapshot."""
+        snaps = Path(os.environ["CLAUDE_CACHE_SNAPSHOT_DIR"])
+        (snaps / "2020-01-01.db.xz").write_bytes(b"not a database")
+        snapshotted.execute("DELETE FROM ccreport_records")
+        snapshotted.commit()
+        cache_db._sanity_check(snapshotted)
+        err = capsys.readouterr().err
+        assert ".db.xz" not in err
+        assert "Restore with:   cp " in err
+
     def test_a_cost_wipe_warns_though_the_row_count_holds(self, snapshotted, capsys):
         snapshotted.execute("UPDATE ccreport_records SET cost = NULL")
         snapshotted.commit()
@@ -2230,6 +2242,188 @@ class TestDailySnapshot:
         path, fresh = cache_db._maybe_snapshot(cast("sqlite3.Connection", recorder))
         assert (path, fresh) == (self._today(snaps), False)
         assert recorder.calls == []
+
+
+class TestSnapshotRetention:
+    """Recent copies stay daily; older ones thin to the last day of each week.
+
+    The bands are read off the file names, so these cases carry their own clock
+    and none of them depends on the day the suite runs.
+    """
+
+    @staticmethod
+    def _drop(names, keep=7, weeks=7):
+        paths = [Path(f"/snaps/{n}.db") for n in names]
+        return [p.name[:-3] for p in cache_db._snapshots_to_drop(paths, keep, weeks)]
+
+    @staticmethod
+    def _run(start, end):
+        """Every date from *start* to *end* inclusive, as YYYY-MM-DD."""
+        first = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=UTC)
+        last = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=UTC)
+        span = (last - first).days
+        return [(first + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(span + 1)]
+
+    def test_a_short_history_loses_nothing(self):
+        assert self._drop(self._run("2026-08-10", "2026-08-15")) == []
+
+    def test_the_newest_keep_files_stay_daily(self):
+        # 2026-08-09 is a Sunday, so 08-09..08-15 spans two ISO weeks.
+        assert set(self._drop(self._run("2026-08-03", "2026-08-15"))) == set(
+            self._run("2026-08-03", "2026-08-08")
+        )
+
+    def test_a_daily_that_ages_out_becomes_its_weeks_keeper(self):
+        """The boundary day: 08-09 ends ISO week 32 and leaves the daily band."""
+        dropped = self._drop(self._run("2026-08-03", "2026-08-16"))
+        assert "2026-08-09" not in dropped
+        assert set(dropped) == set(self._run("2026-08-03", "2026-08-08"))
+
+    def test_a_week_is_kept_by_its_last_day_not_its_first(self):
+        """Otherwise the keeper walks forward a file at a time as days age out."""
+        assert self._drop(self._run("2026-08-03", "2026-08-23"), keep=3) == [
+            *self._run("2026-08-03", "2026-08-08"),
+            *self._run("2026-08-10", "2026-08-15"),
+            *self._run("2026-08-17", "2026-08-20"),
+        ]
+
+    def test_the_weekly_bound_drops_the_oldest_weeks(self):
+        mondays = self._run("2026-05-04", "2026-06-22")[::7]
+        assert self._drop(mondays, keep=1, weeks=3) == mondays[:5]
+
+    def test_zero_weeks_keeps_the_dailies_alone(self):
+        days = self._run("2026-08-03", "2026-08-15")
+        assert self._drop(days, keep=2, weeks=0) == days[:-2]
+
+    def test_a_file_that_is_not_a_date_is_left_alone(self):
+        """Nothing here put it there, so nothing here removes it."""
+        names = [*self._run("2026-08-03", "2026-08-15"), "2026-13-45"]
+        assert "2026-13-45" not in self._drop(names, keep=1, weeks=0)
+
+    def test_the_weekly_bound_comes_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_WEEKS", "3")
+        assert cache_db._snapshot_weeks() == 3
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_WEEKS", "not a number")
+        assert cache_db._snapshot_weeks() == cache_db._SNAPSHOT_WEEKS_DEFAULT
+
+    def test_rotation_applies_the_thinning(self, tmp_path, monkeypatch):
+        snaps = tmp_path / "snaps"
+        snaps.mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_DIR", str(snaps))
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_KEEP", "2")
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_WEEKS", "1")
+        monkeypatch.delenv("CLAUDE_CACHE_SNAPSHOT_DISABLE", raising=False)
+        for name in self._run("2026-08-03", "2026-08-09"):
+            (snaps / f"{name}.db").write_bytes(b"old")
+        recorder = _BackupRecorder()
+        _path, fresh = cache_db._maybe_snapshot(cast("sqlite3.Connection", recorder))
+        assert fresh
+        today = datetime.now(tz=UTC).strftime("%Y-%m-%d")
+        assert sorted(p.name for p in snaps.glob("*.db")) == sorted(
+            ["2026-08-09.db", f"{today}.db"]
+        )
+
+
+class TestSnapshotCompression:
+    """Rotated snapshots become .db.xz; the two newest stay readable files."""
+
+    @pytest.fixture
+    def snaps(self, tmp_path, monkeypatch):
+        snaps = tmp_path / "snaps"
+        snaps.mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_DIR", str(snaps))
+        monkeypatch.delenv("CLAUDE_CACHE_SNAPSHOT_DISABLE", raising=False)
+        monkeypatch.setattr(cache_db, "DB_PATH", tmp_path / "cache.db")
+        return snaps
+
+    @staticmethod
+    def _names(snaps):
+        return sorted(p.name for p in snaps.iterdir())
+
+    def test_the_newest_two_stay_plain_and_the_rest_compress(self, snaps):
+        for day in range(3, 8):
+            (snaps / f"2026-08-0{day}.db").write_bytes(b"page" * 4096)
+        cache_db._rotate_snapshots(snaps)
+        assert self._names(snaps) == [
+            "2026-08-03.db.xz",
+            "2026-08-04.db.xz",
+            "2026-08-05.db.xz",
+            "2026-08-06.db",
+            "2026-08-07.db",
+        ]
+
+    def test_the_boundary_day_compresses_exactly_one_file(self, snaps):
+        """The day a plain snapshot becomes a compressed one."""
+        (snaps / "2026-08-05.db.xz").write_bytes(b"already")
+        for day in (6, 7):
+            (snaps / f"2026-08-0{day}.db").write_bytes(b"page" * 4096)
+        cache_db._rotate_snapshots(snaps)
+        assert self._names(snaps) == ["2026-08-05.db.xz", "2026-08-06.db", "2026-08-07.db"]
+        (snaps / "2026-08-08.db").write_bytes(b"page" * 4096)
+        cache_db._rotate_snapshots(snaps)
+        assert self._names(snaps) == [
+            "2026-08-05.db.xz",
+            "2026-08-06.db.xz",
+            "2026-08-07.db",
+            "2026-08-08.db",
+        ]
+
+    def test_both_kinds_are_one_series_for_retention(self, snaps, monkeypatch):
+        """A compressed file counts against keep, or the series never shortens."""
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_KEEP", "3")
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_WEEKS", "0")
+        for day in (3, 4, 5):
+            (snaps / f"2026-08-0{day}.db.xz").write_bytes(b"old")
+        for day in (6, 7, 8):
+            (snaps / f"2026-08-0{day}.db").write_bytes(b"page" * 4096)
+        cache_db._rotate_snapshots(snaps)
+        assert self._names(snaps) == ["2026-08-06.db.xz", "2026-08-07.db", "2026-08-08.db"]
+
+    def test_a_compressed_snapshot_restores_to_the_original_bytes(self, snaps):
+        import lzma
+
+        body = bytes(range(256)) * 800
+        for day in (3, 4, 5):
+            (snaps / f"2026-08-0{day}.db").write_bytes(body)
+        cache_db._rotate_snapshots(snaps)
+        with lzma.open(snaps / "2026-08-03.db.xz") as restored:
+            assert restored.read() == body
+
+    def test_rotation_takes_the_sidecars_with_the_snapshot(self, snaps, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_KEEP", "1")
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_WEEKS", "0")
+        for day in (3, 4):
+            (snaps / f"2026-08-0{day}.db").write_bytes(b"page" * 4096)
+            (snaps / f"2026-08-0{day}.db-shm").write_bytes(b"shm")
+            (snaps / f"2026-08-0{day}.db-wal").write_bytes(b"wal")
+        cache_db._rotate_snapshots(snaps)
+        assert self._names(snaps) == ["2026-08-04.db", "2026-08-04.db-shm", "2026-08-04.db-wal"]
+
+    def test_sidecars_left_by_an_earlier_rotation_are_swept(self, snaps):
+        """11 of these were on the machine, the oldest for a long-gone .db."""
+        (snaps / "2026-07-06.db-shm").write_bytes(b"shm")
+        (snaps / "2026-07-06.db-wal").write_bytes(b"wal")
+        (snaps / "2026-08-07.db").write_bytes(b"page" * 4096)
+        cache_db._rotate_snapshots(snaps)
+        assert self._names(snaps) == ["2026-08-07.db"]
+
+    def test_a_failed_compression_leaves_the_plain_file(self, snaps, monkeypatch):
+        for day in (3, 4, 5):
+            (snaps / f"2026-08-0{day}.db").write_bytes(b"page" * 4096)
+
+        def boom(*_a, **_k):
+            raise OSError("no space")
+
+        monkeypatch.setattr(Path, "open", boom)
+        cache_db._rotate_snapshots(snaps)
+        assert "2026-08-03.db" in self._names(snaps)
+        assert not list(snaps.glob("*.tmp"))
+
+    def test_the_restore_hint_matches_the_format_it_points_at(self, snaps):
+        assert cache_db._restore_hint(snaps / "2026-08-04.db").startswith("cp ")
+        compressed = cache_db._restore_hint(snaps / "2026-08-03.db.xz")
+        assert "lzma" in compressed
+        assert not compressed.startswith("cp ")
 
 
 class TestAccountEvents:

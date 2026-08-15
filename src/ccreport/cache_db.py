@@ -17,7 +17,7 @@ import sqlite3
 import sys
 import time
 from collections.abc import Callable, Iterable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from itertools import groupby
 from operator import itemgetter
 from pathlib import Path
@@ -34,7 +34,27 @@ DB_PATH = _CACHE_DIR / "cache.db"
 # Snapshots live outside ~/.cache so aggressive cache cleanup can't take out
 # the live DB and all its backups in one sweep.
 _DEFAULT_SNAPSHOT_DIR = Path.home() / ".local" / "share" / "ccreport" / "snapshots"
-_SNAPSHOT_KEEP_DEFAULT = 14
+
+# Retention is two bands: the newest _SNAPSHOT_KEEP_DEFAULT snapshots stay one
+# per day, and older ones thin to the last snapshot of each ISO week,
+# _SNAPSHOT_WEEKS_DEFAULT of those. A copy is the whole DB, so history costs
+# files rather than days — 7 + 7 reaches back two months for what 14 dailies
+# spent on two weeks.
+_SNAPSHOT_KEEP_DEFAULT = 7
+_SNAPSHOT_WEEKS_DEFAULT = 7
+
+# Rotated snapshots are stored compressed. SQLite pages give about ten to one at
+# lzma preset 1, which beat both zstd -3 and gzip -6 on a real 163 MB snapshot
+# and needs no binary off PATH.
+_SNAPSHOT_GLOB = "????-??-??.db"
+_SNAPSHOT_XZ_SUFFIX = ".xz"
+_SNAPSHOT_XZ_PRESET = 1
+
+# How many of the newest snapshots stay readable .db files. Two, because
+# _sanity_check opens the newest one from a *prior* day for two COUNT(*)
+# queries, and today's own copy sits above it — decompressing 163 MB to count
+# rows would land on every migrate and every day's snapshot run.
+_SNAPSHOT_PLAIN = 2
 
 # Where the cache and its snapshots lived while this tooling was a directory in
 # the macsetup repo. relocate_legacy_paths() below moves them the first time a
@@ -851,7 +871,9 @@ the corpus.
 #
 # One daily snapshot of the live DB, written with SQLite's online backup API so
 # WAL-mode writers can't corrupt it, into a directory outside ~/.cache/ where a
-# cache-cleanup sweep can't take the backups out with the original.
+# cache-cleanup sweep can't take the backups out with the original. Rotation
+# keeps the recent copies one per day, thins the rest to one per ISO week, and
+# stores everything below the newest two as .db.xz.
 #
 # The sanity guard rides that same once-a-day cadence, plus any run that
 # migrated: it compares the irreplaceable ccreport_records against the most
@@ -860,7 +882,9 @@ the corpus.
 #
 # Env overrides:
 #   CLAUDE_CACHE_SNAPSHOT_DIR       — destination directory
-#   CLAUDE_CACHE_SNAPSHOT_KEEP      — retention count (default 14)
+#   CLAUDE_CACHE_SNAPSHOT_KEEP      — daily snapshots kept (default 7)
+#   CLAUDE_CACHE_SNAPSHOT_WEEKS     — weekly snapshots kept past those
+#                                     (default 7; 0 keeps the dailies alone)
 #   CLAUDE_CACHE_SNAPSHOT_DISABLE=1 — skip snapshots entirely
 #   CLAUDE_CACHE_SNAPSHOT_DEFER=1   — skip only the daily one; leave it to a
 #                                     process that isn't on a render path
@@ -881,6 +905,131 @@ def _snapshot_keep() -> int:
         return max(1, int(raw))
     except ValueError:
         return _SNAPSHOT_KEEP_DEFAULT
+
+
+def _snapshot_weeks() -> int:
+    raw = os.environ.get("CLAUDE_CACHE_SNAPSHOT_WEEKS")
+    if not raw:
+        return _SNAPSHOT_WEEKS_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _SNAPSHOT_WEEKS_DEFAULT
+
+
+def _snapshot_date(path: Path) -> date | None:
+    """The calendar day a snapshot file is named for, or None if it isn't one."""
+    try:
+        return datetime.strptime(path.name[:10], "%Y-%m-%d").replace(tzinfo=UTC).date()
+    except ValueError:
+        return None
+
+
+def _snapshots_to_drop(snapshots: Iterable[Path], keep: int, weeks: int) -> list[Path]:
+    """Which of *snapshots*, oldest first, retention no longer covers.
+
+    The newest *keep* files survive as dailies. Past them one file per ISO week
+    survives, for the newest *weeks* weeks, and it is the week's last day even
+    while that day is still inside the daily band — otherwise a week's keeper
+    would walk forward one file at a time as its days aged out, writing off a
+    Monday only to adopt the Tuesday behind it. A file whose name is not a date
+    is left alone, since nothing here put it there.
+    """
+    dated = [(d, p) for p in snapshots if (d := _snapshot_date(p)) is not None]
+    dated.sort()
+    daily = {p for _d, p in dated[max(0, len(dated) - keep) :]} if keep else set()
+    last_of_week: dict[tuple[int, int], Path] = {}
+    for d, p in dated:
+        last_of_week[d.isocalendar()[:2]] = p
+    keepers = list(last_of_week.values())
+    weekly = set(keepers[max(0, len(keepers) - weeks) :]) if weeks else set()
+    return [p for _d, p in dated if p not in daily and p not in weekly]
+
+
+def _snapshots_to_compress(snapshots: Iterable[Path], plain: int) -> list[Path]:
+    """Which surviving snapshots, oldest first, are still plain and shouldn't be.
+
+    Compression is a rotation step rather than a write-time one: the day's copy
+    already writes the whole DB, and compressing in the same pass would add a
+    second read and write of those bytes to that one run.
+    """
+    dated = [(d, p) for p in snapshots if (d := _snapshot_date(p)) is not None]
+    dated.sort()
+    older = dated[: max(0, len(dated) - plain)]
+    return [p for _d, p in older if p.suffix != _SNAPSHOT_XZ_SUFFIX]
+
+
+def _sidecars(snapshot: Path) -> tuple[Path, Path]:
+    """The -shm and -wal files a read-only open leaves beside a snapshot."""
+    return (
+        snapshot.with_name(snapshot.name + "-shm"),
+        snapshot.with_name(snapshot.name + "-wal"),
+    )
+
+
+def _drop_snapshot(snapshot: Path) -> None:
+    """Remove a snapshot and the sidecars a reader created beside it.
+
+    Unlinking the .db alone leaves the pair orphaned for good: nothing later
+    globs for a date whose snapshot has already gone.
+    """
+    for path in (snapshot, *_sidecars(snapshot)):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _compress_snapshot(snapshot: Path) -> None:
+    """Rewrite one rotated snapshot as .db.xz and remove the plain file."""
+    # lzma and shutil are imported here rather than at module scope: cache_db is
+    # deferred out of the statusline's render path, and this runs once a day.
+    import lzma
+    import shutil
+
+    target = snapshot.with_name(snapshot.name + _SNAPSHOT_XZ_SUFFIX)
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        with (
+            snapshot.open("rb") as src,
+            lzma.open(tmp, "wb", preset=_SNAPSHOT_XZ_PRESET) as dst,
+        ):
+            shutil.copyfileobj(src, dst, length=1 << 20)
+        tmp.replace(target)
+    except (OSError, lzma.LZMAError):
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+    _drop_snapshot(snapshot)
+
+
+def _sweep_sidecars(snap_dir: Path) -> None:
+    """Remove -shm and -wal files whose snapshot is gone."""
+    for suffix in ("-shm", "-wal"):
+        for orphan in snap_dir.glob(_SNAPSHOT_GLOB + suffix):
+            if orphan.with_name(orphan.name[: -len(suffix)]).exists():
+                continue
+            try:
+                orphan.unlink()
+            except OSError:
+                pass
+
+
+def _rotate_snapshots(snap_dir: Path) -> None:
+    """Thin, compress and tidy the snapshot directory. One series, two formats."""
+    snapshots = [
+        *snap_dir.glob(_SNAPSHOT_GLOB),
+        *snap_dir.glob(_SNAPSHOT_GLOB + _SNAPSHOT_XZ_SUFFIX),
+    ]
+    dropped = _snapshots_to_drop(snapshots, _snapshot_keep(), _snapshot_weeks())
+    for old in dropped:
+        _drop_snapshot(old)
+    survivors = [p for p in snapshots if p not in set(dropped)]
+    for stale in _snapshots_to_compress(survivors, _SNAPSHOT_PLAIN):
+        _compress_snapshot(stale)
+    _sweep_sidecars(snap_dir)
 
 
 def _today_utc() -> str:
@@ -1035,13 +1184,7 @@ def _maybe_snapshot(conn: sqlite3.Connection) -> tuple[Path | None, bool]:
             pass
         return None, False
     try:
-        snapshots = sorted(snap_dir.glob("????-??-??.db"))
-        keep = _snapshot_keep()
-        for old in snapshots[:-keep]:
-            try:
-                old.unlink()
-            except OSError:
-                pass
+        _rotate_snapshots(snap_dir)
     except OSError:
         pass
     return target, True
@@ -1078,6 +1221,16 @@ _SANITY_DROP_THRESHOLD_PCT = 10.0
 _SANITY_MIN_PRIOR_COUNT = 100
 
 
+def _restore_hint(snapshot: Path) -> str:
+    """A command that puts *snapshot* back at DB_PATH, in the format it is in."""
+    if snapshot.suffix == _SNAPSHOT_XZ_SUFFIX:
+        return (
+            f'python3 -c "import lzma,shutil;shutil.copyfileobj('
+            f"lzma.open('{snapshot}'),open('{DB_PATH}','wb'))\""
+        )
+    return f"cp '{snapshot}' '{DB_PATH}'"
+
+
 def _warn_on_drop(label: str, prev: int, cur: int, snapshot: Path) -> None:
     """Report a material drop in one aggregate against the prior snapshot.
 
@@ -1093,7 +1246,7 @@ def _warn_on_drop(label: str, prev: int, cur: int, snapshot: Path) -> None:
         f"cache.db lost ccreport_records {label}: "
         f"{drop_pct:.1f}% drop ({prev} -> {cur}).\n"
         f"  Prior snapshot: {snapshot}\n"
-        f"  Restore with:   cp '{snapshot}' '{DB_PATH}'"
+        f"  Restore with:   {_restore_hint(snapshot)}"
     )
 
 
@@ -1122,7 +1275,9 @@ def _sanity_check(conn: sqlite3.Connection) -> None:
     if not snap_dir.is_dir():
         return
     today_name = f"{_today_utc()}.db"
-    snapshots = sorted(snap_dir.glob("????-??-??.db"))
+    # The plain glob only: _SNAPSHOT_PLAIN keeps a readable prior day at the top
+    # of the series so these two counts never decompress a whole snapshot.
+    snapshots = sorted(snap_dir.glob(_SNAPSHOT_GLOB))
     prior = [s for s in snapshots if s.name != today_name]
     if not prior:
         return
