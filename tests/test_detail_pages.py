@@ -155,6 +155,18 @@ class TestScoping:
         assert dashboard.cached_build(app.state.db, 30) is first
 
 
+class TestTheTableStack:
+    def test_model_comes_before_account(self, client):
+        """Which model billed it is the first question a project page is opened with."""
+        body = client.get("/project/infrastructure").text
+        assert body.index("By model") < body.index("By account")
+
+    def test_each_table_is_clipped(self, client):
+        """Four stack here, and an all-time day table would otherwise be the page."""
+        body = client.get("/project/infrastructure").text
+        assert body.count('class="table-clip"') == len(dashboard.SCOPES) - 1
+
+
 def _total(body: str) -> float:
     figure = re.search(r'<div class="figure"[^>]*>\$([\d,.]+)</div>', body)
     assert figure, "the page carries no headline figure"

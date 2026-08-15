@@ -47,6 +47,7 @@
 {% for dimension in dimensions %}
 <section>
   <div class="chart-head"><h2>By {{ dimension }}</h2></div>
+  <div class="table-clip">
   <table class="breakdown">
     <thead>
       <tr>
@@ -69,6 +70,7 @@
       {% endfor %}
     </tbody>
   </table>
+  </div>
 </section>
 {% endfor %}
 

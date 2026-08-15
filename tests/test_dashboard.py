@@ -444,6 +444,24 @@ class TestPage:
         assert TestClient(gated).get("/").status_code == 403
 
 
+class TestSortableTables:
+    """Every page's tables re-order on a click; the script is what does it."""
+
+    @pytest.mark.parametrize("path", ["/", "/settings/machines", "/settings/accounts",
+                                      "/model/claude-haiku-4-5"])
+    def test_the_page_loads_the_sort_script(self, client, path):
+        assert "/static/sort.js" in client.get(path).text
+
+    def test_it_loads_after_format_js(self, client):
+        """The listener registered second runs second, on the text format.js left."""
+        body = client.get("/").text
+        assert body.index("/static/format.js") < body.index("/static/sort.js")
+
+    def test_the_dashboard_breakdown_is_not_clipped(self, client):
+        """One table is on that page at a time, so the window scrolls it."""
+        assert "table-clip" not in client.get("/").text
+
+
 class TestNoExternalOrigin:
     """The page has to draw on a laptop with no internet."""
 

@@ -90,6 +90,35 @@ th, td { padding: .5rem .75rem; text-align: left; border-bottom: 1px solid var(-
 tbody tr:last-child td { border-bottom: none; }
 th { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); font-weight: 600; }
 td a { color: var(--accent); text-decoration: none; }
+
+/* sort.js moves each sortable header's label into a button, because a th is
+   neither focusable nor announced as a control. The padding moves with it so
+   the whole cell stays the click target. */
+th.sortable { padding: 0; }
+th.sortable button.sort {
+  display: flex;
+  align-items: baseline;
+  gap: .35rem;
+  width: 100%;
+  padding: .5rem .75rem;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  color: inherit;
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+th.sortable.num button.sort { justify-content: flex-end; }
+/* The arrow keeps its width while hidden, so the first click does not shift
+   the header it was aimed at. */
+button.sort::after { content: "\25B2"; font-size: .7em; opacity: 0; }
+button.sort:hover { color: var(--text); }
+button.sort:hover::after { opacity: .4; }
+th[aria-sort] button.sort { color: var(--text); }
+th[aria-sort] button.sort::after { opacity: 1; }
+th[aria-sort="descending"] button.sort::after { content: "\25BC"; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .mono { font-family: var(--mono); font-size: .85rem; }
 .dim { color: var(--dim); }
@@ -125,7 +154,7 @@ button {
   font-weight: 600;
   cursor: pointer;
 }
-button:not(.ghost):not(.danger):hover { filter: brightness(1.1); }
+button:not(.ghost):not(.danger):not(.sort):hover { filter: brightness(1.1); }
 button.danger { background: transparent; color: var(--off); border: 1px solid var(--off); font-weight: 500; }
 button.ghost {
   background: transparent;
@@ -264,11 +293,15 @@ main a.toggle:hover { text-decoration: none; }
 .tile-sub { font-size: .75rem; }
 
 table.breakdown { margin-top: .5rem; }
-/* The breakdown has no row cap server-side; the clip is what keeps a month of
-   many models inside the no-scroll budget the rest of the page fits. */
-.breakdown-clip { max-height: 17rem; overflow-y: auto; margin-top: .5rem; }
-.breakdown-clip table.breakdown { margin-top: 0; }
-.breakdown-clip thead th { position: sticky; top: 0; background: var(--panel); }
+/* The dashboard shows one breakdown at a time and the page below it is empty,
+   so that table runs to its last row and the window does the scrolling. */
+.breakdown-clip { margin-top: .5rem; }
+/* Where several tables stack on one page, each is capped instead. 40.5rem is
+   15 body rows (1rem padding + 1.55 x .9375rem line + 1px border each) under
+   the 2.3rem sticky header; a 16th row is what starts the scrollbar. */
+.table-clip { max-height: 40.5rem; overflow-y: auto; margin-top: .5rem; }
+.breakdown-clip table.breakdown, .table-clip table.breakdown { margin-top: 0; }
+.table-clip thead th { position: sticky; top: 0; background: var(--panel); }
 
 /* Two plots per row where the window allows it, so a reader compares cost
    against what the tokens under it were doing without scrolling between them. */

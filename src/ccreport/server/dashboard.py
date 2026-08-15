@@ -33,9 +33,11 @@ DIMENSIONS = ("model", "day", "project", "machine")
 METRICS = ("cost", "tokens")
 """Which series the chart draws. Both are in the payload either way."""
 
-SCOPES = ("account", *DIMENSIONS)
-"""What a detail page can be about. One more than the dashboard's tabs: the
-accounts have a column of their own there rather than a table."""
+SCOPES = ("model", "account", *(name for name in DIMENSIONS if name != "model"))
+"""What a detail page can be about, in the order that page stacks its tables.
+One more than the dashboard's tabs: the accounts have a column of their own
+there rather than a table. Model leads, because which model was billed is the
+first question a page about one project or one day is opened with."""
 
 TRACE_LIMIT = 6
 """Series per chart before the rest fold into one. Past this the eye is reading

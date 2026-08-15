@@ -6,6 +6,9 @@
   <title>{% block title %}ccreport{% endblock %}</title>
   <link rel="stylesheet" href="{{ asset('app.css') }}">
   <script src="{{ asset('format.js') }}"></script>
+  <!-- After format.js, whose listener therefore runs first: a column with no
+       raw value sorts the text a reader sees. -->
+  <script src="{{ asset('sort.js') }}"></script>
   {% block head %}{% endblock %}
 </head>
 <body>
