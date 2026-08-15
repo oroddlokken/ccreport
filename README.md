@@ -137,6 +137,39 @@ The week gets a pace line comparing usage against elapsed time.
 from whichever weekday the window starts on. It defaults to 7, and both this
 and the status line's pace segment answer to it.
 
+## The dashboard
+
+![the merged spend dashboard: per-account totals, a daily cost chart, token tiles and a per-model breakdown](assets/dashboard.png)
+
+One machine runs a server and every machine pushes its records to it, so the
+dashboard reports spend across all of them. The server prices each record with
+its own copy of the pricing table rather than trusting what arrived.
+
+```bash
+just serve      # http://127.0.0.1:8787
+```
+
+`CCREPORT_SERVER_DB`, `_HOST`, `_PORT`, `_NETWORKS` and `_MAX_BODY` configure
+it; there is no config file. `_NETWORKS` defaults to loopback and gates the web
+UI alone — a machine pushes from wherever it happens to be, and its token is
+what admits it.
+
+Mint a token under `/settings/machines`. That page shows it once, inside the
+command that consumes it:
+
+```bash
+ccreport server connect http://host:8787 --token TOKEN
+ccreport server status                      # what each server knows this machine as
+ccreport server push                        # the status line also pushes on its own interval
+ccreport --server http://host:8787          # the merged reports, in the terminal
+```
+
+The token and the push policy land in `~/.config/ccreport/push.toml` at mode
+0600. `--opt-in-repos work,ccreport` restricts that policy to the named
+projects: every other project still sends its counts, but its name, session,
+cwd and repo are stripped before the push and report as one aggregated row per
+account.
+
 ## Install
 
 ```bash
