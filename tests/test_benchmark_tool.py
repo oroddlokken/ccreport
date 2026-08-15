@@ -108,16 +108,36 @@ class TestDetachedChildren:
         assert (ppid, pgid) == (os.getppid(), os.getpgid(0))
         assert state
 
+    def test_the_marker_is_scoped_to_one_run(self, bench):
+        """A `just bench` running beside the suite is two watches, not one."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            env=dict(os.environ, **{bench.BENCH_RUN_ENV: "mine"}),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            assert bench._describe(proc.pid, "mine")[1]
+            assert not bench._describe(proc.pid, "theirs")[1]
+        finally:
+            proc.kill()
+            proc.wait()
+
     @pytest.mark.slow
     def test_a_cold_render_is_seen_spawning_all_three(self, bench):
         """The three spawns are interval-gated, so only a render against a cold
         HOME makes them at all — which is what this phase exists to arrange.
         """
-        # Two renders, not one: ps is a sampler, and measure_detached reports
-        # the run that saw the most.
+        # Two renders and their union, not one run's list: ps samples, and a
+        # spawn that lives and dies between two of them is missed by the run
+        # that made it. The push is the one this happened to — it dies against
+        # a closed port — and a third render costs the suite more than the
+        # union of two leaves on the table.
         seen = bench.measure_detached(2)
+        expected = {"ccreport.usage_api", "ccreport.update_check", "ccreport.push"}
         assert seen["failed_renders"] == 0
-        assert set(seen["detached"]) == {
-            "ccreport.usage_api", "ccreport.update_check", "ccreport.push",
-        }
+        assert expected <= set(seen["seen"])
+        # Any other name is a fourth spawn and belongs in the report. UNNAMED
+        # is not one: it is a root that exited before ps could print its
+        # command, which is the same sampling miss one line up allows for.
+        assert set(seen["seen"]) - expected <= {bench.UNNAMED}
         assert seen["peak_live"] >= 3

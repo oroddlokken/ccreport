@@ -134,11 +134,15 @@ def _proc_table() -> dict[int, tuple[int, int, str]]:
     return table
 
 
-def _describe(pid: int) -> tuple[str, bool]:
+def _describe(pid: int, tag: str = "") -> tuple[str, bool]:
     """(command line, carries our marker) for one pid, ("", False) once it is gone.
 
     One pid per call: ps -p prints nothing at all when any pid in a list has
     already exited, and every pid here is a process that may exit mid-poll.
+
+    *tag* narrows the marker to one run's spawns. Two runs overlap whenever the
+    suite watches a render while `just bench` is doing the same, and each was
+    otherwise free to adopt the other's children and report them twice.
     """
     proc = subprocess.run(
         ["ps", "-Ewww", "-p", str(pid), "-o", "command="], capture_output=True, text=True,
@@ -149,7 +153,7 @@ def _describe(pid: int) -> tuple[str, bool]:
     # -E appends the environment to the command; cut at the first VAR= token so
     # the report shows the command and not a screenful of exported variables.
     cut = _ENV_TOKEN.search(raw)
-    return (raw[: cut.start()] if cut else raw), f"{BENCH_RUN_ENV}=" in raw
+    return (raw[: cut.start()] if cut else raw), f"{BENCH_RUN_ENV}={tag}" in raw
 
 
 def _bench_home() -> str:
@@ -211,9 +215,13 @@ def _detached_run(tag: str) -> dict:
             if pgid == proc.pid:
                 kin[pid] = (pgid, UNNAMED)     # the reaped tree: counted, never named
             elif pgid == pid and ppid == proc.pid:
-                roots[pid] = UNNAMED
-                kin[pid] = (pgid, UNNAMED)
-                to_name.append(pid)
+                # Named here rather than in the batch below, which runs a ps
+                # per pid after the whole table has been walked: the push is
+                # the shortest-lived of the three spawns and was reaching that
+                # batch already dead, landing in the report as "(exited)".
+                cmd, _ = _describe(pid, tag)
+                roots[pid] = label_of(cmd)
+                kin[pid] = (pgid, roots[pid])
             elif pgid in roots:
                 kin[pid] = (pgid, UNNAMED)
                 to_name.append(pid)
@@ -221,16 +229,14 @@ def _detached_run(tag: str) -> dict:
                 tested.add(pid)                # a leader met after the render exited
                 to_test.append(pid)
         for pid in to_test:
-            cmd, marked = _describe(pid)
+            cmd, marked = _describe(pid, tag)
             if marked:
                 roots[pid] = label_of(cmd)
                 kin[pid] = (pid, label_of(cmd))
         for pid in to_name:
-            cmd, _ = _describe(pid)
+            cmd, _ = _describe(pid, tag)
             if cmd:
                 kin[pid] = (kin[pid][0], label_of(cmd))
-                if pid in roots:
-                    roots[pid] = label_of(cmd)
         # Concurrency, not headcount: what these processes compete for is cores,
         # and a zombie holds none. The render's own tree is in the figure because
         # the question is how many of its processes are ever runnable at once.
@@ -308,6 +314,10 @@ def measure_detached(runs: int) -> dict:
         "runs": runs,
         "detached": widest["detached"],
         "descendants": widest["descendants"],
+        # Which spawns exist, as against how many one render was seen making.
+        # A miss is the only error a sampler makes, so a name any run saw is a
+        # name every run made — the counts above stay one render's.
+        "seen": sorted({name for r in observed for name in r["detached"]}),
         "peak_live": max(r["peak_live"] for r in observed),
         "failed_renders": sum(1 for r in observed if r["returncode"] != 0),
         "survivors": max(r["survivors"] for r in observed),
