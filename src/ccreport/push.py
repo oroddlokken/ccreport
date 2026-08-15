@@ -579,16 +579,37 @@ def due(last_attempt: float, failures: int, now: float) -> bool:
     return now - last_attempt >= interval
 
 
+def refresh_cache() -> None:
+    """Parse what has changed on disk into the cache this run sends from.
+
+    Only a parse writes ccreport_files, and until this ran only the CLI did
+    one. A machine whose reports nobody opens would send the corpus as it stood
+    when someone last typed `ccreport`, while every attempt reported success —
+    the running session's own records were not in the table to offer.
+
+    A database another process holds costs this run its fresh records, not its
+    push: what is already cached still goes out.
+    """
+    from ccreport import scan
+
+    try:
+        scan.refresh_cache()
+    except sqlite3.Error:
+        pass
+
+
 def run_once(*, full: bool = False, only: str | None = None,
              config_path: Path | None = None, force: bool = False) -> list[PushResult]:
     """Push to every configured server that is due, and stamp each attempt.
 
     *force* skips the interval, which is what the manual command wants and the
-    spawn does not.
+    spawn does not. The cache is refreshed once a server has cleared every
+    gate, so a run that sends nothing parses nothing either.
     """
     from ccreport import cache_db
 
     results = []
+    refreshed = False
     now = time.time()
     for server in load_config(config_path):
         if only and server.url != only:
@@ -606,6 +627,9 @@ def run_once(*, full: bool = False, only: str | None = None,
             cache_db.write_push_attempt(server.url, now, 0)
             results.append(PushResult(server=server.url, blocked_by=server.networks))
             continue
+        if not refreshed:
+            refresh_cache()
+            refreshed = True
         try:
             result = push_to(server, full=full)
         except PushError as exc:

@@ -474,7 +474,7 @@ def extract_assistant_fields(
     Returns (message, usage, message_id, request_id, dedup_key, timestamp)
     or None if the record is invalid/incomplete.
 
-    Shared by _iter_jsonl_costs (pricing) and parse_jsonl_file (ccreport).
+    Shared by _iter_jsonl_costs (pricing) and parse_jsonl_file (scan).
     """
     if rec.get("type") != "assistant":
         return None

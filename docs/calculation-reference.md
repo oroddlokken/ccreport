@@ -119,7 +119,7 @@ Each assistant message in JSONL contains:
 }
 ```
 
-Additionally, `ccreport.py` supports a `costUSD` field on JSONL records — if
+Additionally, `scan.py` supports a `costUSD` field on JSONL records — if
 present, that pre-calculated value is used instead of computing from tokens.
 
 ---
@@ -362,8 +362,8 @@ new `CREATE TABLE` there gets a row here.
 | `dedup_keys` | Dedup keys of in-window files, linked to file_costs | pricing.py |
 | `cache_stats` | Per-session token accumulation | statusline.py |
 | `session_costs` | Per-session JSONL cost cache | pricing.py |
-| `ccreport_files` | Per-file mtime/size tracking for ccreport | ccreport.py |
-| `ccreport_records` | Parsed assistant message records | ccreport.py |
+| `ccreport_files` | Per-file mtime/size tracking for ccreport | scan.py |
+| `ccreport_records` | Parsed assistant message records | scan.py |
 | `ccreport_rollups` | Per-day aggregates of the post-dedup record stream, keyed `(day, oslo_date, sid, project, model, account)`; what a bare `ccreport` serves for days past `ROLLUP_WINDOW_DAYS`. Valid only against `meta.ccreport_rollup_fp`, and derivable from `ccreport_records` | ccreport.py |
 | `ccreport_orphan_costs` | All-time cost of records whose JSONL is gone, pre-summed per `(dir_prefix, project, cwd, repo)`. Orphans are most of `ccreport_records` and none can ever change, but `all_time` has no window to bound the walk. Override rules are resolved at read time, so a `ccreport merge` re-groups with no rebuild. Valid only against `meta.ccreport_orphan_fp` | pricing.py |
 | `project_overrides` | Manual project-grouping rules (`name` / `remote` / `cwd_prefix` → target), applied by every reader | ccreport.py (write), project_identity.py (read) |
@@ -472,6 +472,8 @@ else:
 ### 5.6 Report Cache
 
 - **Tables**: `ccreport_files` + `ccreport_records`
+- **Written by**: `scan.py` alone, whether the reports asked for the parse or
+  `push.run_once` did on its way to sending
 - **Invalidation**: `check_ccreport_valid()` compares three `meta` keys —
   `ccreport_version`, `ccreport_script_hash`, and `ccreport_schema_salt` (the
   `cache_db.CACHE_SCHEMA_SALT` constant, bumped by hand when a schema or

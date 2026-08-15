@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import subprocess
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -90,13 +93,106 @@ class TestChangedFiles:
 
     def test_the_cache_is_opened_read_only(self, tmp_path):
         """A render must never wait on this process for a write lock."""
-        import sqlite3
-
         _cached_file()
         conn = push._read_only(cache_db.DB_PATH)
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             conn.execute("DELETE FROM ccreport_files")
         conn.close()
+
+
+class TestCacheRefresh:
+    """A push parses its own records, since only a parse writes the table it reads."""
+
+    @pytest.fixture
+    def logged(self):
+        """One session log on disk that nothing has parsed yet."""
+        from ccreport import scan
+
+        root = scan._PROJECT_ROOTS[0] / "-tmp-projA"
+        root.mkdir(parents=True)
+        path = root / "sess-1.jsonl"
+        path.write_text(json.dumps({
+            "type": "assistant",
+            "timestamp": "2026-03-02T12:00:00Z",
+            "sessionId": "sess-1",
+            "cwd": "/tmp/projA",
+            "requestId": "req-1",
+            "message": {
+                "id": "msg_1", "model": "claude-opus-5",
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+            },
+        }) + "\n")
+        return path
+
+    def _sent(self, monkeypatch) -> list[list[str]]:
+        """The paths each push_to call found pending, without a server."""
+        sent: list[list[str]] = []
+
+        def record(server, full=False, db_path=None):
+            conn = push._read_only(cache_db.DB_PATH)
+            sent.append([path for path, _m, _s in push.changed_files(conn, {})])
+            conn.close()
+            return push.PushResult(server=server.url)
+
+        monkeypatch.setattr(push, "push_to", record)
+        return sent
+
+    def test_a_run_sends_a_session_no_report_has_read(self, tmp_path, logged, monkeypatch):
+        """The bug: a machine whose CLI nobody runs pushed nothing and called it a success."""
+        sent = self._sent(monkeypatch)
+        push.run_once(config_path=_write_config(tmp_path), force=True)
+        assert sent == [[str(logged)]]
+
+    def test_a_run_that_is_not_due_parses_nothing(self, tmp_path, logged, monkeypatch):
+        cache_db.write_push_attempt("https://ccr.example.net", time.time(), 0)
+        push.run_once(config_path=_write_config(tmp_path))
+        conn = push._read_only(cache_db.DB_PATH)
+        assert push.changed_files(conn, {}) == []
+        conn.close()
+
+    def test_a_blocked_run_parses_nothing(self, tmp_path, logged, monkeypatch):
+        """Off-network is the state a laptop spends its evenings in."""
+        monkeypatch.setattr(push, "on_allowed_network", lambda networks: False)
+        config = _write_config(tmp_path, networks=["10.0.0.0/8"])
+        assert push.run_once(config_path=config, force=True)[0].blocked
+        conn = push._read_only(cache_db.DB_PATH)
+        assert push.changed_files(conn, {}) == []
+        conn.close()
+
+    def test_two_servers_parse_once(self, tmp_path, logged, monkeypatch):
+        path = tmp_path / "push.toml"
+        path.write_text(
+            '[server."https://a.example"]\ntoken = "t1"\n'
+            '[server."https://b.example"]\ntoken = "t2"\n',
+        )
+        calls = []
+        monkeypatch.setattr(push, "push_to",
+                            lambda server, full=False, db_path=None: push.PushResult(server.url))
+        monkeypatch.setattr(push, "refresh_cache", lambda: calls.append(1))
+        push.run_once(config_path=path, force=True)
+        assert calls == [1]
+
+    def test_the_client_still_imports_no_rich(self):
+        """What the parse moved to scan.py for: a detached spawn pays for its imports."""
+        loaded = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, ccreport.push, ccreport.scan; print('rich' in sys.modules)"],
+            capture_output=True, text=True, check=True,
+        )
+        assert loaded.stdout.strip() == "False"
+
+    def test_a_locked_database_costs_the_records_and_not_the_push(self, tmp_path, monkeypatch):
+        """What is already cached still goes out; the fresh records wait a run."""
+        from ccreport import scan
+
+        def locked():
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(scan, "refresh_cache", locked)
+        sent = self._sent(monkeypatch)
+        _cached_file()
+        push.run_once(config_path=_write_config(tmp_path), force=True)
+        assert sent == [["/p/a.jsonl"]]
 
 
 class TestPayload:

@@ -65,6 +65,10 @@ detached spawn from the status line.
 `forecast.py` projects spend to a ceiling. It is pure and stdlib-light, because
 `ccu` and the status line read it.
 
+`scan.py` reads the JSONL logs into `ccreport_files` and `ccreport_records` and
+is the only writer of either. It imports no rich, because the push refreshes
+that cache before it sends and the CLI is not always what runs first.
+
 `pricing.py`, `cache_db.py`, `exchange.py`, `aggregate.py`,
 `project_identity.py` and `usage_api.py` are shared. `update_check.py` is
 spawned by the status line alone. `bin/` holds the wrappers that Claude Code's
@@ -236,6 +240,12 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   probed, since a machine that matched the first one would otherwise never
   reach the typo in the second. A blocked push writes no watermark and still
   stamps the attempt
+- `push.run_once` calls `scan.refresh_cache()` once a server has cleared every
+  gate — after the interval, the terminal state and the network check, so a run
+  that sends nothing parses nothing. It sends what `ccreport_files` holds and
+  only a parse writes that table, so without this a machine whose reports
+  nobody opens offered the corpus as it stood when someone last typed
+  `ccreport` while every attempt stamped a success
 - The push watermark is `push_state` in cache.db, written from the server's
   response and never from having sent it, so a rejected file is retried. The
   status line spawns `ccreport.push` but never imports it: its gate is one meta
@@ -279,8 +289,9 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   cwd→projects-dir name. Do not re-derive any of the three inline
 - Which project a record belongs to is `project_identity.py` plus
   `pricing.project_scope()` — `ccreport merge` rules apply to reports and status
-  line alike. `ccreport._script_hash()` covers `project_identity.py`, so changing
-  how a name is derived re-parses the corpus
+  line alike. `scan._script_hash()` covers `scan.py` and `project_identity.py`,
+  so changing how a name is derived re-parses the corpus and editing a report
+  renderer no longer does
 - A bare `ccreport` serves days older than `ccreport.ROLLUP_WINDOW_DAYS` from the
   `ccreport_rollups` table — per-day aggregates built from the post-dedup,
   post-override, post-attribution record stream, never from a `GROUP BY` over

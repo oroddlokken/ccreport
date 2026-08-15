@@ -96,7 +96,7 @@ def repo_from_path(cwd: str) -> str | None:
 def name_for_cwd(cwd: str) -> str:
     """The project name a record logged from *cwd* would be filed under.
 
-    ccreport.parse_jsonl_file prefers the git remote's repo basename and falls
+    scan.parse_jsonl_file prefers the git remote's repo basename and falls
     back to this; callers that cannot afford to shell out to git (the
     statusline runs this on every render) use it directly. The two agree
     whenever the checkout sits under a repo root with the remote's own name,

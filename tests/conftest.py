@@ -75,3 +75,19 @@ def isolate_cache_db(tmp_path, monkeypatch, isolate_environment):
     monkeypatch.setattr(cache_db, "_conn", None)
     yield
     cache_db.close_connection()
+
+
+@pytest.fixture(autouse=True)
+def isolate_session_logs(tmp_path, monkeypatch):
+    """Keep every test off the developer's own ~/.claude/projects.
+
+    A test reaches the roots through scan rather than through the name it
+    stubbed — push.run_once refreshes the cache on its way to sending — so
+    without this the suite parses this machine's whole history into a temporary
+    database, and its numbers change with whatever the developer worked on
+    yesterday. Left uncreated: discover_jsonl_files skips a root that is not
+    there, and a directory in tmp_path is a directory some other test counts.
+    """
+    from ccreport import scan
+
+    monkeypatch.setattr(scan, "_PROJECT_ROOTS", (tmp_path / "isolated-projects",))

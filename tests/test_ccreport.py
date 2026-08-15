@@ -17,7 +17,7 @@ import pytest
 from _narrow import present
 from rich.console import Console
 
-from ccreport import aggregate, cache_db
+from ccreport import aggregate, cache_db, scan
 from ccreport import ccreport as ccr
 
 UTC = dt.UTC
@@ -431,7 +431,7 @@ class TestSaveBatching:
         assert commits() == 1
 
     def test_the_batch_size_bounds_each_transaction(self, loader, monkeypatch):
-        monkeypatch.setattr(ccr, "_SAVE_BATCH", 5)
+        monkeypatch.setattr(scan, "_SAVE_BATCH", 5)
         self._corpus(loader, 12)
         commits = self._commits(cache_db.get_connection())
         ccr.load_all_records()
@@ -440,7 +440,7 @@ class TestSaveBatching:
     def test_batching_caches_every_file_and_then_writes_nothing(
         self, loader, monkeypatch
     ):
-        monkeypatch.setattr(ccr, "_SAVE_BATCH", 5)
+        monkeypatch.setattr(scan, "_SAVE_BATCH", 5)
         self._corpus(loader, 12)
         ccr.load_all_records()
         file_meta, by_file = cache_db.bulk_load_ccreport_cache()
@@ -485,10 +485,10 @@ class TestPartialParseNeverOverwritesTheCache:
         )
         first_line = path.read_bytes().splitlines()[0]
         monkeypatch.setattr(
-            ccr, "open", lambda *_a, **_kw: _FlakyFile([first_line]), raising=False
+            scan, "open", lambda *_a, **_kw: _FlakyFile([first_line]), raising=False
         )
         with pytest.raises(OSError):
-            ccr.parse_jsonl_file(path)
+            scan.parse_jsonl_file(path)
 
     def test_a_failed_reparse_leaves_the_cached_records_whole(
         self, loader, monkeypatch
@@ -518,7 +518,7 @@ class TestPartialParseNeverOverwritesTheCache:
                 return _FlakyFile(path.read_bytes().splitlines()[:1])
             return real_open(*args, **kwargs)
 
-        monkeypatch.setattr(ccr, "open", flaky_open, raising=False)
+        monkeypatch.setattr(scan, "open", flaky_open, raising=False)
         # This run under-reports the unreadable file...
         assert ccr.load_all_records() == []
         # ...but its cache entry is untouched, so nothing is lost for good.
@@ -558,7 +558,7 @@ class TestExplicitJsonNulls:
     def test_nulls_parse_to_the_intended_defaults(self, loader):
         path = loader / "nulls.jsonl"
         self._write_null_jsonl(path)
-        (rec,) = ccr.parse_jsonl_file(path)
+        (rec,) = scan.parse_jsonl_file(path)
         assert rec.session_id == path.stem
         assert rec.model == "unknown"
         assert rec.tokens.total == 0
@@ -798,7 +798,7 @@ class TestAggregationAndRows:
         # cost_usd means "the log gave us this"; a computed cost must not land
         # there, because that field is what gets written to the SQLite cache.
         assert rec.cost_usd is None
-        assert "_cost" not in ccr._serialize_records([rec])[0]
+        assert "_cost" not in scan._serialize_records([rec])[0]
 
     def test_logged_cost_usd_still_wins_over_computation(self):
         assert ccr.record_cost(_rec(cost_usd=0.25)) == 0.25
@@ -1077,7 +1077,7 @@ class TestAccountAttributionEndToEnd:
         self._log((self._epoch("2026-06-15T09:00:00Z"), "u-work", "me@work.example"))
         records = ccr.load_all_records()
         assert records[0].account == "me@work.example"
-        assert "account" not in ccr._serialize_records(records)[0]
+        assert "account" not in scan._serialize_records(records)[0]
 
 
 class TestReportAccount:
