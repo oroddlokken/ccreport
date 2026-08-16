@@ -256,6 +256,10 @@ pre.command {
 /* --- Dashboard --- */
 
 .range { display: flex; justify-content: space-between; align-items: center; margin-bottom: .75rem; }
+/* The two dates open their own day page. They stay the dim label they read as;
+   the underline on hover is what says they are links. */
+main .span a { color: inherit; text-decoration: none; }
+main .span a:hover { color: var(--accent); text-decoration: underline; }
 .toggles { display: inline-flex; gap: .4rem; }
 .toggle {
   color: var(--dim);

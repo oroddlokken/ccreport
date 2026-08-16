@@ -5,7 +5,15 @@
 {% block content %}
 
 <div class="range">
-  <span class="dim">{{ scope.dimension }} · <span data-day="{{ view.start }}">{{ view.start }}</span> — <span data-day="{{ view.end }}">{{ view.end }}</span></span>
+  <span class="dim span">{{ scope.dimension }} ·
+    {% if scope.dimension == "day" %}
+    <span data-day="{{ view.start }}">{{ view.start }}</span> —
+    <span data-day="{{ view.end }}">{{ view.end }}</span>
+    {% else %}
+    <a href="/day/{{ view.start }}" data-day="{{ view.start }}">{{ view.start }}</a> —
+    <a href="/day/{{ view.end }}" data-day="{{ view.end }}">{{ view.end }}</a>
+    {% endif %}
+  </span>
   {% if scope.dimension != "day" %}
   <span class="toggles">
     {% for days in ranges %}

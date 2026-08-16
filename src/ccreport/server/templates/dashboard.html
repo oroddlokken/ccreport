@@ -5,7 +5,7 @@
 {% block content %}
 
 <div class="range">
-  <span class="dim"><span data-day="{{ view.start }}">{{ view.start }}</span> — <span data-day="{{ view.end }}">{{ view.end }}</span></span>
+  <span class="dim span"><a href="/day/{{ view.start }}" data-day="{{ view.start }}">{{ view.start }}</a> — <a href="/day/{{ view.end }}" data-day="{{ view.end }}">{{ view.end }}</a></span>
   <span class="toggles">
     {% for days in ranges %}
     <a class="toggle {% if days == view.days %}on{% endif %}"

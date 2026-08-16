@@ -25,7 +25,11 @@ RANGES = (7, 30, 90, ALL_TIME)
 
 RANGE_LABELS = {7: "7d", 30: "30d", 90: "90d", ALL_TIME: "All"}
 
-DEFAULT_RANGE = 30
+DEFAULT_RANGE = ALL_TIME
+"""What a page with no `days` opens on, and what an unknown one falls back to."""
+
+EMPTY_SPAN_DAYS = 30
+"""How wide all-time is when there is nothing stored to measure it from."""
 
 DIMENSIONS = ("model", "day", "project", "machine")
 """What the breakdown table switches between. Same columns throughout."""
@@ -57,13 +61,13 @@ def range_bounds(days: int, now: datetime) -> tuple[datetime, datetime]:
 def all_time_bounds(oldest: float | None, now: datetime) -> tuple[datetime, datetime]:
     """The span from the oldest record's local day to the same next midnight.
 
-    A database with nothing in it falls back to the default range: a zero-day
+    A database with nothing in it falls back to `EMPTY_SPAN_DAYS`: a zero-day
     axis has no columns to draw and reads as a broken chart rather than an
     empty one.
     """
     end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
     if oldest is None:
-        return range_bounds(DEFAULT_RANGE, now)
+        return range_bounds(EMPTY_SPAN_DAYS, now)
     start = datetime.fromtimestamp(oldest, tz=now.tzinfo or UTC).astimezone(now.tzinfo)
     start = start.replace(hour=0, minute=0, second=0, microsecond=0)
     return min(start, end - timedelta(days=1)), end

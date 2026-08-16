@@ -114,7 +114,7 @@ class TestAllTime:
         """A zero-day axis has no columns and reads as a broken chart."""
         app = create_app(sf.config(tmp_path))
         view = dashboard.build(app.state.db.connect(), dashboard.ALL_TIME, NOW)
-        assert len(view.chart_days) == dashboard.DEFAULT_RANGE
+        assert len(view.chart_days) == dashboard.EMPTY_SPAN_DAYS
         assert view.total_cost == 0.0
 
     def test_the_oldest_record_is_what_the_database_reports(self, app):
@@ -423,6 +423,18 @@ class TestPage:
         body = client.get("/").text
         for days in dashboard.RANGES:
             assert f'href="/?days={days}&by=model&metric=cost"' in body
+
+    def test_a_page_with_no_range_opens_on_all_time(self, client):
+        body = client.get("/").text
+        assert dashboard.DEFAULT_RANGE == dashboard.ALL_TIME
+        assert ('class="toggle on"\n       aria-current="true"\n'
+                f'       href="/?days={dashboard.ALL_TIME}&by=model&metric=cost"') in body
+
+    def test_the_header_dates_open_their_day_pages(self, client):
+        view = dashboard.cached_build(client.app.state.db, dashboard.DEFAULT_RANGE)
+        body = client.get("/").text
+        assert f'<a href="/day/{view.start}" data-day="{view.start}">' in body
+        assert f'<a href="/day/{view.end}" data-day="{view.end}">' in body
 
     def test_the_selected_range_is_marked(self, client):
         body = client.get("/?days=7").text

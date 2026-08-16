@@ -247,18 +247,30 @@ class TestTheDayPage:
         """The toggle cannot widen a page that is about one day."""
         assert 'class="toggle' not in client.get(f"/day/{TODAY}").text
 
+    def test_its_own_date_is_not_a_link(self, client):
+        """Both dates are the day the page is already on."""
+        assert f'href="/day/{TODAY}"' not in client.get(f"/day/{TODAY}").text
+
 
 class TestLinks:
     def test_a_breakdown_row_opens_that_entity(self, client):
         body = client.get("/?by=project").text
-        assert 'href="/project/infrastructure?days=30"' in body
+        assert f'href="/project/infrastructure?days={dashboard.DEFAULT_RANGE}"' in body
 
     def test_an_account_bar_opens_its_account(self, client):
-        assert 'href="/account/work%40example.net?days=30"' in client.get("/").text
+        body = client.get("/").text
+        assert f'href="/account/work%40example.net?days={dashboard.DEFAULT_RANGE}"' in body
+
+    def test_the_header_dates_open_their_day_pages(self, client):
+        body = client.get("/project/infrastructure?days=7").text
+        view = dashboard.build(client.app.state.db.connect(), 7,
+                               scope=dashboard.Scope("project", "infrastructure"))
+        assert f'<a href="/day/{view.start}" data-day="{view.start}">' in body
+        assert f'<a href="/day/{view.end}" data-day="{view.end}">' in body
 
     def test_a_row_carries_the_range_it_was_clicked_from(self, client):
         assert 'href="/model/claude-haiku-4-5?days=7"' in client.get("/?days=7&by=model").text
 
     def test_a_detail_row_opens_the_next_entity(self, client):
         body = client.get("/project/infrastructure").text
-        assert 'href="/machine/neo?days=30"' in body
+        assert f'href="/machine/neo?days={dashboard.DEFAULT_RANGE}"' in body
