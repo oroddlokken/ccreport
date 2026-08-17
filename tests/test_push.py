@@ -337,6 +337,42 @@ class TestInterval:
         assert push.due(one_base_ago, 0, now), "a success should be back to the base"
 
 
+class TestConfiguredInterval:
+    """`interval_minutes` is the machine's, not the server's: a wired desktop
+    keeps the merged view minutes fresh where a metered laptop pushes rarely.
+    """
+
+    def test_it_is_read_as_seconds(self, tmp_path):
+        assert push.load_config(_write_config(tmp_path, interval_minutes=5))[0].interval_s == 300
+
+    def test_an_entry_without_it_takes_the_default(self, tmp_path):
+        assert push.load_config(_write_config(tmp_path))[0].interval_s == push.BASE_INTERVAL_S
+
+    @pytest.mark.parametrize("value", [0, -5, "soon", 5.5, True, ""])
+    def test_an_unusable_value_takes_the_default(self, tmp_path, value):
+        conf = _write_config(tmp_path, interval_minutes=value)
+        assert push.load_config(conf)[0].interval_s == push.BASE_INTERVAL_S
+
+    def test_a_quoted_number_still_counts(self, tmp_path):
+        """A hand-edited 0600 file is the input, so "5" is a typo worth honouring."""
+        assert push.load_config(_write_config(tmp_path, interval_minutes="5"))[0].interval_s == 300
+
+    def test_due_widens_from_the_configured_base(self):
+        now = 1_000_000.0
+        base = 5 * 60
+        assert push.due(now - base - 1, 0, now, base)
+        assert not push.due(now - base - 1, 1, now, base), "one failure doubles 5 min"
+        assert push.due(now - 2 * base - 1, 1, now, base)
+
+    def test_the_cap_never_shortens_a_configured_base(self):
+        base = push.MAX_INTERVAL_S * 2
+        assert push.attempt_interval(0, base) == base
+        assert push.attempt_interval(3, base) == base
+
+    def test_the_cap_still_bounds_the_widening_from_the_default(self):
+        assert push.attempt_interval(99) == push.MAX_INTERVAL_S
+
+
 class TestWatermarkState:
     def test_it_starts_empty_and_records_what_was_acknowledged(self):
         url = "https://ccr.example.net"
@@ -553,6 +589,21 @@ class TestRunOnce:
         push.run_once(config_path=config_path)
         assert calls == []
 
+    def test_a_configured_interval_is_what_run_once_waits_out(self, tmp_path, monkeypatch):
+        url = "https://ccr.example.net"
+        path = _write_config(tmp_path, interval_minutes=5)
+        calls = []
+        monkeypatch.setattr(
+            push, "push_to",
+            lambda server, full=False, db_path=None: calls.append(1) or push.PushResult("x"),
+        )
+        cache_db.write_push_attempt(url, time.time() - 4 * 60, 0)
+        push.run_once(config_path=path)
+        assert calls == [], "four minutes in, a five-minute machine is not due"
+        cache_db.write_push_attempt(url, time.time() - 6 * 60, 0)
+        push.run_once(config_path=path)
+        assert calls == [1]
+
     def test_the_manual_command_ignores_the_interval(self, config_path, monkeypatch):
         """Someone who typed it is watching; waiting out an invisible backoff reads as broken."""
         calls = []
@@ -589,6 +640,16 @@ class TestSpawnGate:
         path = _write_config(tmp_path)
         cache_db.write_push_attempt("https://ccr.example.net", 1000.0, 2)
         assert push.next_attempt_at(1000.0, path) == 1000.0 + push.BASE_INTERVAL_S * 4
+
+    def test_the_configured_interval_decides_the_next_attempt(self, tmp_path):
+        path = _write_config(tmp_path, interval_minutes=5)
+        cache_db.write_push_attempt("https://ccr.example.net", 1000.0, 0)
+        assert push.next_attempt_at(1000.0, path) == 1300.0
+
+    def test_a_failure_doubles_the_configured_one(self, tmp_path):
+        path = _write_config(tmp_path, interval_minutes=5)
+        cache_db.write_push_attempt("https://ccr.example.net", 1000.0, 1)
+        assert push.next_attempt_at(1000.0, path) == 1600.0
 
     def test_a_stopped_server_contributes_nothing(self, tmp_path):
         path = _write_config(tmp_path)

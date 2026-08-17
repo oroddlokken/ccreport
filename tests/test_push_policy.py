@@ -445,6 +445,67 @@ class TestConnectCommand:
         ])
         assert push.load_config(path)[0].networks == ()
 
+    def test_the_interval_is_written_in_minutes_and_read_in_seconds(
+        self, tmp_path, monkeypatch, health,
+    ):
+        path = tmp_path / "push.toml"
+        out = self._run(monkeypatch, [
+            "server", "connect", "https://ccr.example.net", "--token", "good",
+            "--interval-minutes", "5", "--config", str(path),
+        ])
+        assert "interval_minutes = 5" in path.read_text()
+        assert push.load_config(path)[0].interval_s == 300
+        assert "Pushing every 5 min." in out
+
+    def test_omitting_it_leaves_the_default(self, tmp_path, monkeypatch, health):
+        path = tmp_path / "push.toml"
+        self._run(monkeypatch, [
+            "server", "connect", "https://ccr.example.net", "--token", "good",
+            "--config", str(path),
+        ])
+        assert "interval_minutes" not in path.read_text()
+        assert push.load_config(path)[0].interval_s == push.BASE_INTERVAL_S
+
+    def test_a_non_positive_interval_is_refused(self, tmp_path, monkeypatch, health):
+        """Writing it would store a value that reads back as the default."""
+        path = tmp_path / "push.toml"
+        with pytest.raises(SystemExit) as exit_info:
+            self._run(monkeypatch, [
+                "server", "connect", "https://ccr.example.net", "--token", "good",
+                "--interval-minutes", "0", "--config", str(path),
+            ])
+        assert exit_info.value.code == 1
+        assert not path.exists()
+
+
+class TestStatusPrintsTheInterval:
+    """The push interval is invisible otherwise: the file is 0600 and the spawn
+    is detached, so this command is where a machine's own cadence is read off.
+    """
+
+    @pytest.fixture(autouse=True)
+    def health(self, monkeypatch):
+        monkeypatch.setattr(
+            "ccreport.remote.fetch_health",
+            lambda base, token: {"label": "Laptop", "machine_id": "laptop-1", "records": 3},
+        )
+
+    def _status(self, monkeypatch, path) -> str:
+        buf = io.StringIO()
+        monkeypatch.setattr(ccr, "console", Console(file=buf, width=200, no_color=True))
+        monkeypatch.setattr(ccr.sys, "argv",
+                            ["ccreport", "server", "status", "--config", str(path)])
+        ccr.main()
+        return buf.getvalue()
+
+    def test_a_configured_one_prints_in_minutes(self, tmp_path, monkeypatch):
+        path = _write_config(tmp_path, interval_minutes=5)
+        assert "interval     5 min" in self._status(monkeypatch, path)
+
+    def test_an_entry_without_it_prints_the_default(self, tmp_path, monkeypatch):
+        path = _write_config(tmp_path)
+        assert "interval     30 min" in self._status(monkeypatch, path)
+
 
 class TestAllowDenyCommands:
     def _run(self, monkeypatch, argv) -> str:

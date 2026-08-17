@@ -1,8 +1,9 @@
 """Send this machine's records to a ccreport server.
 
 Runs two ways: `ccreport push`, and a detached spawn from the status line's
-slow path every thirty minutes. Neither is on the render path — the status
-line spawns this the way it spawns usage_api.py and never imports it.
+slow path on each server's `interval_minutes`, thirty by default. Neither is on
+the render path — the status line spawns this the way it spawns usage_api.py and
+never imports it.
 
 Nothing happens without ~/.config/ccreport/push.toml, which
 `ccreport server connect` writes. A machine that has not opted in pays nothing:
@@ -33,12 +34,15 @@ from pathlib import Path
 CONFIG_PATH = Path.home() / ".config" / "ccreport" / "push.toml"
 
 BASE_INTERVAL_S = 30 * 60
-"""How often the status line's spawn is allowed to try. The client cache is
-already whole; this only decides how fresh the merged view is."""
+"""How often the status line's spawn is allowed to try, absent an
+`interval_minutes` in push.toml. The client cache is already whole; this only
+decides how fresh the merged view is."""
 
 MAX_INTERVAL_S = 8 * 60 * 60
-"""The ceiling the interval widens to. A server down overnight is then eight
-attempts short of one per interval, rather than twenty."""
+"""The ceiling the failure widening reaches. A server down overnight is then
+eight attempts short of one per interval, rather than twenty. A configured base
+above it is not clamped to it: the ceiling never shortens an interval someone
+asked for."""
 
 REQUEST_TIMEOUT_S = 120
 """A first push is a machine's whole history, which the server prices as it
@@ -67,6 +71,11 @@ class ServerConfig:
     label: str
     machine_id: str
     max_body: int = DEFAULT_MAX_BODY
+    interval_s: int = BASE_INTERVAL_S
+    """How long after an attempt this server is due again, from
+    `interval_minutes`. A property of the machine and its link, not of the
+    server: a wired desktop keeps the merged view minutes fresh, a metered
+    laptop pushes rarely."""
     restricted: bool = False
     """Whether a project has to be opted in by name to be identified at all.
 
@@ -165,12 +174,38 @@ def load_config(path: Path | None = None) -> list[ServerConfig]:
             label=entry.get("label") or os.uname().nodename,
             machine_id=entry.get("machine_id") or "",
             max_body=int(entry.get("max_body") or DEFAULT_MAX_BODY),
+            interval_s=_interval_seconds(entry.get("interval_minutes")),
             restricted=states_restriction or was_restricted,
             allow=allow,
             salt=str(entry.get("salt") or ""),
             networks=tuple(str(net) for net in (entry.get("networks") or ())),
         ))
     return servers
+
+
+def _interval_seconds(value: object) -> int:
+    """`interval_minutes` as seconds, or BASE_INTERVAL_S for anything unusable.
+
+    A hand-edited 0600 file is the input, so a typo has to cost the default
+    rather than the push: a float, a bool, a word and a zero all read as absent.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return BASE_INTERVAL_S
+    try:
+        minutes = int(value)
+    except ValueError:
+        return BASE_INTERVAL_S
+    return minutes * 60 if minutes > 0 else BASE_INTERVAL_S
+
+
+def attempt_interval(failures: int, base: int = BASE_INTERVAL_S) -> int:
+    """How long after an attempt the next one is allowed, *failures* in a row.
+
+    Doubling per failure, so a server that has been down all night is asked a
+    handful of times rather than every interval. The cap cannot shorten a
+    configured base, hence max() rather than MAX_INTERVAL_S alone.
+    """
+    return min(base * (2 ** max(failures, 0)), max(MAX_INTERVAL_S, base))
 
 
 def configured(path: Path | None = None) -> bool:
@@ -568,15 +603,14 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
     return result
 
 
-def due(last_attempt: float, failures: int, now: float) -> bool:
-    """Whether the interval has elapsed, widened by consecutive failures.
+def due(last_attempt: float, failures: int, now: float,
+        base: int = BASE_INTERVAL_S) -> bool:
+    """Whether this server's interval has elapsed, widened by its failures.
 
-    Doubling per failure up to MAX_INTERVAL_S, so a server that has been down
-    all night is asked a handful of times rather than every thirty minutes. One
-    success resets the count and with it the interval.
+    *base* is the server's own `interval_s`. One success resets the failure
+    count and with it the interval.
     """
-    interval = min(BASE_INTERVAL_S * (2 ** max(failures, 0)), MAX_INTERVAL_S)
-    return now - last_attempt >= interval
+    return now - last_attempt >= attempt_interval(failures, base)
 
 
 def refresh_cache() -> None:
@@ -617,7 +651,7 @@ def run_once(*, full: bool = False, only: str | None = None,
         attempt, failures, stopped = cache_db.read_push_attempt(server.url)
         if stopped and not force:
             continue
-        if not force and not due(attempt, failures, now):
+        if not force and not due(attempt, failures, now, server.interval_s):
             continue
         if not on_allowed_network(server.networks):
             # Blocked: no request, no watermark, so everything queued goes out
@@ -660,8 +694,7 @@ def next_attempt_at(now: float, config_path: Path | None = None) -> float:
         attempt, failures, stopped = cache_db.read_push_attempt(server.url)
         if stopped:
             continue
-        interval = min(BASE_INTERVAL_S * (2 ** max(failures, 0)), MAX_INTERVAL_S)
-        due_at = attempt + interval
+        due_at = attempt + attempt_interval(failures, server.interval_s)
         soonest = due_at if soonest is None else min(soonest, due_at)
     # No server, or every one of them stopped: park the spawn a full interval
     # out rather than forever, so re-minting a token is picked up on its own.

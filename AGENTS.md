@@ -92,6 +92,13 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   out — otherwise one project's session starves every other project's. That gate
   is `cache_db.is_costs_refresh_blocked()`, never `is_fetch_blocked()`: the
   costs lock skips the API error backoff on purpose
+- No render derives the `*_project_cost` split itself: that walks every JSONL
+  file in the project on the frame Claude Code is waiting on. A summary too old
+  for the merge still supplies the split, up to
+  `COST_SUMMARY_FALLBACK_MAX_AGE`, and past that the cost windows show the
+  machine-wide total alone until the detached refresh lands. Only the project
+  keys are taken from it — `_fetch_usage` never sees that read, since a hit
+  would suppress the refresh spawn it gates on the fresh one
 - Both refresh spawns carry the window bounds as `--session-reset`/`--week-reset`,
   native stdin readings first and the cached row only as fallback; `usage_api.py`
   in turn treats them as the fallback for a response that omitted `resets_at`.
@@ -195,7 +202,7 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   machine's UTC offset at that instant, which is what makes `server_records.day`
   the machine's calendar day rather than the server's
 - `~/.config/ccreport/push.toml` is the machine's whole push policy — server,
-  token, `restricted`, `allow`, `salt`, `networks` — written by
+  token, `restricted`, `allow`, `salt`, `networks`, `interval_minutes` — written by
   `ccreport server connect` at mode 0600, one `[server."URL"]` table each.
   There are no environment variables for any of it. The mint page types the
   networks and the opt-in list into the connect command it prints and stores
@@ -267,7 +274,10 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   key, `push_next_at`, that the child writes on every outcome. How far the
   interval widens after a failure and which servers are due live in `push.py`,
   and a 401 is terminal — a revoked token stops the machine rather than
-  knocking every interval
+  knocking every interval. The widening is `push.attempt_interval()` alone:
+  `due()` and `next_attempt_at()` both call it, so a per-server
+  `interval_minutes` doubles from its own base and `MAX_INTERVAL_S` never
+  shortens a base set above it
 - The attempt stamp moves on every outcome, so it cannot date a push. What
   `ccreport server status` prints as `last push` is the separate `success`
   stamp `write_push_attempt(succeeded=True)` writes on the success path alone,
@@ -294,6 +304,12 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
 - All pricing data lives in `pricing.py` — update only this file when prices
   change. Source: the LiteLLM pricing database; update `LAST_CHECKED` after
   verifying
+- A record's `costUSD` is its cost wherever this machine prices it — the JSONL
+  parse (`pricing._line_cost`), a cached record (`pricing._rec_cost`) and the
+  reports (`aggregate.UsageRecord.cost`) — and `calc_cost` answers only where
+  the log carried none. One reader pricing from tokens while another kept the
+  logged figure put a 24h window above `all_time` on the same corpus, so a new
+  read path picks neither on its own
 - Cost windows come from `pricing.ROLLING_WINDOWS` (name, span, label). Adding
   one means editing that list plus `_COST_WINDOW_TOGGLES` in `statusline.py`;
   every other key list is derived. `tests/test_window_keys.py` fails if
@@ -325,8 +341,9 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   (`compute_session_usage`), because a Task subagent spends on the model its
   definition names and stdin only ever reports the selected one. It is cached per file in
   `file_costs.week_model_json`, and an entry whose stored shape gains or loses a
-  field needs `cache_db._COST_ENTRY_SCHEMA` bumped: mtime and size still match,
-  so nothing else re-scans it and the missing field totals as zero
+  field — or whose pricing rule changes — needs `cache_db._COST_ENTRY_SCHEMA`
+  bumped: mtime and size still match, so nothing else re-scans it and what it
+  stored totals as it stands
 - Read-time dedup goes through `pricing.dedup_identity()`. It falls back to
   record content when the log carried no `message.id` or `requestId`; only the
   log's own key is persisted

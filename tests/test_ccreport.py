@@ -2613,16 +2613,20 @@ class TestCmdLimits:
             **{"since": None, "until": None, "window": None, "json": False, **kw}
         )
 
-    def _corpus(self):
+    def _account(self, iso="2026-06-14T12:00", tier="default_claude_max_5x"):
+        """One capture, tiered by default — the tables hide a window without one."""
         cache_db.record_account_event(
             {
                 "accountUuid": "u-work",
                 "emailAddress": "me@work.example",
                 "organizationName": "Org",
-                "userRateLimitTier": "default_claude_max_5x",
+                "userRateLimitTier": tier,
             },
-            now=_local_epoch("2026-06-14T12:00"),
+            now=_local_epoch(iso),
         )
+
+    def _corpus(self):
+        self._account()
         _seed_samples("session", _W1_RESET, _W1_START, [2.0, 99.7])
         _seed_samples("week", _W1_RESET, _W1_START, [30.0, 44.0])
         _seed_samples(
@@ -2733,32 +2737,30 @@ class TestCmdLimits:
             now=_W1_START,
         )
 
-    def test_a_placeholder_reset_is_dropped_and_said_out_loud(self, capsys):
+    def test_a_placeholder_reset_is_dropped(self, capsys):
         self._corpus()
         self._seed_sentinel()
         entries, err = self._run_json(capsys, window="session")
         assert [e["resets_at"] for e in entries] == [_W1_RESET]
-        assert "dropped 1 sample(s)" in err
-        assert "8 days" in err
+        assert err == ""
 
-    def test_nothing_is_said_when_nothing_was_dropped(self, capsys):
-        self._corpus()
-        assert self._run_json(capsys)[1] == ""
-
-    def test_the_note_counts_only_what_this_run_would_have_shown(self, capsys):
-        """The filters run first, so a --window the placeholder is not in stays quiet."""
+    def test_a_run_that_has_a_report_to_print_says_nothing_beside_it(
+        self, capsys, monkeypatch
+    ):
+        """stderr is for the exits below. A note above every run is noise."""
+        buf = io.StringIO()
+        monkeypatch.setattr(ccr, "console", Console(file=buf, width=200, no_color=True))
         self._corpus()
         self._seed_sentinel()
-        assert self._run_json(capsys, window="week")[1] == ""
+        ccr.cmd_limits(self._args())
+        assert capsys.readouterr().err == ""
 
     def test_a_run_left_with_nothing_but_placeholders_exits_one(self, capsys):
         self._seed_sentinel()
         with pytest.raises(SystemExit) as exc:
             ccr.cmd_limits(self._args())
         assert exc.value.code == 1
-        err = capsys.readouterr().err
-        assert "dropped 1 sample(s)" in err
-        assert "match those filters" in err
+        assert "match those filters" in capsys.readouterr().err
 
     def test_a_window_this_report_has_no_label_for_still_shows_up(
         self, capsys, monkeypatch
@@ -2766,6 +2768,7 @@ class TestCmdLimits:
         """The writer's window list lives elsewhere; drift must not lose history."""
         buf = io.StringIO()
         monkeypatch.setattr(ccr, "console", Console(file=buf, width=200, no_color=True))
+        self._account()
         _seed_samples("session", _W1_RESET, _W1_START, [2.0])
         _seed_samples("opus_hourly", _W1_RESET, _W1_START, [61.0])
         ccr.cmd_limits(self._args())
@@ -2787,6 +2790,79 @@ class TestCmdLimits:
         assert "default_claude_max_5x" in out
 
 
+class TestLimitsUntiered:
+    """A window sampled before the account log carried a tier reaches --json only."""
+
+    @pytest.fixture(autouse=True)
+    def _corpus_stub(self, monkeypatch):
+        monkeypatch.setattr(ccr, "load_all_records", lambda **_kw: [])
+
+    def _args(self, **kw):
+        return types.SimpleNamespace(
+            **{"since": None, "until": None, "window": None, "json": False, **kw}
+        )
+
+    def _table(self, monkeypatch, **kw):
+        """The rendered tables, from a run whose stderr the caller reads after."""
+        buf = io.StringIO()
+        monkeypatch.setattr(ccr, "console", Console(file=buf, width=200, no_color=True))
+        ccr.cmd_limits(self._args(**kw))
+        return buf.getvalue()
+
+    def _mixed(self):
+        """One window before the log's only capture and one after it."""
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
+        cache_db.record_account_event(
+            {
+                "accountUuid": "u-work",
+                "emailAddress": "me@work.example",
+                "userRateLimitTier": "default_claude_max_5x",
+            },
+            now=_local_epoch("2026-06-15T20:00"),
+        )
+        _seed_samples("session", _W2_RESET, _W2_START, [1.0, 30.0])
+
+    def test_the_table_carries_the_tiered_window_alone(self, capsys, monkeypatch):
+        self._mixed()
+        out = self._table(monkeypatch)
+        assert "Session (5h) — 1 window(s)" in out
+        assert "2026-06-16 13:00" in out
+        assert "2026-06-15 13:00" not in out
+
+    def test_the_hidden_window_is_hidden_quietly(self, capsys, monkeypatch):
+        """The report is what the run prints; the rows it left out are in --json."""
+        self._mixed()
+        self._table(monkeypatch)
+        assert capsys.readouterr().err == ""
+
+    def test_the_json_carries_both(self, capsys):
+        self._mixed()
+        ccr.cmd_limits(self._args(json=True))
+        entries = json.loads(capsys.readouterr().out)
+        assert [(e["resets_at"], e["limit_tier"]) for e in entries] == [
+            (_W1_RESET, None),
+            (_W2_RESET, "default_claude_max_5x"),
+        ]
+
+    def test_a_history_with_no_tier_at_all_exits_one(self, capsys):
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
+        with pytest.raises(SystemExit) as exc:
+            ccr.cmd_limits(self._args())
+        assert exc.value.code == 1
+        assert "predates the tier columns" in capsys.readouterr().err
+
+    def test_an_untiered_capture_is_no_tier(self, capsys):
+        """An event from before the tier columns reads back with none of them."""
+        cache_db.record_account_event(
+            {"accountUuid": "u-work", "emailAddress": "me@work.example"},
+            now=_local_epoch("2026-06-14T12:00"),
+        )
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
+        with pytest.raises(SystemExit):
+            ccr.cmd_limits(self._args())
+        assert "predates the tier columns" in capsys.readouterr().err
+
+
 class TestLimitsRendering:
     """The table's own decisions: the caption, and what a narrow terminal loses."""
 
@@ -2801,7 +2877,7 @@ class TestLimitsRendering:
         spends = {
             i.key: ccr._instance_spend(i, index, extras, stamp) for i in instances
         }
-        ccr.report_limits(instances, _timeline(), spends, stamp)
+        ccr.report_limits(instances, _timeline(), spends)
         return buf.getvalue()
 
     def _reflowed(self, *args, **kw):
@@ -2813,7 +2889,13 @@ class TestLimitsRendering:
         """
         return " ".join(self._render(*args, **kw).split())
 
-    def test_an_open_window_is_read_out_under_its_table(self, monkeypatch):
+    def test_an_open_window_gets_no_caption_of_its_own(self, monkeypatch):
+        """Where it stands is the row; where it is heading is --json.
+
+        The projection was a sentence under the table for a while: a rate, a
+        percentage past 100 and a dollar figure for the points left, none of
+        which a reader of the table had asked for.
+        """
         _seed_samples("session", _W1_RESET, _W1_START, [10.0, 30.0])
         out = self._reflowed(
             monkeypatch,
@@ -2822,35 +2904,10 @@ class TestLimitsRendering:
                 _spend_rec("2026-06-15T08:30", usd=10.0),
             ],
         )
-        assert "open at 30.0%" in out
-        assert "seen from 10.0%" in out
-        assert "20.0 pp/h" in out
-        assert "110% by reset 2026-06-15 13:00" in out
-        assert "70.0 pp left" in out
-
-    def test_the_caption_names_the_model_of_a_scoped_window(self, monkeypatch):
-        _seed_samples(
-            "scoped",
-            _W1_RESET,
-            _W1_START,
-            [10.0, 30.0],
-            model="claude-fable-5",
-            source="api",
-        )
-        assert "fable-5: open at 30.0%" in self._reflowed(
-            monkeypatch, now="2026-06-15T10:00"
-        )
-
-    def test_a_closed_window_is_read_out_to_nobody(self, monkeypatch):
-        _seed_samples("session", _W1_RESET, _W1_START, [10.0, 30.0])
-        assert "open at" not in self._render(monkeypatch, now="2026-06-15T13:01")
-
-    def test_an_open_window_with_no_rate_says_that_instead_of_a_number(
-        self, monkeypatch
-    ):
-        _seed_samples("session", _W1_RESET, _W1_START, [30.0])
-        out = self._reflowed(monkeypatch, now="2026-06-15T10:00")
-        assert "no rate to project from yet" in out
+        assert "30.0%" in out
+        assert "still open" not in out
+        assert "by reset" not in out
+        assert "left is worth" not in out
 
     def test_a_partial_window_is_starred_and_read_out(self, monkeypatch):
         _seed_samples("week", _W1_RESET, _W1_START, [77.0, 93.0])

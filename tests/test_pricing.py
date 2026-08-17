@@ -712,6 +712,49 @@ class TestScanJsonlFile:
         assert result.all_time_cost == 0.0
 
 
+class TestTheRawParseHonoursALoggedCost:
+    """A record's own `costUSD` outranks the token calculation, as it does for
+    `aggregate.UsageRecord.cost` and for the cached-record readers.
+    """
+
+    TS = "2025-06-15T12:00:00+00:00"
+
+    def _file(self, tmp_path, **extra):
+        import json
+
+        line = {
+            "type": "assistant",
+            "timestamp": self.TS,
+            "requestId": "req-1",
+            "sessionId": "s1",
+            "message": {
+                "id": "msg-1",
+                "model": "claude-opus-5",
+                "usage": {"input_tokens": 1000, "output_tokens": 0},
+            },
+            **extra,
+        }
+        path = tmp_path / "a.jsonl"
+        path.write_text(json.dumps(line) + "\n")
+        return path
+
+    def _from_tokens(self) -> float:
+        return calc_cost(1000, 0, 0, 0, "claude-opus-5",
+                         datetime.fromisoformat(self.TS))
+
+    def test_a_logged_cost_is_taken_as_it_stands(self, tmp_path):
+        [(cost, _ts, _dk, _m)] = _iter_live(self._file(tmp_path, costUSD=2.5))
+        assert cost == 2.5
+
+    def test_without_one_the_tokens_price_it(self, tmp_path):
+        [(cost, _ts, _dk, _m)] = _iter_live(self._file(tmp_path))
+        assert cost == self._from_tokens()
+
+    def test_an_unparseable_one_falls_back_to_the_tokens(self, tmp_path):
+        [(cost, _ts, _dk, _m)] = _iter_live(self._file(tmp_path, costUSD="lots"))
+        assert cost == self._from_tokens()
+
+
 # ---------------------------------------------------------------------------
 # compute_costs — session-window key presence
 # ---------------------------------------------------------------------------
@@ -863,16 +906,16 @@ class TestComputeCostsSavesOnlyChangedFiles:
 
 
 # ---------------------------------------------------------------------------
-# Per-render reads scoped to one project
+# Which records one project's windows are allowed to count
 # ---------------------------------------------------------------------------
 
 
-class TestPerRenderScoping:
-    """The statusline renders one project, so it must read only that project.
+class TestProjectScoping:
+    """A project's cost windows count that project's records and no others.
 
-    Both functions here run on every render and used to load the whole
-    ccreport_records table — ~89K rows on a real machine — to keep one
-    project's or one session's share of it.
+    The path prefix is the whole defence against a sibling directory whose name
+    starts with the same string, and an orphaned record has only the prefix and
+    the stored project name left to be found by.
     """
 
     CWD = "/tmp/proj"
@@ -892,9 +935,14 @@ class TestPerRenderScoping:
         return d
 
     def _orphan(
-        self, path: str, *, sid: str, cost: float, ts: float | None = None
+        self, path: str, *, sid: str, cost: float, ts: float | None = None,
+        project: str = "proj", cwd: str | None = None,
     ) -> None:
-        """Cache a record under *path* with no file on disk to back it."""
+        """Cache a record under *path* with no file on disk to back it.
+
+        *project* and *cwd* are the record's own, which is what an orphan is
+        attributed by once its directory is gone.
+        """
         from ccreport import cache_db
 
         cache_db.save_ccreport_file(
@@ -907,8 +955,8 @@ class TestPerRenderScoping:
                     "model": "claude-opus-5",
                     "ts": ts if ts is not None else datetime.now(tz=UTC).timestamp(),
                     "sid": sid,
-                    "project": "proj",
-                    "cwd": self.CWD,
+                    "project": project,
+                    "cwd": cwd if cwd is not None else self.CWD,
                     "repo": None,
                     "dk": None,
                     "cost": cost,
@@ -918,30 +966,31 @@ class TestPerRenderScoping:
         )
 
     def test_orphaned_project_costs_still_reach_the_totals(self, projects_dir):
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         self._orphan(str(projects_dir / "-tmp-proj" / "gone.jsonl"), sid="s1", cost=3.0)
-        totals = compute_project_rolling_costs(self.CWD)
+        totals = compute_costs(cwd=self.CWD)
         assert totals["all_time_project_cost"] == 3.0
         assert totals["twenty_four_hour_project_cost"] == 3.0
 
     def test_a_sibling_project_sharing_the_prefix_is_not_counted(self, projects_dir):
-        from ccreport.pricing import compute_project_rolling_costs
+        """Each record carries its own project, so the directory is what could
+        confuse the two: `-tmp-proj` is a bare string prefix of `-tmp-proj-other`.
+        """
+        from ccreport.pricing import compute_costs
 
         self._orphan(str(projects_dir / "-tmp-proj" / "gone.jsonl"), sid="s1", cost=3.0)
         self._orphan(
-            str(projects_dir / "-tmp-proj-other" / "gone.jsonl"), sid="s1", cost=99.0
+            str(projects_dir / "-tmp-proj-other" / "gone.jsonl"), sid="s1", cost=99.0,
+            project="proj-other", cwd=self.SIBLING_CWD,
         )
-        assert compute_project_rolling_costs(self.CWD)["all_time_project_cost"] == 3.0
-        assert (
-            compute_project_rolling_costs(self.SIBLING_CWD)["all_time_project_cost"]
-            == 99.0
-        )
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 3.0
+        assert compute_costs(cwd=self.SIBLING_CWD)["all_time_project_cost"] == 99.0
 
     def test_a_live_file_is_not_also_counted_as_an_orphan(self, projects_dir):
         import json
 
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         live = projects_dir / "-tmp-proj" / "live.jsonl"
         live.write_text(
@@ -964,25 +1013,7 @@ class TestPerRenderScoping:
         self._orphan(str(live), sid="s1", cost=50.0)
         # The cached row is for a path still on disk, so the JSONL scan owns it
         # and the orphan pass must skip it — 50.0 would be the double count.
-        assert compute_project_rolling_costs(self.CWD)["all_time_project_cost"] < 1.0
-
-    def test_the_project_scan_reads_no_other_projects_rows(
-        self, projects_dir, monkeypatch
-    ):
-        from ccreport import cache_db
-        from ccreport.pricing import compute_project_rolling_costs
-
-        self._orphan(str(projects_dir / "-tmp-proj" / "gone.jsonl"), sid="s1", cost=3.0)
-        self._orphan(
-            str(projects_dir / "-tmp-proj-other" / "gone.jsonl"), sid="s1", cost=99.0
-        )
-
-        def no_full_scans():
-            msg = "a render must not load the whole table"
-            raise AssertionError(msg)
-
-        monkeypatch.setattr(cache_db, "bulk_load_ccreport_cache", no_full_scans)
-        assert compute_project_rolling_costs(self.CWD)["all_time_project_cost"] == 3.0
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] < 1.0
 
     def test_the_purged_session_fallback_sums_only_that_session(self, projects_dir):
         from ccreport.pricing import compute_session_cost
@@ -1022,13 +1053,13 @@ class TestPerRenderScoping:
 
     def test_a_mismatched_salt_degrades_to_no_orphans(self, projects_dir):
         from ccreport import cache_db
-        from ccreport.pricing import compute_project_rolling_costs, compute_session_cost
+        from ccreport.pricing import compute_costs, compute_session_cost
 
         self._orphan(str(projects_dir / "-tmp-proj" / "gone.jsonl"), sid="s1", cost=3.0)
         conn = cache_db.get_connection()
         cache_db._set_meta(conn, "ccreport_schema_salt", "not-the-salt")
         conn.commit()
-        assert compute_project_rolling_costs(self.CWD)["all_time_project_cost"] == 0.0
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 0.0
         assert compute_session_cost("s1", self.CWD) == 0.0
         # Degraded, not repaired: the row a re-parse could never rebuild is intact.
         assert conn.execute("SELECT cost FROM ccreport_records").fetchone()[0] == 3.0
@@ -1137,39 +1168,33 @@ class TestMergedProjectsShareTheirCostWindows:
         projects_dir,
         monkeypatch,
     ):
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         self._both_projects(projects_dir)
         self._merge(monkeypatch, "other", "proj")
-        assert compute_project_rolling_costs(self.CWD)["all_time_project_cost"] == 102.0
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 102.0
 
     def test_the_merged_side_lands_on_the_target_too(self, projects_dir, monkeypatch):
         """Standing in the directory that was merged away sees the same total."""
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         self._both_projects(projects_dir)
         self._merge(monkeypatch, "other", "proj")
-        assert (
-            compute_project_rolling_costs(self.OTHER_CWD)["all_time_project_cost"]
-            == 102.0
-        )
+        assert compute_costs(cwd=self.OTHER_CWD)["all_time_project_cost"] == 102.0
 
     def test_without_a_rule_the_two_projects_stay_apart(
         self, projects_dir, monkeypatch
     ):
         from ccreport import cache_db
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         self._both_projects(projects_dir)
         monkeypatch.setattr(cache_db, "get_project_overrides", list)
-        assert compute_project_rolling_costs(self.CWD)["all_time_project_cost"] == 3.0
-        assert (
-            compute_project_rolling_costs(self.OTHER_CWD)["all_time_project_cost"]
-            == 99.0
-        )
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 3.0
+        assert compute_costs(cwd=self.OTHER_CWD)["all_time_project_cost"] == 99.0
 
     def test_an_unrelated_project_is_not_dragged_in(self, projects_dir, monkeypatch):
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         self._both_projects(projects_dir)
         (projects_dir / "-tmp-third").mkdir()
@@ -1180,7 +1205,7 @@ class TestMergedProjectsShareTheirCostWindows:
             cost=7.0,
         )
         self._merge(monkeypatch, "other", "proj")
-        assert compute_project_rolling_costs(self.CWD)["all_time_project_cost"] == 102.0
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 102.0
 
     def test_a_purged_record_reaches_the_target_by_name_alone(
         self,
@@ -1209,7 +1234,7 @@ class TestMergedProjectsShareTheirCostWindows:
 
     def test_the_table_is_read_once_per_computation(self, projects_dir, monkeypatch):
         from ccreport import cache_db
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         self._both_projects(projects_dir)
         reads = []
@@ -1222,7 +1247,7 @@ class TestMergedProjectsShareTheirCostWindows:
             return rules
 
         monkeypatch.setattr(cache_db, "get_project_overrides", counted)
-        compute_project_rolling_costs(self.CWD)
+        compute_costs(cwd=self.CWD)
         assert reads == [1], "one read per compute, not one per record"
 
 
@@ -1437,35 +1462,35 @@ class TestFallbackDedupIdentity:
         )
 
     def test_two_identical_dk_null_rows_count_once(self, projects_dir):
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         self._rows(projects_dir, {}, {})
-        assert compute_project_rolling_costs(self.CWD)["all_time_project_cost"] == 1.0
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 1.0
 
     def test_one_differing_token_count_keeps_them_apart(self, projects_dir):
         """A streaming message's chunks differ exactly here."""
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         self._rows(projects_dir, {"t": [1, 1, 0, 0]}, {"t": [1, 2, 0, 0]})
-        assert compute_project_rolling_costs(self.CWD)["all_time_project_cost"] == 2.0
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 2.0
 
     def test_a_different_session_keeps_them_apart(self, projects_dir):
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         self._rows(projects_dir, {}, {"sid": "s2"})
-        assert compute_project_rolling_costs(self.CWD)["all_time_project_cost"] == 2.0
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 2.0
 
     def test_rows_carrying_a_dedup_key_are_untouched(self, projects_dir):
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         self._rows(projects_dir, {"dk": "m:r1"}, {"dk": "m:r2"})
-        assert compute_project_rolling_costs(self.CWD)["all_time_project_cost"] == 2.0
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 2.0
 
     def test_the_same_dedup_key_still_collapses(self, projects_dir):
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         self._rows(projects_dir, {"dk": "m:r1"}, {"dk": "m:r1"})
-        assert compute_project_rolling_costs(self.CWD)["all_time_project_cost"] == 1.0
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 1.0
 
     def test_the_purged_session_fallback_dedupes_the_same_way(self, projects_dir):
         from ccreport.pricing import compute_session_cost
@@ -1476,7 +1501,7 @@ class TestFallbackDedupIdentity:
     def test_a_live_jsonl_scan_dedupes_the_same_way(self, projects_dir):
         import json
 
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         line = json.dumps(
             {
@@ -1495,24 +1520,21 @@ class TestFallbackDedupIdentity:
         # No requestId, so extract_assistant_fields leaves dk NULL.
         live.write_text(line + "\n" + line + "\n")
         once = 1000 * 5e-06
-        assert compute_project_rolling_costs(self.CWD)[
+        assert compute_costs(cwd=self.CWD)[
             "all_time_project_cost"
         ] == round(once, 4)
 
 
 # ---------------------------------------------------------------------------
-# A render prices an unchanged live file from the cache
+# An unchanged live file is priced from the cache, not re-read
 # ---------------------------------------------------------------------------
 
 
 class TestLiveFilesPricedFromTheCcreportCache:
-    """Re-parsing the project's whole corpus per render was ~93% of it.
-
-    The cached records already hold every time-independent fact the windows
-    need, so a file whose (mtime_ns, size) still matches is summed from them.
-    Every test here pins the property that makes that substitution legal: the
-    two paths have to produce the same number, and a cache that cannot be
-    trusted has to fall back rather than answer.
+    """A file whose (mtime_ns, size) still matches is summed from its cached
+    records instead of re-read, which only holds while both paths total the
+    same. `TestTryCachedFile` covers the branches; these run the whole
+    computation twice over one corpus.
     """
 
     CWD = "/tmp/proj"
@@ -1530,7 +1552,11 @@ class TestLiveFilesPricedFromTheCcreportCache:
 
     @staticmethod
     def _record(mid: str, **kw) -> dict:
-        """One cached record, in the shape cache_db stores and pricing reads."""
+        """One cached record, in the shape cache_db stores and pricing reads.
+
+        `cost` is None as scan.py leaves it for a log with no `costUSD`, which is
+        almost every log; a test that wants one sets it and _line emits it.
+        """
         return {
             "mid": mid,
             "model": "claude-opus-5",
@@ -1540,7 +1566,7 @@ class TestLiveFilesPricedFromTheCcreportCache:
             "cwd": "/tmp/proj",
             "repo": None,
             "dk": f"{mid}:req-1",
-            "cost": 0.5,
+            "cost": None,
             "t": [1000, 500, 0, 0],
             **kw,
         }
@@ -1568,6 +1594,8 @@ class TestLiveFilesPricedFromTheCcreportCache:
         }
         if rec["dk"]:
             line["requestId"] = rec["dk"].split(":", 1)[1]
+        if rec["cost"] is not None:
+            line["costUSD"] = rec["cost"]
         return json.dumps(line)
 
     def _file(
@@ -1597,19 +1625,6 @@ class TestLiveFilesPricedFromTheCcreportCache:
 
         return round(sum(_rec_cost_from_tokens(r) for r in records), 4)
 
-    @staticmethod
-    def _clear_fingerprints() -> None:
-        """Force the raw parse without touching the records or the salt.
-
-        Not invalidate_ccreport: that also drops the salt and NULLs the costs,
-        so it could not tell a fingerprint miss from a cache the reader refused.
-        """
-        from ccreport import cache_db
-
-        conn = cache_db.get_connection()
-        conn.execute("UPDATE ccreport_files SET mtime_ns = 0, size = 0")
-        conn.commit()
-
     def _mixed_project(self, projects_dir) -> list[dict]:
         """Three files: cached and fresh, uncached, cached but stale."""
         fresh = [self._record("msg-a"), self._record("msg-b")]
@@ -1620,27 +1635,28 @@ class TestLiveFilesPricedFromTheCcreportCache:
         self._file(projects_dir, "c.jsonl", stale, fresh=False)
         return [*fresh, *uncached, *stale]
 
-    def test_the_cached_path_totals_what_a_full_reparse_totals(self, projects_dir):
-        from ccreport.pricing import compute_project_rolling_costs
+    def test_the_warm_caches_total_what_the_cold_ones_did(self, projects_dir):
+        """The first call fills file_costs; the second answers from it."""
+        from ccreport.pricing import compute_costs
 
         records = self._mixed_project(projects_dir)
-        cached = compute_project_rolling_costs(self.CWD)
-        self._clear_fingerprints()
-        assert cached == compute_project_rolling_costs(self.CWD)
-        assert cached["all_time_project_cost"] == self._expected(*records)
+        cold = compute_costs(cwd=self.CWD)
+        assert cold == compute_costs(cwd=self.CWD)
+        assert cold["all_time_project_cost"] == self._expected(*records)
 
-    def test_every_window_agrees_not_just_the_total(self, projects_dir):
-        """The windows are the reason bucket sums could not be cached."""
-        from ccreport.pricing import ROLLING_COST_NAMES, compute_project_rolling_costs
+    def test_a_logged_cost_is_what_both_paths_total(self, projects_dir):
+        """A `costUSD` in the log is the record's cost on either path.
 
-        self._mixed_project(projects_dir)
-        cached = compute_project_rolling_costs(self.CWD)
-        self._clear_fingerprints()
-        raw = compute_project_rolling_costs(self.CWD)
-        assert [cached[f"{n}_project_cost"] for n in ROLLING_COST_NAMES] == [
-            raw[f"{n}_project_cost"] for n in ROLLING_COST_NAMES
-        ]
-        assert cached["six_hour_project_cost"] == cached["all_time_project_cost"]
+        The parse used to price from tokens while the cached record kept the
+        logged figure, so one warm window read higher than all_time.
+        """
+        from ccreport.pricing import compute_costs
+
+        self._file(projects_dir, "a.jsonl", [self._record("msg-a", cost=2.5)])
+        cold = compute_costs(cwd=self.CWD)
+        assert cold["all_time_project_cost"] == 2.5
+        assert cold["twenty_four_hour_project_cost"] == 2.5
+        assert compute_costs(cwd=self.CWD) == cold
 
     @pytest.mark.parametrize("cached_first", [True, False])
     def test_one_message_in_two_files_counts_once_across_the_two_paths(
@@ -1649,7 +1665,7 @@ class TestLiveFilesPricedFromTheCcreportCache:
         cached_first,
     ):
         """seen_keys is shared, so which path reads the twin cannot matter."""
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         rec = self._record("msg-a")
         first, second = (
@@ -1657,38 +1673,23 @@ class TestLiveFilesPricedFromTheCcreportCache:
         )
         self._file(projects_dir, first, [rec])
         self._file(projects_dir, second, [rec], cached=False)
-        assert compute_project_rolling_costs(self.CWD)[
+        assert compute_costs(cwd=self.CWD)[
             "all_time_project_cost"
         ] == self._expected(rec)
-
-    def test_a_live_files_stored_cost_loses_to_the_recomputed_one(self, projects_dir):
-        """Ccreport may have stored the log's costUSD; the raw path never did.
-
-        Serving the stored value would make a file's cost depend on whether
-        the render happened to hit the cache, which is the one thing the
-        substitution may not change.
-        """
-        from ccreport.pricing import compute_project_rolling_costs
-
-        rec = self._record("msg-a", cost=99.0)
-        self._file(projects_dir, "a.jsonl", [rec])
-        total = compute_project_rolling_costs(self.CWD)["all_time_project_cost"]
-        assert total == self._expected(rec)
-        assert total < 1.0
 
     def test_an_orphans_stored_cost_still_wins(self, projects_dir):
         """No JSONL left to re-price from, so the stored cost is the only truth."""
         from ccreport import cache_db
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         rec = self._record("msg-a", cost=99.0)
         cache_db.save_ccreport_file(
             str(projects_dir / "-tmp-proj" / "gone.jsonl"), 1, 1, [rec]
         )
-        assert compute_project_rolling_costs(self.CWD)["all_time_project_cost"] == 99.0
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 99.0
 
     def test_a_file_modified_after_caching_is_reparsed(self, projects_dir):
-        from ccreport.pricing import compute_project_rolling_costs
+        from ccreport.pricing import compute_costs
 
         rec = self._record("msg-a")
         path = self._file(projects_dir, "a.jsonl", [rec])
@@ -1696,68 +1697,35 @@ class TestLiveFilesPricedFromTheCcreportCache:
         # that no longer exists, and their fingerprint is what says so.
         rewritten = [self._record("msg-b"), self._record("msg-c")]
         path.write_text("".join(self._line(r) + "\n" for r in rewritten))
-        assert compute_project_rolling_costs(self.CWD)[
+        assert compute_costs(cwd=self.CWD)[
             "all_time_project_cost"
         ] == self._expected(*rewritten)
-
-    def test_a_mismatched_salt_falls_back_to_the_raw_parse(self, projects_dir):
-        from ccreport import cache_db
-        from ccreport.pricing import compute_project_rolling_costs
-
-        records = self._mixed_project(projects_dir)
-        conn = cache_db.get_connection()
-        cache_db._set_meta(conn, "ccreport_schema_salt", "not-the-salt")
-        conn.commit()
-        assert compute_project_rolling_costs(self.CWD)[
-            "all_time_project_cost"
-        ] == self._expected(*records)
-
-    def test_an_invalidated_cache_falls_back_to_the_raw_parse(self, projects_dir):
-        from ccreport import cache_db
-        from ccreport.pricing import compute_project_rolling_costs
-
-        records = self._mixed_project(projects_dir)
-        live = {str(p) for p in (projects_dir / "-tmp-proj").glob("*.jsonl")}
-        cache_db.invalidate_ccreport(live)
-        assert compute_project_rolling_costs(self.CWD)[
-            "all_time_project_cost"
-        ] == self._expected(*records)
-
-    def test_a_render_writes_nothing_back(self, projects_dir):
-        """One WAL writer only — a cache miss costs a parse, not a write."""
-        from ccreport import cache_db
-        from ccreport.pricing import compute_project_rolling_costs
-
-        self._mixed_project(projects_dir)
-        conn = cache_db.get_connection()
-        before = conn.execute(
-            "SELECT path, mtime_ns, size FROM ccreport_files"
-        ).fetchall()
-        compute_project_rolling_costs(self.CWD)
-        assert (
-            conn.execute("SELECT path, mtime_ns, size FROM ccreport_files").fetchall()
-            == before
-        )
 
     def test_only_the_files_the_cache_cannot_vouch_for_are_read(
         self,
         projects_dir,
         monkeypatch,
     ):
-        """The point of the change: a fresh fingerprint means no file read."""
+        """A file with cached records and a matching fingerprint is not opened.
+
+        b.jsonl has no cached records, so its per-record timestamps can only
+        come from the file however fresh file_costs is; c.jsonl's fingerprint
+        misses.
+        """
         from pathlib import Path
 
         from ccreport import pricing
 
         self._mixed_project(projects_dir)
+        pricing.compute_costs(cwd=self.CWD)  # fills file_costs for all three
         parsed: list[str] = []
-        real = pricing._iter_jsonl_costs
+        real = pricing._scan_jsonl_file
         monkeypatch.setattr(
             pricing,
-            "_iter_jsonl_costs",
-            lambda p, seen: parsed.append(Path(p).name) or real(p, seen),
+            "_scan_jsonl_file",
+            lambda p, *a, **kw: parsed.append(Path(p).name) or real(p, *a, **kw),
         )
-        pricing.compute_project_rolling_costs(self.CWD)
+        pricing.compute_costs(cwd=self.CWD)
         assert parsed == ["b.jsonl", "c.jsonl"]
 
 
@@ -2639,112 +2607,6 @@ class TestBoundedCostWindows:
         cache_db.add_project_override("name", "proj", "proj")
         assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 4.0
         assert rebuilds == []
-
-
-class TestProjectRollingStaleFileBound:
-    """A project file too old to reach a window need not be re-read for all_time."""
-
-    CWD = "/tmp/proj"
-
-    @pytest.fixture
-    def projects_dir(self, monkeypatch, tmp_path):
-        from ccreport import cache_db, pricing
-
-        d = tmp_path / "projects"
-        (d / "-tmp-proj").mkdir(parents=True)
-        monkeypatch.setattr(pricing, "_get_projects_dirs", lambda: [d])
-        cache_db.init_ccreport_meta(1, "test-hash")
-        return d
-
-    def _write(self, path, mid: str, *, age_s: float) -> None:
-        import json
-        import os
-
-        ts = datetime.now(tz=UTC) - timedelta(seconds=age_s)
-        path.write_text(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "timestamp": ts.isoformat(),
-                    "requestId": f"req-{mid}",
-                    "sessionId": "s1",
-                    "cwd": self.CWD,
-                    "message": {
-                        "id": mid,
-                        "model": OLD_MODEL,
-                        "usage": {"input_tokens": 1000, "output_tokens": 1000},
-                    },
-                }
-            )
-            + "\n"
-        )
-        # mtime is what the bound is read off, so it has to match the record.
-        os.utime(path, (ts.timestamp(), ts.timestamp()))
-
-    def _parses(self, monkeypatch) -> list:
-        from ccreport import pricing
-
-        seen: list = []
-        real = pricing._iter_jsonl_costs
-
-        def spy(path, seen_keys):
-            seen.append(str(path))
-            yield from real(path, seen_keys)
-
-        monkeypatch.setattr(pricing, "_iter_jsonl_costs", spy)
-        return seen
-
-    def test_an_out_of_window_file_comes_from_the_stored_all_time(
-        self,
-        projects_dir,
-        monkeypatch,
-    ):
-        from ccreport.pricing import compute_costs, compute_project_rolling_costs
-
-        old = projects_dir / "-tmp-proj" / "old.jsonl"
-        self._write(old, "msg-old", age_s=90 * 86400)
-        # compute_costs is what fills file_costs; ccreport never ran, so the
-        # record cache has nothing for this file and the fingerprint misses.
-        expected = compute_costs(cwd=self.CWD)["all_time_project_cost"]
-        assert expected > 0
-
-        parsed = self._parses(monkeypatch)
-        totals = compute_project_rolling_costs(self.CWD)
-        assert totals["all_time_project_cost"] == expected
-        assert totals["thirty_day_project_cost"] == 0.0
-        assert parsed == [], "the stored all_time is the whole answer here"
-
-    def test_an_in_window_file_is_still_parsed(self, projects_dir, monkeypatch):
-        from ccreport.pricing import compute_costs, compute_project_rolling_costs
-
-        recent = projects_dir / "-tmp-proj" / "recent.jsonl"
-        self._write(recent, "msg-recent", age_s=3600)
-        expected = compute_costs(cwd=self.CWD)["all_time_project_cost"]
-
-        parsed = self._parses(monkeypatch)
-        totals = compute_project_rolling_costs(self.CWD)
-        assert totals["all_time_project_cost"] == expected
-        # The stored all_time cannot answer a rolling window, so the file is read.
-        assert totals["six_hour_project_cost"] == expected
-        assert parsed == [str(recent)]
-
-    def test_a_changed_file_is_parsed_however_old_it_looks(
-        self,
-        projects_dir,
-        monkeypatch,
-    ):
-        from ccreport.pricing import compute_costs, compute_project_rolling_costs
-
-        old = projects_dir / "-tmp-proj" / "old.jsonl"
-        self._write(old, "msg-old", age_s=90 * 86400)
-        compute_costs(cwd=self.CWD)
-        # Rewritten behind file_costs' back: same age, different bytes, so the
-        # stored (mtime_ns, size) must stop answering for it.
-        self._write(old, "msg-old-two", age_s=91 * 86400)
-
-        parsed = self._parses(monkeypatch)
-        compute_project_rolling_costs(self.CWD)
-        assert parsed == [str(old)]
 
 
 def _iter_live(path):

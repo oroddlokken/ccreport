@@ -118,7 +118,6 @@ from ccreport.pricing import (
     SESSION_WINDOW_S,
     WEEK_WINDOW_S,
     compute_costs,
-    compute_project_rolling_costs,
     compute_session_usage,
     model_family,
     pace_days,
@@ -144,6 +143,10 @@ NEAR_THRESHOLD_MARGIN = 10  # % below a display threshold that still warrants fe
 # between the two is deliberate — aligning them to 600 for consistency runs that
 # rescan half again as often.
 COST_SUMMARY_MAX_AGE = 900  # seconds the cached compute_costs() result stays usable
+# How old the stored summary may be and still supply the project cost split once
+# the COST_SUMMARY_MAX_AGE read has missed. Four unwritten refreshes; past that a
+# render shows the machine-wide total alone rather than an hour-old split.
+COST_SUMMARY_FALLBACK_MAX_AGE = 3600
 FAST_TTL_S = 15            # seconds a render may reuse the previous render's fetch results
 # Twice a day, which is what the update line is worth: master moves in commits,
 # not releases, and nobody pulls on the hour. The stamp behind this is written
@@ -2056,12 +2059,14 @@ def _render_session(
 
 def _merge_cost_data(
     usage_data: dict, session_id: str, cwd: str, native_rl: dict | None = None,
-    cost_summary: dict | None = None,
+    cost_summary: dict | None = None, stale_project_costs: dict | None = None,
 ) -> None:
     """Enrich usage_data with cost data from JSONL and the cost summary cache.
 
     *cost_summary* is the render's single read of that cache — _fetch_usage
     needs the same answer, so main reads it once and passes it to both.
+    *stale_project_costs* is the expired summary the render falls back to for
+    the project split alone, and is None whenever *cost_summary* is not.
     """
     if not usage_data and _on("HISTORIC_COST"):
         # Cold start: no cached row, so the window bounds can only come from
@@ -2086,14 +2091,17 @@ def _merge_cost_data(
         ):
             if k in cost_summary:
                 usage_data[k] = cost_summary[k]
-    if cwd and _on("HISTORIC_COST") and usage_data and not any(
+    if stale_project_costs and cwd and _on("HISTORIC_COST") and usage_data and not any(
         "project_cost" in k for k in usage_data
     ):
-        # compute_costs writes the *_project_cost keys, so a cost summary that
-        # already carried them was just merged above and this would be a full
-        # unbounded rescan producing the same numbers. Only a summary that
-        # predates those keys (or a cold start with none) still needs the walk.
-        usage_data.update(compute_project_rolling_costs(cwd))
+        # Deriving the split here walks every JSONL file in the project on the
+        # render thread — 0.57 s against an 0.08 s render on two fanless cores.
+        # Only the project keys land: another project's refresh moves the row's
+        # machine-wide totals without touching this summary, so the row's pair
+        # is never the older one.
+        usage_data.update({
+            k: v for k, v in stale_project_costs.items() if k.endswith("_project_cost")
+        })
 
 
 class _InputData(NamedTuple):
@@ -2478,16 +2486,24 @@ def _fetch_all(
     battery_proc = _start_battery()
     dsp_proc = _start_dsp_check(memo.get("dsp"))
     try:
-        # One read for the whole render: _fetch_usage decides from it whether a
-        # costs-only refresh is due, _merge_cost_data merges what it holds.
+        # One fresh read for the whole render: _fetch_usage decides from it
+        # whether a costs-only refresh is due, _merge_cost_data merges what it
+        # holds. The wider read follows only when that one missed.
+        cost_summary: dict | None = None
+        stale_costs: dict | None = None
         try:
             from ccreport import cache_db
 
             cost_summary = cache_db.read_cost_summary(
                 max_age=COST_SUMMARY_MAX_AGE, cwd=inp.cwd,
             )
+            # Not passed to _fetch_usage: it gates the refresh spawn on the fresh
+            # read alone, and a hit here would suppress the write this stands in for.
+            stale_costs = None if cost_summary else cache_db.read_cost_summary(
+                max_age=COST_SUMMARY_FALLBACK_MAX_AGE, cwd=inp.cwd,
+            )
         except Exception:  # noqa: BLE001
-            cost_summary = None
+            pass
         # In-process: usage cache + .dogcats log (no subprocess)
         usage_data = _fetch_usage(inp.session_id, inp.cwd, native_rl, cost_summary)
         # Strip project-scoped costs from usage cache — they belong to
@@ -2496,7 +2512,9 @@ def _fetch_all(
             for k in list(usage_data):
                 if "project_cost" in k:
                     del usage_data[k]
-        _merge_cost_data(usage_data, inp.session_id, inp.cwd, native_rl, cost_summary)
+        _merge_cost_data(
+            usage_data, inp.session_id, inp.cwd, native_rl, cost_summary, stale_costs,
+        )
         dcat_data = _fetch_dcat(inp.cwd)
         # Nothing on the line depends on these two; they sit here to overlap the
         # subprocesses started above rather than trail them.

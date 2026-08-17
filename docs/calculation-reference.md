@@ -119,8 +119,12 @@ Each assistant message in JSONL contains:
 }
 ```
 
-Additionally, `scan.py` supports a `costUSD` field on JSONL records — if
-present, that pre-calculated value is used instead of computing from tokens.
+Additionally, a JSONL record may carry a `costUSD` field. Where it does, that
+value is the record's cost for every local reader. `scan.py` stores it,
+`aggregate.UsageRecord.cost` reports it, and `pricing.py` totals its windows
+from it. `calc_cost` over the tokens answers only where it is absent. The
+server prices what it ingests itself, and keeps the client's figure in a column
+of its own.
 
 ---
 
@@ -400,9 +404,10 @@ thousands of rows after months of daily use.
 - **Invalidation**: when week/month keys shift, all `file_costs` rows are deleted (cascades to `dedup_keys`)
 - **Entry shape**: `cost_schema` is the payload version (`cache_db._COST_ENTRY_SCHEMA`),
   checked the same way and truncating the same rows. A row predating a field —
-  `week_model_json`, added for the per-model week split — still matches on mtime
-  and size, so nothing else would invalidate it and the field would total as zero.
-  Bumping the constant buys one full re-scan and makes the whole corpus correct
+  `week_model_json`, added for the per-model week split — or priced under an
+  older rule still matches on mtime and size, so nothing else would invalidate
+  it and what it stored would total as it stands. Bumping the constant buys one
+  full re-scan and makes the whole corpus correct
 - **Per-file change detection**: `mtime_ns` + `size` columns, same logic as before
 - **Dedup keys**: stored in separate `dedup_keys` table with `(file_path, dk)` composite PK
 - **Pre-loaded**: all dedup keys loaded into Python `set` at start of `compute_costs()`
@@ -488,23 +493,23 @@ else:
   this run — preserving historic usage data beyond the ~1 month JSONL retention window
 - **Writes are batched**: freshly parsed files accumulate and flush through
   `save_ccreport_files()` every `_SAVE_BATCH` files, one write transaction per batch
-- **The statusline reads it too**: `compute_project_rolling_costs` sums a live
-  file from `load_ccreport_records_under` when
-  `load_ccreport_file_meta_under` says the fingerprint still matches the file
-  on disk, and re-parses the JSONL when it does not — 90 MB re-parsed per
-  render was ~93% of it. Only per-record facts come from the cache; the windows
-  are still derived from `now` on every call. A live file's
-  cost is recomputed from its cached tokens rather than read from the stored
-  `cost`, so the two paths agree on a record whose `costUSD` disagrees with
-  `calc_cost`; the orphan pass keeps the stored cost, which for a purged file
-  is all that is left. The render never writes back, so files newer than the
-  last `ccreport` run cost one parse each
+- **Cost computation reads it too**: `compute_costs` sums a live file from
+  `load_ccreport_records_since` when `load_ccreport_file_meta` says the
+  fingerprint still matches the file on disk, and re-parses the JSONL when it
+  does not — 90 MB re-parsed per call was ~93% of it. Only per-record facts
+  come from the cache; the windows are still derived from `now` on every call.
+  Both paths resolve a record's cost the same way — the log's `costUSD` where
+  it carried one, `calc_cost` over the tokens otherwise — so which one read a
+  file cannot change its total. `_rec_cost` is that rule for a cached record
+  and `_line_cost` for a parsed line; the orphan pass has only the stored cost
+  left to keep. Nothing here writes records back, so files newer than the last
+  `ccreport` run cost one parse each
 - **The resolved scope is cached per cwd**: `project_scopes(cwd, name,
-  prefixes)` holds what `pricing.project_scope` worked out, so a render with
-  merge rules in play skips `load_ccreport_file_identities` — a GROUP BY over
-  every cached record, 0.020s of an 0.085s call. The row carries no fingerprint
-  of its own: it is a pure function of `project_overrides` and those
-  identities, and every writer of either
+  prefixes)` holds what `pricing.project_scope` worked out, so a cost
+  computation with merge rules in play skips `load_ccreport_file_identities` —
+  a GROUP BY over every cached record, 0.020s of an 0.085s call. The row
+  carries no fingerprint of its own: it is a pure function of
+  `project_overrides` and those identities, and every writer of either
   (`add_project_override`, `delete_project_override`, `invalidate_ccreport`)
   empties the table in the same transaction — except `save_ccreport_files`,
   which empties it only when the batch changes some file's
@@ -514,8 +519,8 @@ else:
   derived one — to the unmerged scope. A row is also ignored when it no longer
   covers the cwd's own project directories, which is what lets a projects dir
   that appeared since the write show up without waiting for an invalidation.
-  This is the one thing a render does write, best-effort: a failing write costs
-  the next render a re-derivation and nothing else
+  The write is best-effort: a failing one costs the next computation a
+  re-derivation and nothing else
 
 ### 5.7 Update Check
 
@@ -578,8 +583,8 @@ waved through — a row stored twice then counted twice in every reader.
 ```
 
 Every reader goes through that one function: `ccreport._keep`, the orphaned and
-cached-record passes in `compute_costs`, `compute_project_rolling_costs`, and
-the JSONL scan itself. Only the log's own key is ever persisted as a file's
+cached-record passes in `compute_costs`, and the JSONL scan itself. Only the
+log's own key is ever persisted as a file's
 `dedup_keys`; the fallback is a read-time device.
 
 Deliberately narrow. Progressive chunks of one streaming message share a
@@ -880,6 +885,16 @@ project's summary goes unwritten for as long as that session runs — taking
 `cache_db.is_costs_refresh_blocked()`, the costs lock alone: `is_fetch_blocked()`
 also reports the API error backoff, which `try_acquire_costs_lock` ignores on
 purpose, and consulting it here would starve the summary for the whole backoff.
+
+That render still needs the `*_project_cost` split, and deriving it walks every
+JSONL file in the project. On a 73 MB project whose open session log matches no
+fingerprint, that took 0.566 s against an 0.08 s render on two fanless cores. So
+a second read follows the miss, with `COST_SUMMARY_FALLBACK_MAX_AGE` (3600 s) in
+place of the 900 s. Only the split is taken from it: another project's refresh
+moves the row's machine-wide totals without touching this summary. Past an hour
+the cost windows show `$total` alone until a refresh lands. The wider read never
+reaches `_fetch_usage`, which gates the `--costs-only` spawn on the fresh read
+alone. A hit there would suppress the write the fallback stands in for.
 
 **Historic cost line** (separate from rate-limit line):
 
@@ -1230,10 +1245,10 @@ report on real data:
   stdin where it has no real one; rows written before the lookahead check carry
   it. `_rl_sample` now refuses anything more than `cache_db.RL_MAX_LOOKAHEAD_S`
   (8 days — one day of slack over the longest real window) past the reading,
-  and `cmd_limits` drops the stored ones after the date/window filters,
-  printing a one-line count to stderr.
-  Silently dropping them would leave a report nobody could reconcile against the
-  row count in the table
+  and `cmd_limits` drops the stored ones after the date/window filters. Silently:
+  the count was printed to stderr for a while, and a note above every run is a
+  line nobody reads twice. Every row carries its reset time, which is what a
+  reader reconciling the table against a stored total needs
 
 Per instance:
 
@@ -1247,7 +1262,7 @@ Per instance:
 | $/pp | Spend ÷ rise — an exchange rate, not an identity. The rate limit meters something Anthropic does not publish; this prices the points in the only unit this tool has. The footer's is the group's total spend over its total rise, not the mean of the rows: a window that rose one point would otherwise weigh as much as a week that rose forty |
 | Extra | real dollars billed as Extra usage while the window ran, from `extra_usage_snapshots`. Not gated on Hit, and measured over the window's whole span rather than over the fill — see below. `—` where no reading bounds the span, which is unknown and not $0.00; `$0.00` where readings bound it and it did not move. `--json` carries it as `extra_usd` |
 | Hit | `round(peak) >= 100`. Rounded to match the write gate, which only passes a whole-percent move — 99.6 is the last sample a full window can leave behind |
-| Account / Tier | attributed at the instance's **first** sample, via `AccountTimeline.label_at()` / `.tier_at()` — one bisect over the same events, so both answers come off the event in force when the window opened |
+| Account / Tier | attributed at the instance's **first** sample, via `AccountTimeline.label_at()` / `.tier_at()` — one bisect over the same events, so both answers come off the event in force when the window opened. A window with no tier there is not in the table at all (below) |
 
 The spend join takes the full record path (`load_all_records`), not a `SUM` over
 `ccreport_records`: dedup is what makes the number an answer, and summing the
@@ -1290,15 +1305,23 @@ number cannot say:
   opening (or a $0.00 inside it) and one after that, the answer is `—`
 - 31 days of retention, so an older window is `—` however full it got
 
-Below each table, one caption line per **partial** window and then one per
-**open** window (`resets_at` in the
-future): where it stands, the reading it was first seen at, the rate, the
-projected fill at reset, and what the points left are worth at that window's own
-$/pp — `_open_note` has why a caption rather than a column. The arithmetic and
-its uncapped, extrapolate-from-the-last-sample rule are `WindowInstance.projected_pct`.
+Below each table, one caption line per **partial** window, and nothing else. An
+**open** window (`resets_at` in the future) is a row like the closed ones. It had
+a caption of its own for a while — where it stood, the rate, the projected fill
+at reset, what the points left were worth — and the projection is the part that
+did not survive contact: a rate over two adjacent renders carried to a 7-day
+reset read 1595%, and even a sound one answered a question nobody reading the
+table had asked. `--json` carries it as `projected_used_pct`, uncapped and
+extrapolated from the last sample (`WindowInstance.projected_pct`), for a caller
+that wants it.
 
-A blank tier is an event that predates the tier columns (or no event at all):
-absent, not a change. `--since` / `--until` select samples, not instances, so a
+A window whose first sample resolves to no tier — an event that predates the tier
+columns, or no event at all — is left out of the tables, silently, like the
+placeholders above (`_tiered`, `cmd_limits`). Its peak and its spend are real
+readings with no entitlement behind them, and a table is read down a column: the
+row cannot be set beside the one under it. Nothing is deleted, `--json` prints
+every instance, and a run whose every window is untiered exits 1 with a reason
+rather than printing empty tables. `--since` / `--until` select samples, not instances, so a
 window straddling the bound reports the peak, fill time and spend of the part
 inside the range. Each window type gets its own table, summarized by instances
 seen, how many hit 100%, the max peak and the group exchange rate; `--json`

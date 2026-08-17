@@ -233,7 +233,9 @@ The token and the push policy land in `~/.config/ccreport/push.toml` at mode
 0600. `--opt-in-repos work,ccreport` restricts that policy to the named
 projects: every other project still sends its counts, but its name, session,
 cwd and repo are stripped before the push and report as one aggregated row per
-account.
+account. `--interval-minutes 5` sets how often the status line's detached push
+runs; the default is 30. A metered link wants a longer interval, a wired desktop
+a shorter one.
 
 ## Install
 

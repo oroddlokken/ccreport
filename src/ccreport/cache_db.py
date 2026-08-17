@@ -408,11 +408,11 @@ _ADDED_COLUMNS: list[tuple[str, str, str]] = [
 ]
 
 # Shape of a file_costs row's payload, stored in meta as `cost_schema` and
-# checked the way the week and month keys are. Bump it when a stored entry
-# gains or loses a field: a row from the previous shape still matches on mtime
-# and size, so nothing else would ever make it re-scan, and the missing field
-# reads as an empty total rather than an error.
-_COST_ENTRY_SCHEMA = "2"
+# checked the way the week and month keys are. Bump it when a stored entry gains
+# or loses a field, and when the rule that priced one changes: a row from before
+# either still matches on mtime and size, so nothing else would ever make it
+# re-scan, and it reads back as a total rather than as an error.
+_COST_ENTRY_SCHEMA = "3"
 
 
 def _add_column(

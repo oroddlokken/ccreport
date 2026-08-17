@@ -1397,6 +1397,12 @@ def cmd_server_connect(args) -> None:
         fields["networks"] = [
             cidr.strip() for cidr in args.only_on_network.split(",") if cidr.strip()
         ]
+    if args.interval_minutes is not None:
+        if args.interval_minutes < 1:
+            print("ccreport: --interval-minutes takes a positive number of minutes.",
+                  file=sys.stderr)
+            sys.exit(1)
+        fields["interval_minutes"] = args.interval_minutes
     push.write_server(path, args.url, fields)
     console.print(
         f"Connected to [bold]{args.url}[/bold] as "
@@ -1406,6 +1412,8 @@ def cmd_server_connect(args) -> None:
     if fields.get("restricted"):
         allowed = ", ".join(fields["allow"]) or "nothing"
         console.print(f"Restricted: only {allowed} will be identified by name.")
+    if "interval_minutes" in fields:
+        console.print(f"Pushing every {fields['interval_minutes']} min.")
 
 
 def _split_allow_targets(targets: Sequence[str], entries: dict, path: Path) -> tuple[str, list[str]]:
@@ -1490,6 +1498,7 @@ def cmd_server_status(args) -> None:
         console.print(f"  network gate {', '.join(server.networks) or 'none'}")
         if server.networks and not push.on_allowed_network(server.networks):
             console.print("               [yellow]off-network: pushes are held[/yellow]")
+        console.print(f"  interval     {server.interval_s // 60} min")
         attempt, failures, stopped = cache_db.read_push_attempt(server.url)
         success, reason = cache_db.read_push_outcome(server.url)
         console.print(f"  last push    {_fmt_epoch(success) if success else 'never'}")
@@ -2364,6 +2373,16 @@ def _limits_entry(
     }
 
 
+def _tiered(inst: WindowInstance, accounts: AccountTimeline) -> bool:
+    """Whether the account log records which tier *inst* filled against.
+
+    False for a window whose first sample predates the tier columns: its peak
+    and its spend are real readings, and a fill rate with no entitlement behind
+    it cannot be set beside the window below it in the table.
+    """
+    return accounts.tier_at(_as_local(inst.first_ts)) is not None
+
+
 def _partial_note(inst: WindowInstance) -> str | None:
     """The caption line for a window that was already filling when first seen.
 
@@ -2380,33 +2399,6 @@ def _partial_note(inst: WindowInstance) -> str | None:
         f"* {named}{_fmt_epoch(inst.resets_at)}: first sampled at "
         f"{inst.opening_pct:.1f}%{lag} — Peak counts that rise, Spend and $/pp do not"
     )
-
-
-def _open_note(inst: WindowInstance, spend: WindowSpend, now: float) -> str | None:
-    """The caption line for a window that has not reset yet, or None.
-
-    A projection belongs to one row, so a column of it would be one number and
-    a stack of dashes. In words it can open with the reading it starts from,
-    which is where capture began and not where the window did.
-    """
-    if not inst.is_open(now):
-        return None
-    named = f"{short_model(inst.model)}: " if inst.model else ""
-    standing = f"{named}open at {inst.latest_pct:.1f}% ({_fmt_epoch(inst.last_ts)})"
-    parts = [f"{standing}, seen from {inst.opening_pct:.1f}%"]
-    projected = inst.projected_pct(now)
-    if projected is None:
-        parts.append("no rate to project from yet")
-    else:
-        parts.append(
-            f"{_fmt_burn(inst.burn_pph)} pp/h → {projected:.0f}% by reset "
-            f"{_fmt_epoch(inst.resets_at)}"
-        )
-    if spend.headroom_usd is not None:
-        parts.append(
-            f"{100 - inst.latest_pct:.1f} pp left ≈ {fmt_cost(spend.headroom_usd)}"
-        )
-    return "; ".join(parts)
 
 
 def _group_per_pp(group: list[WindowInstance], spends: dict) -> float | None:
@@ -2426,11 +2418,12 @@ def report_limits(
     instances: list[WindowInstance],
     accounts: AccountTimeline,
     spends: dict[tuple[str, str | None, float], WindowSpend],
-    now: float,
 ) -> None:
     """Print one table per window type, each summarized by its own footer.
 
     *instances* arrive in _instance_order, so each group is already chronological.
+    Nothing here needs the clock: an open window is a row like the closed ones,
+    and where its rate leads is in --json.
 
     Account and tier are attributed at the instance's first sample, the way
     ccreport attributes a record: the table answers "who was drawing on this
@@ -2445,7 +2438,6 @@ def report_limits(
         group = [i for i in instances if i.window == window]
         scoped = window == "scoped"
         notes = [n for n in (_partial_note(i) for i in group) if n]
-        notes += [n for n in (_open_note(i, spends[i.key], now) for i in group) if n]
         table = Table(
             title=f"{_LIMIT_WINDOW_LABELS.get(window, window)} — {len(group)} window(s)",
             title_style="bold", box=box.ROUNDED, expand=False, show_lines=False,
@@ -2540,8 +2532,14 @@ def cmd_limits(args) -> None:
     boundary reports the peak and fill time of the part inside the range, and
     the spend of that part.
 
-    Exits 1 with a note on stderr when no samples have been recorded at all and
-    when the filters leave none.
+    The tables carry the windows whose tier is recorded; --json carries every
+    instance. A table is read down a column, and the history from before the
+    tier columns cannot be compared with the rows under it, while --json is
+    arithmetic somewhere else and drops nothing.
+
+    Exits 1 with a reason on stderr when no samples have been recorded at all,
+    when the filters leave none, and when no sampled window has a tier. Nothing
+    else is printed there: the report is what the run is for.
     """
     since = parse_date(args.since) if args.since else None
     until = parse_date(args.until) if args.until else None
@@ -2562,19 +2560,11 @@ def cmd_limits(args) -> None:
     if until:
         samples = [s for s in samples if s["ts"] <= until.timestamp()]
 
-    # After the filters, so the count describes the data this run would have
-    # reported rather than every placeholder on the machine. Said out loud
-    # because a report that quietly drops rows is a report that cannot be
-    # reconciled with the row count in the table.
-    kept = [s for s in samples if not _implausible_reset(s)]
-    if len(kept) < len(samples):
-        print(
-            f"note: dropped {len(samples) - len(kept)} sample(s) whose reset time "
-            f"is more than {RL_MAX_LOOKAHEAD_S // 86400} days past the reading — a "
-            "placeholder Claude Code sent, kept in history but not a window",
-            file=sys.stderr,
-        )
-    samples = kept
+    # A placeholder reset (RL_MAX_LOOKAHEAD_S past its reading) is not a window
+    # and is left out silently. The tables print the reset time of every row, so
+    # a reader counting them against a stored total has the dates to do it with,
+    # and a note above every run is a line nobody reads twice.
+    samples = [s for s in samples if not _implausible_reset(s)]
     if not samples:
         print("No rate-limit samples match those filters.", file=sys.stderr)
         sys.exit(1)
@@ -2582,14 +2572,24 @@ def cmd_limits(args) -> None:
     instances = sorted(_window_instances(samples), key=_instance_order)
     accounts = AccountTimeline(load_account_events())
     now = datetime.now(UTC).timestamp()
-    spends = _load_instance_spend(instances, now)
     if args.json:
+        spends = _load_instance_spend(instances, now)
         print(json.dumps(
             [_limits_entry(i, accounts, spends[i.key], now) for i in instances],
             indent=2,
         ))
         return
-    report_limits(instances, accounts, spends, now)
+
+    shown = [i for i in instances if _tiered(i, accounts)]
+    if not shown:
+        print(
+            "Every sampled window predates the tier columns in the account log, so "
+            "the tables would carry no comparison. `ccreport limits --json` prints "
+            "them as recorded.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    report_limits(shown, accounts, _load_instance_spend(shown, now))
 
 
 def main() -> None:
@@ -2711,6 +2711,9 @@ def main() -> None:
                                  "The flag with no names sets restricted and identifies nothing")
             sp.add_argument("--only-on-network", metavar="CIDRS",
                             help="Comma-separated CIDRs this machine must be inside to push")
+            sp.add_argument("--interval-minutes", metavar="N", type=int,
+                            help="Minutes between detached pushes from this machine "
+                                 "(default 30)")
         if name in ("allow", "deny"):
             sp.add_argument("targets", nargs="+", metavar="TARGET",
                             help="Project names, before or after a merge rule, after an optional "

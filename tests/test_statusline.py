@@ -507,7 +507,6 @@ class TestMergeCostData:
             return {"session_window_cost": 3.5}
 
         monkeypatch.setattr(sl, "compute_costs", fake_compute)
-        monkeypatch.setattr(sl, "compute_project_rolling_costs", lambda cwd: {})
         return seen
 
     def test_native_resets_passed_through(self, calls):
@@ -542,41 +541,53 @@ class TestMergeCostData:
         assert usage["week_model_costs"] == split
 
 
-class TestProjectCostRescanIsGated:
-    """compute_project_rolling_costs is an unbounded rescan.
+class TestTheProjectSplitComesFromStorage:
+    """Deriving the *_project_cost keys walks the project's JSONL logs.
 
-    Every *_project_cost key it produces is also written by compute_costs and
-    cached in the cost summary, so running it over numbers that were merged one
-    line earlier buys the render nothing.
+    No render pays for that walk: a summary too old for the merge above still
+    supplies the split, and the detached --costs-only refresh writes the next
+    one. _merge_cost_data carries the figures.
     """
 
     PROJ_KEY = "twenty_four_hour_project_cost"
 
-    @pytest.fixture
-    def rescans(self, monkeypatch):
+    @pytest.fixture(autouse=True)
+    def historic_cost_on(self, monkeypatch):
         monkeypatch.setenv("CLAUDE_STATUSLINE_HISTORIC_COST", "1")
-        seen: list[str] = []
-        monkeypatch.setattr(
-            sl,
-            "compute_project_rolling_costs",
-            lambda cwd: seen.append(cwd) or {self.PROJ_KEY: 99.0},
-        )
-        return seen
 
     def test_the_key_is_in_the_summary_merge_list(self):
         assert self.PROJ_KEY in sl.rolling_cost_keys()
 
-    def test_a_summary_with_project_costs_skips_the_rescan(self, rescans):
+    def test_a_fresh_summary_carrying_them_ignores_the_stored_set(self):
         usage = {"session_percent": 10}
-        sl._merge_cost_data(usage, "sid", "/tmp/proj", None, {self.PROJ_KEY: 4.0})
-        assert rescans == []
+        sl._merge_cost_data(
+            usage, "sid", "/tmp/proj", None, {self.PROJ_KEY: 4.0}, {self.PROJ_KEY: 99.0},
+        )
         assert usage[self.PROJ_KEY] == 4.0
 
-    def test_a_summary_without_them_still_rescans(self, rescans):
+    def test_an_expired_summary_supplies_the_split(self):
+        usage = {"session_percent": 10}
+        sl._merge_cost_data(usage, "sid", "/tmp/proj", None, None, {self.PROJ_KEY: 4.0})
+        assert usage[self.PROJ_KEY] == 4.0
+
+    def test_a_fresh_summary_without_them_supplies_nothing(self):
+        """It writes no refresh spawn either, so the split waits out its TTL."""
         usage = {"session_percent": 10}
         sl._merge_cost_data(usage, "sid", "/tmp/proj", None, {"week_cost": 4.0})
-        assert rescans == ["/tmp/proj"]
-        assert usage[self.PROJ_KEY] == 99.0
+        assert not [k for k in usage if "project_cost" in k]
+
+    def test_only_the_project_keys_come_from_the_stored_set(self):
+        usage = {"session_percent": 10, "week_cost": 1.0}
+        sl._merge_cost_data(
+            usage, "sid", "/tmp/proj", None, None,
+            {self.PROJ_KEY: 4.0, "week_cost": 99.0},
+        )
+        assert usage["week_cost"] == 1.0
+
+    def test_nothing_stored_leaves_the_split_out(self):
+        usage = {"session_percent": 10}
+        sl._merge_cost_data(usage, "sid", "/tmp/proj", None, None, None)
+        assert not [k for k in usage if "project_cost" in k]
 
 
 class TestGitDiffstatIsGatedOnItsToggle:
@@ -1085,6 +1096,78 @@ class TestAFreshRowStillRefreshesAnExpiredSummary:
 
         cache_db.record_fetch_failure()
         assert spawns(None) == [{"costs_only": True}]
+
+
+class TestARenderServesTheStoredProjectSplit:
+    """The wider summary read is a second meta round trip, and only on the miss.
+
+    _fetch_usage gates its --costs-only spawn on the fresh read alone, so a hit
+    on the wider one must not reach it: that would suppress the very write the
+    render is standing in for.
+    """
+
+    PROJ_KEY = "seven_day_project_cost"
+
+    @pytest.fixture
+    def render(self, monkeypatch, tmp_path):
+        from ccreport import cache_db
+
+        monkeypatch.setenv("CLAUDE_STATUSLINE_HISTORIC_COST", "1")
+        monkeypatch.setenv("CLAUDE_STATUSLINE_GIT", "0")
+        ages: list[int] = []
+        gated: list[dict | None] = []
+
+        def fake_read(max_age=600, cwd=None):
+            ages.append(max_age)
+            if max_age >= sl.COST_SUMMARY_FALLBACK_MAX_AGE:
+                return {self.PROJ_KEY: 7.0, "week_cost": 99.0}
+            return None
+
+        def fake_fetch_usage(session_id, cwd, native_rl, cost_summary):
+            gated.append(cost_summary)
+            # 42.0 is another project's: the singleton row carries whatever the
+            # last refresh scoped it to, which _fetch_all strips.
+            return {"session_percent": 5, "week_cost": 1.0, self.PROJ_KEY: 42.0}
+
+        monkeypatch.setattr(cache_db, "read_cost_summary", fake_read)
+        monkeypatch.setattr(sl, "_fetch_usage", fake_fetch_usage)
+        monkeypatch.setattr(sl, "_fetch_dcat", lambda cwd: {})
+        monkeypatch.setattr(sl, "_capture_account", lambda memo=None: None)
+        monkeypatch.setattr(sl, "_accumulate_cache_stats", lambda *a: (0, 0, 0))
+        monkeypatch.setattr(sl, "compute_session_usage", lambda *a: (0.0, frozenset()))
+        inp = sl._InputData(
+            cwd=str(tmp_path),
+            model="Opus",
+            effort="",
+            thinking_off=False,
+            used="10",
+            ctx_size=200_000,
+            lines_added=0,
+            lines_removed=0,
+            cache_create=0,
+            cache_read=0,
+            input_fresh=0,
+            total_in=0,
+            session_id="stored-split-session",
+        )
+        fetched = sl._fetch_all(inp, {}, {}, 1_000_000.0, test_mode=True)
+        return fetched, ages, gated
+
+    def test_the_miss_takes_the_wider_read(self, render):
+        _, ages, _ = render
+        assert ages == [sl.COST_SUMMARY_MAX_AGE, sl.COST_SUMMARY_FALLBACK_MAX_AGE]
+
+    def test_the_split_is_the_stored_one(self, render):
+        fetched, _, _ = render
+        assert fetched.usage[self.PROJ_KEY] == 7.0
+
+    def test_the_refresh_gate_sees_the_miss(self, render):
+        _, _, gated = render
+        assert gated == [None]
+
+    def test_the_machine_wide_total_stays_with_the_row(self, render):
+        fetched, _, _ = render
+        assert fetched.usage["week_cost"] == 1.0
 
 
 class TestRenderSurvivesContention:

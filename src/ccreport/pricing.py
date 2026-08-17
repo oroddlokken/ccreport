@@ -739,6 +739,10 @@ def _line_cost(
 
     Only the log's own dedup key is returned: the fallback identity is a
     read-time device, and callers persist what they get as durable dedup keys.
+
+    A logged `costUSD` is the cost, as it is for `aggregate.UsageRecord.cost`
+    and for the cached-record readers here — pricing from tokens instead made a
+    window disagree with the reports and with a warm cache.
     """
     if b'"assistant"' not in line:
         return None
@@ -767,6 +771,12 @@ def _line_cost(
             return None
         seen_keys.add(key)
 
+    logged = rec.get("costUSD")
+    if logged is not None:
+        try:
+            return float(logged), ts, dk, model
+        except (TypeError, ValueError):
+            pass
     return calc_cost(*tokens, model, ts), ts, dk, model
 
 
@@ -1115,14 +1125,13 @@ def _accumulate_orphaned_costs(
     seen_keys: set[str],
     thresholds: dict[str, float],
     totals: dict[str, float],
-    proj_totals: dict[str, float] | None = None,
-    project_name: str = "",
+    proj_totals: dict[str, float],
+    project_name: str,
     path_prefixes: list[str] | None = None,
     extra_thresholds: dict[str, float] | None = None,
     extra_totals: dict[str, float] | None = None,
     week_model_totals: dict[str, float] | None = None,
     resolve: Resolver | None = None,
-    all_time: bool = True,
 ) -> None:
     """Accumulate costs from orphaned ccreport records (deleted JSONL files).
 
@@ -1135,11 +1144,10 @@ def _accumulate_orphaned_costs(
     already applied — *resolve* puts the record through the same rules, so both
     sides of the comparison land on the merge target before it is made.
 
-    *all_time* off leaves the untimed bucket alone, for a caller handed only
-    the records inside its widest window: those records' all-time share is in
-    the stored orphan totals (_orphan_alltime_totals), which cover every
-    orphaned record rather than the recent ones, so adding it here too would
-    count it twice.
+    The untimed bucket is left alone: the caller is handed only the records
+    inside its widest window, and their all-time share is in the stored orphan
+    totals (_orphan_alltime_totals), which cover every orphaned record rather
+    than the recent ones. Adding it here too would count it twice.
     """
     from ccreport.project_identity import record_project
 
@@ -1155,15 +1163,11 @@ def _accumulate_orphaned_costs(
             if not cost:
                 continue
             ts_epoch = rec.get("ts", 0)
-            if all_time:
-                totals["all_time"] = totals.get("all_time", 0.0) + cost
             # The path test is what places a record from a project-scoped read;
             # the name is the only handle left on one whose directory is gone.
             is_project = is_ours or bool(
                 project_name and record_project(rec, resolve) == project_name
             )
-            if all_time and is_project and proj_totals is not None:
-                proj_totals["all_time"] = proj_totals.get("all_time", 0.0) + cost
             if ts_epoch:
                 _bucket_rolling_cost(cost, ts_epoch, thresholds, totals,
                                      proj_totals, is_project)
@@ -1302,118 +1306,6 @@ def _apply_orphan_alltime(
             proj_totals["all_time"] = proj_totals.get("all_time", 0.0) + cost
 
 
-def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
-    """Rolling cost totals for one project, `ccreport merge` targets included.
-
-    A file whose (mtime_ns, size) still matches what ccreport cached is summed
-    from those cached records instead of re-read; docs/calculation-reference.md
-    section 5.6 has why, and why the windows themselves are never cached.
-
-    Read-only bar one row: a render never writes records back, only the
-    resolved scope.
-    """
-    if not cwd:
-        return {}
-
-    projects_dirs = _get_projects_dirs()
-    scope = project_scope(cwd, projects_dirs)
-
-    now_local = datetime.now(tz=_local_tz())
-    thresholds = _rolling_thresholds(now_local)
-    totals: dict[str, float] = {}
-    seen_keys: set[str] = set()
-
-    # One walk of the project's directories, reused below as the live-path set
-    # that tells an orphaned cached record from a file still on disk. Walking
-    # twice cost a second full rglob of the project on every render.
-    project_files: list[Path] = []
-    for prefix in scope.prefixes:
-        proj_dir = Path(prefix)
-        if proj_dir.is_dir():
-            project_files.extend(sorted(proj_dir.rglob("*.jsonl")))
-    project_live_paths = {str(p) for p in project_files}
-
-    # One scoped load, read twice: as the per-file record cache the walk below
-    # hits, and as the orphan source after it. Scoped to the project's path
-    # prefixes in SQL — this runs on every render, and the prefixes discard all
-    # but one project's share anyway. Empty on any failure, including a cache
-    # the salt says this build cannot read, which degrades to the full raw
-    # parse this used to do unconditionally.
-    project_ccr: dict[str, list[dict]] = {}
-    cached_meta: dict[str, tuple[int, int]] = {}
-    # compute_costs' own per-file totals, for the files this one would
-    # otherwise have to open. Same scoping, same failure posture.
-    file_alltime: dict[str, tuple[int, int, float, list[str]]] = {}
-    try:
-        from ccreport.cache_db import (
-            load_ccreport_file_meta_under,
-            load_ccreport_records_under,
-            load_file_all_time_under,
-        )
-        for prefix in scope.prefixes:
-            project_ccr.update(load_ccreport_records_under(prefix))
-            cached_meta.update(load_ccreport_file_meta_under(prefix))
-            file_alltime.update(load_file_all_time_under(prefix))
-    except Exception:  # noqa: BLE001
-        project_ccr, cached_meta, file_alltime = {}, {}, {}
-
-    oldest_threshold = min(thresholds.values())
-
-    for jsonl_path in project_files:
-        try:
-            st = jsonl_path.stat()
-        except OSError:
-            continue
-        key = str(jsonl_path)
-        if cached_meta.get(key) != (st.st_mtime_ns, st.st_size):
-            # No cached records for this file, so all_time would cost a full
-            # re-read of it — and with the ccreport cache unreadable that is
-            # every file in the project, however far back it goes. A file last
-            # written before the widest window opened can only reach all_time,
-            # which compute_costs has already summed per file and keyed by the
-            # same (mtime_ns, size). A record cannot postdate the write that
-            # appended it, which is the same reading of mtime compute_costs'
-            # own in_rolling_window test makes.
-            stored = file_alltime.get(key)
-            if (st.st_mtime < oldest_threshold and stored is not None
-                    and stored[:2] == (st.st_mtime_ns, st.st_size)):
-                totals["all_time"] = totals.get("all_time", 0.0) + stored[2]
-                seen_keys.update(stored[3])
-                continue
-            for cost, ts, _dk, _model in _iter_jsonl_costs(jsonl_path, seen_keys):
-                totals["all_time"] = totals.get("all_time", 0.0) + cost
-                _bucket_rolling_cost(cost, ts.timestamp(), thresholds, totals)
-            continue
-        for rec in project_ccr.get(key, ()):
-            if record_is_duplicate(rec, seen_keys):
-                continue
-            # Recomputed from the record's own tokens, never its stored cost:
-            # the raw path recomputes too, and a file still on disk has nothing
-            # to lose by it. The orphan pass below keeps the stored cost, which
-            # for a purged file is the only surviving truth.
-            cost = _rec_cost_from_tokens(rec)
-            if not cost:
-                continue
-            totals["all_time"] = totals.get("all_time", 0.0) + cost
-            ts_epoch = rec.get("ts") or 0.0
-            if ts_epoch:
-                _bucket_rolling_cost(cost, ts_epoch, thresholds, totals)
-
-    # Include orphaned cached records for this project.
-    try:
-        _accumulate_orphaned_costs(
-            project_ccr, project_live_paths, seen_keys, thresholds,
-            totals, path_prefixes=scope.prefixes,
-        )
-    except Exception:  # noqa: BLE001
-        pass
-
-    return {
-        f"{name}_project_cost": round(totals.get(name, 0.0), 4)
-        for name in ROLLING_COST_NAMES
-    }
-
-
 def pace_days() -> int:
     """The pace window in days from CLAUDE_CODE_PACE_DAYS, default 7.
 
@@ -1483,10 +1375,8 @@ def _parse_window_starts(
 def _rec_cost_from_tokens(rec: dict) -> float:
     """Cost of a ccreport record priced from its own tokens, stored cost ignored.
 
-    What a reader wants when the JSONL is still on disk: the raw parse prices
-    every record this way, so a cached record whose stored cost came from the
-    log's costUSD would otherwise total differently depending on which path
-    read it.
+    What _rec_cost falls back to for a record whose log gave no `costUSD`, which
+    is almost all of them.
     """
     t = rec.get("t")
     if not t or len(t) < 4:
@@ -1786,7 +1676,6 @@ def compute_costs(
 
     # Every JSONL still on disk, across all projects: this function owes a
     # global total as well as the project's, so its walk is the whole corpus.
-    # compute_project_rolling_costs keeps a project-scoped set of its own.
     corpus_live_paths: set[str] = set()
 
     for projects_dir in projects_dirs:
@@ -1910,7 +1799,6 @@ def compute_costs(
         extra_thresholds=extra_thresholds, extra_totals=extra_totals,
         week_model_totals=week_model_totals,
         resolve=scope.resolve,
-        all_time=False,
     )
     _apply_orphan_alltime(
         _orphan_alltime_totals(set(ccr_file_meta) - corpus_live_paths, projects_dirs),
