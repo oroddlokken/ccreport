@@ -1699,6 +1699,9 @@ def cmd_update(args) -> None:
             where = f"{branch} tracks no remote branch"
         else:
             where = f"{branch} tracks {tracks}"
+        # The refusal reads as an answer to the count, so the count has to have
+        # landed first: stdout is block-buffered down a pipe and stderr is not.
+        sys.stdout.flush()
         print(f"Not pulling: {where}, so a fast-forward here cannot reach {upstream} and "
               f"the count above would survive it. Check out a branch that tracks "
               f"{upstream}, or bring the commits in with git yourself.", file=sys.stderr)
