@@ -134,7 +134,12 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   repeating a number the user has acted on. There are no tags and no releases —
   master is the release and the unit is a commit. `ccreport update` asks the
   same question inline, with no spawn and no interval, and writes its answer
-  through the same keys
+  through the same keys. Both the line and `--pull` are further gated on
+  `pull_reaches_upstream`: the count is measured against `origin/master` while a
+  bare `git pull` follows whatever the checked-out branch tracks, and on a fork
+  those are two different refs — a topic branch tracking `fork/<topic>` pulls
+  something already up to date and leaves the count where it was. The gate is
+  last on the render path because it is the one reader that opens `.git/config`
 - Which rows a report has is `aggregate.py`; what they look like is
   `ccreport.py`. The row builders there are the one place the rollup path and
   the full record path meet, and the server folds records through the same

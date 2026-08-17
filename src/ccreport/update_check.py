@@ -12,12 +12,13 @@ even when the check fails, so an unreachable API costs one process per
 interval rather than one per render.
 
 Nothing here writes to the checkout. The remote state comes over HTTPS, and
-the local SHA is read out of `.git` as a file — no fetch, no refs touched, and
-no git process on the render path.
+the local SHA, the branch and its upstream are read out of `.git` as files —
+no fetch, no refs touched, and no git process on the render path.
 
 Module-level imports stay stdlib-cheap and already-loaded, because
-`statusline.py` imports this on its slow path for the two readers at the top.
-urllib, subprocess and cache_db are deferred into the functions that need them.
+`statusline.py` imports this on its slow path for the readers at the top.
+configparser, urllib, subprocess and cache_db are deferred into the functions
+that need them.
 """
 
 from __future__ import annotations
@@ -94,6 +95,65 @@ def local_head_sha(root: Path) -> str | None:
         if name.strip() == ref and _SHA_RE.match(sha):
             return sha
     return None
+
+
+def head_branch(root: Path) -> str | None:
+    """The branch HEAD is on, or None for a detached HEAD or an unreadable file.
+
+    Read as a file for the same reason `local_head_sha` is read as one: this
+    answers a question the status line asks, where a git process would cost
+    more than the rest of the line put together.
+    """
+    try:
+        head = (root / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    prefix = "ref: refs/heads/"
+    if not head.startswith(prefix):
+        return None
+    return head[len(prefix):].strip() or None
+
+
+def tracked_upstream(root: Path) -> str | None:
+    """`<remote>/<branch>` that HEAD's branch pulls from, or None when it has none.
+
+    Straight out of `.git/config`, which git writes in an INI dialect
+    configparser reads: `[branch "master"]` is the section and `remote` and
+    `merge` are the two keys `git pull` with no arguments resolves. A detached
+    HEAD, a branch nobody set an upstream on and an unreadable config all
+    answer None, since none of them names a ref a pull would follow.
+    """
+    import configparser
+
+    branch = head_branch(root)
+    if branch is None:
+        return None
+    parser = configparser.ConfigParser(strict=False)
+    try:
+        parser.read(root / ".git" / "config", encoding="utf-8")
+    except (OSError, UnicodeDecodeError, configparser.Error):
+        return None
+    section = f'branch "{branch}"'
+    if not parser.has_section(section):
+        return None
+    remote = parser.get(section, "remote", fallback="").strip()
+    merge = parser.get(section, "merge", fallback="").strip()
+    head_ref = "refs/heads/"
+    if not remote or not merge.startswith(head_ref):
+        return None
+    return f"{remote}/{merge[len(head_ref):]}"
+
+
+def pull_reaches_upstream(root: Path) -> bool:
+    """Would a bare `git pull` here fast-forward toward the branch we measure against?
+
+    The count comes from comparing HEAD to origin's UPSTREAM_BRANCH over the
+    API, while a pull follows whatever the checked-out branch tracks. On a fork
+    those are two different refs, and a topic branch tracking `fork/<topic>`
+    pulls something already up to date while the count stands unchanged. This
+    is the question that has to be asked before the pull is offered or run.
+    """
+    return tracked_upstream(root) == f"origin/{UPSTREAM_BRANCH}"
 
 
 def remote_slug(root: Path) -> str | None:

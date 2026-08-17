@@ -960,11 +960,12 @@ def _render_update(now: float) -> str:
     goes into the fetch cache beside the other rendered segments, so the
     fast path neither reads the database nor re-spawns.
 
-    Three things have to hold before the line appears. The count is above
-    zero; the check is recent enough to still describe the world; and the SHA
-    it compared is still the one at HEAD — a pull between the check and the
-    render silences the line rather than letting it repeat an answer the user
-    has already acted on.
+    Four things have to hold before the line appears. The count is above zero;
+    the check is recent enough to still describe the world; the SHA it compared
+    is still the one at HEAD — a pull between the check and the render silences
+    the line rather than letting it repeat an answer the user has already acted
+    on; and the checkout is on a branch the offered command can actually
+    fast-forward.
     """
     if not _on("UPDATE"):
         return ""
@@ -984,6 +985,13 @@ def _render_update(now: float) -> str:
     if not behind or now - checked_at >= update_check.UPDATE_MAX_AGE_S:
         return ""
     if compared_sha != update_check.local_head_sha(root):
+        return ""
+    # The line names one command, and on a branch that pulls from somewhere else
+    # that command fast-forwards a ref the count was never measured against — so
+    # it would stand there through every pull the user ran. Nothing to act on,
+    # nothing to say. Last of the four gates because it is the one that reads
+    # .git/config: only a checkout that is already behind pays for it.
+    if not update_check.pull_reaches_upstream(root):
         return ""
     # Not `git pull`: this line renders in whatever project the session is in,
     # where that command pulls that project's repo and not this checkout.
