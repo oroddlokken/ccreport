@@ -1654,7 +1654,8 @@ def cmd_update(args) -> None:
 
     Every outcome the check itself can reach exits 0, including the ones that
     could not answer: not knowing is not a failure of the command. Only a
-    refused `--pull` exits non-zero, with git's own code.
+    refused `--pull` exits non-zero — with git's own code where git refused,
+    and with 1 where the pull was never offered a ref it could reach.
     """
     from ccreport import update_check
 
@@ -1689,6 +1690,22 @@ def cmd_update(args) -> None:
     if not args.pull:
         print("Pull them: ccreport update --pull")
         return
+    if not update_check.pull_reaches_upstream(root):
+        branch = update_check.head_branch(root)
+        tracks = update_check.tracked_upstream(root)
+        if branch is None:
+            where = "HEAD is detached"
+        elif tracks is None:
+            where = f"{branch} tracks no remote branch"
+        else:
+            where = f"{branch} tracks {tracks}"
+        # The refusal reads as an answer to the count, so the count has to have
+        # landed first: stdout is block-buffered down a pipe and stderr is not.
+        sys.stdout.flush()
+        print(f"Not pulling: {where}, so a fast-forward here cannot reach {upstream} and "
+              f"the count above would survive it. Check out a branch that tracks "
+              f"{upstream}, or bring the commits in with git yourself.", file=sys.stderr)
+        sys.exit(1)
     code = _pull_ff_only(root)
     if code != 0:
         sys.exit(code)

@@ -1,9 +1,14 @@
 """Tests for `ccreport update` — the live "master has moved" check.
 
-Neither GitHub nor git is reached: the three readers `update_check` exposes are
+Neither GitHub nor git is reached: the readers `update_check` exposes are
 stubbed per test, and `_pull_ff_only` gets a fake `subprocess.run`. What is
 asserted is the wiring — which reader is consulted, what the user is told, and
 what the check leaves behind in the meta table for the status line to render.
+
+The three that read `.git` as files are the exception. `TestUpstreamReaders`
+builds a real HEAD and config under tmp_path and reads them for real, because
+what they parse is git's own on-disk format and a stub would only assert the
+stub.
 """
 
 from __future__ import annotations
@@ -29,10 +34,11 @@ def _never(*args, **kwargs):
 
 @pytest.fixture
 def checkout(tmp_path, monkeypatch):
-    """A checkout at *tmp_path* with HEAD readable and origin on GitHub."""
+    """A checkout at *tmp_path* with HEAD readable, origin on GitHub, master out."""
     monkeypatch.setattr(update_check, "checkout_root", lambda: tmp_path)
     monkeypatch.setattr(update_check, "local_head_sha", lambda root: SHA)
     monkeypatch.setattr(update_check, "remote_slug", lambda root: "owner/repo")
+    monkeypatch.setattr(update_check, "pull_reaches_upstream", lambda root: True)
     return tmp_path
 
 
@@ -184,6 +190,133 @@ class TestPull:
             ccr.cmd_update(_args(pull=True))
         assert exc.value.code == 1
         assert "Could not run git pull" in capsys.readouterr().err
+
+
+class TestPullRefusesWhatItCannotReach:
+    """A pull that would follow another ref is not run at all."""
+
+    def _elsewhere(self, monkeypatch, branch, tracks):
+        monkeypatch.setattr(update_check, "pull_reaches_upstream", lambda root: False)
+        monkeypatch.setattr(update_check, "head_branch", lambda root: branch)
+        monkeypatch.setattr(update_check, "tracked_upstream", lambda root: tracks)
+
+    def test_a_fork_topic_branch_is_named_and_git_stays_unrun(
+        self, checkout, monkeypatch, capsys
+    ):
+        """The bug this gate exists for: pulling fork/topic never moves the count."""
+        seen = _fake_pull(monkeypatch)
+        self._elsewhere(monkeypatch, "legend-width", "fork/legend-width")
+        _behind(monkeypatch, 17)
+        with pytest.raises(SystemExit) as exc:
+            ccr.cmd_update(_args(pull=True))
+        assert exc.value.code == 1
+        assert seen == []
+        err = capsys.readouterr().err
+        assert "legend-width tracks fork/legend-width" in err
+        assert "origin/master" in err
+
+    def test_the_count_is_still_printed_before_the_refusal(
+        self, checkout, monkeypatch, capsys
+    ):
+        """Knowing master moved is worth having even where this command cannot help."""
+        _fake_pull(monkeypatch)
+        self._elsewhere(monkeypatch, "topic", "fork/topic")
+        _behind(monkeypatch, 17)
+        with pytest.raises(SystemExit):
+            ccr.cmd_update(_args(pull=True))
+        assert "17 commits behind origin/master." in capsys.readouterr().out
+
+    def test_a_branch_with_no_upstream_says_so(self, checkout, monkeypatch, capsys):
+        _fake_pull(monkeypatch)
+        self._elsewhere(monkeypatch, "scratch", None)
+        _behind(monkeypatch, 3)
+        with pytest.raises(SystemExit):
+            ccr.cmd_update(_args(pull=True))
+        assert "scratch tracks no remote branch" in capsys.readouterr().err
+
+    def test_a_detached_head_says_so(self, checkout, monkeypatch, capsys):
+        _fake_pull(monkeypatch)
+        self._elsewhere(monkeypatch, None, None)
+        _behind(monkeypatch, 3)
+        with pytest.raises(SystemExit):
+            ccr.cmd_update(_args(pull=True))
+        assert "HEAD is detached" in capsys.readouterr().err
+
+    def test_without_pull_the_gate_is_never_asked(self, checkout, monkeypatch, capsys):
+        """Reporting the count works from any branch; only the pull is refused."""
+        monkeypatch.setattr(update_check, "pull_reaches_upstream", _never)
+        _behind(monkeypatch, 3)
+        ccr.cmd_update(_args())
+        assert "3 commits behind origin/master." in capsys.readouterr().out
+
+
+class TestUpstreamReaders:
+    """`.git/HEAD` and `.git/config` as git actually writes them."""
+
+    def _checkout(self, root, head, config=""):
+        git = root / ".git"
+        git.mkdir()
+        (git / "HEAD").write_text(head, encoding="utf-8")
+        if config:
+            (git / "config").write_text(config, encoding="utf-8")
+        return root
+
+    MASTER = (
+        '[remote "origin"]\n'
+        "\turl = https://github.com/owner/repo.git\n"
+        "\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+        '[branch "master"]\n'
+        "\tremote = origin\n"
+        "\tmerge = refs/heads/master\n"
+    )
+
+    def test_head_names_the_branch_it_points_at(self, tmp_path):
+        self._checkout(tmp_path, "ref: refs/heads/master\n")
+        assert update_check.head_branch(tmp_path) == "master"
+
+    def test_a_slash_in_the_branch_name_survives(self, tmp_path):
+        self._checkout(tmp_path, "ref: refs/heads/feat/nested\n")
+        assert update_check.head_branch(tmp_path) == "feat/nested"
+
+    def test_a_detached_head_names_no_branch(self, tmp_path):
+        self._checkout(tmp_path, f"{SHA}\n")
+        assert update_check.head_branch(tmp_path) is None
+
+    def test_a_missing_head_names_no_branch(self, tmp_path):
+        assert update_check.head_branch(tmp_path) is None
+
+    def test_the_tracking_pair_reads_as_one_ref(self, tmp_path):
+        """Tab-indented keys under a quoted subsection — git's own layout."""
+        self._checkout(tmp_path, "ref: refs/heads/master\n", self.MASTER)
+        assert update_check.tracked_upstream(tmp_path) == "origin/master"
+
+    def test_a_branch_without_a_section_tracks_nothing(self, tmp_path):
+        self._checkout(tmp_path, "ref: refs/heads/scratch\n", self.MASTER)
+        assert update_check.tracked_upstream(tmp_path) is None
+
+    def test_a_fork_topic_branch_tracks_the_fork(self, tmp_path):
+        config = self.MASTER + '[branch "topic"]\n\tremote = fork\n\tmerge = refs/heads/topic\n'
+        self._checkout(tmp_path, "ref: refs/heads/topic\n", config)
+        assert update_check.tracked_upstream(tmp_path) == "fork/topic"
+
+    def test_a_missing_config_tracks_nothing(self, tmp_path):
+        self._checkout(tmp_path, "ref: refs/heads/master\n")
+        assert update_check.tracked_upstream(tmp_path) is None
+
+    def test_a_local_name_may_differ_from_the_ref_it_tracks(self, tmp_path):
+        """`main` set to pull origin/master is reachable, whatever it is called here."""
+        config = self.MASTER + '[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/master\n'
+        self._checkout(tmp_path, "ref: refs/heads/main\n", config)
+        assert update_check.pull_reaches_upstream(tmp_path) is True
+
+    def test_the_fork_topic_branch_is_the_case_that_fails(self, tmp_path):
+        config = self.MASTER + '[branch "topic"]\n\tremote = fork\n\tmerge = refs/heads/topic\n'
+        self._checkout(tmp_path, "ref: refs/heads/topic\n", config)
+        assert update_check.pull_reaches_upstream(tmp_path) is False
+
+    def test_master_tracking_origin_is_the_case_that_works(self, tmp_path):
+        self._checkout(tmp_path, "ref: refs/heads/master\n", self.MASTER)
+        assert update_check.pull_reaches_upstream(tmp_path) is True
 
 
 class TestParsing:

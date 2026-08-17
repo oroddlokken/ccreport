@@ -1501,7 +1501,7 @@ class TestUpdateSegment:
 
     @pytest.fixture
     def checkout(self, tmp_path, monkeypatch):
-        """A tree update_check reads as its own checkout, with HEAD at SHA."""
+        """A tree update_check reads as its own checkout: master out, HEAD at SHA."""
         from ccreport import update_check
 
         (tmp_path / "src" / "ccreport").mkdir(parents=True)
@@ -1509,6 +1509,7 @@ class TestUpdateSegment:
         (tmp_path / ".git" / "HEAD").write_text(f"{self.SHA}\n", encoding="utf-8")
         monkeypatch.setattr(
             update_check, "__file__", str(tmp_path / "src" / "ccreport" / "update_check.py"))
+        monkeypatch.setattr(update_check, "pull_reaches_upstream", lambda root: True)
         return tmp_path
 
     @pytest.fixture
@@ -1565,6 +1566,27 @@ class TestUpdateSegment:
         self._store(12)
         monkeypatch.setenv("CLAUDE_STATUSLINE_UPDATE", "0")
         assert sl._render_update(self.NOW) == ""
+
+    def test_a_branch_the_pull_cannot_reach_shows_nothing(
+        self, checkout, spawns, monkeypatch
+    ):
+        """On a fork's topic branch the offered command pulls another ref entirely."""
+        from ccreport import update_check
+
+        monkeypatch.setattr(update_check, "pull_reaches_upstream", lambda root: False)
+        self._store(12)
+        assert sl._render_update(self.NOW) == ""
+
+    def test_the_check_is_still_respawned_from_such_a_branch(
+        self, checkout, spawns, monkeypatch
+    ):
+        """The gate silences the line, not the refresh: the count stays current."""
+        from ccreport import update_check
+
+        monkeypatch.setattr(update_check, "pull_reaches_upstream", lambda root: False)
+        self._store(12, age=sl.UPDATE_CHECK_INTERVAL_S + 1)
+        sl._render_update(self.NOW)
+        assert spawns == [["spawn"]]
 
     def test_an_installed_package_has_nothing_to_pull(self, tmp_path, monkeypatch, spawns):
         """No .git beside the package: `uv tool install .`, or a wheel."""
