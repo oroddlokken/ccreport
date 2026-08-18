@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import calendar
 import json
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 import server_fixture as sf
@@ -271,6 +272,78 @@ class TestLinks:
     def test_a_row_carries_the_range_it_was_clicked_from(self, client):
         assert 'href="/model/claude-haiku-4-5?days=7"' in client.get("/?days=7&by=model").text
 
+    def test_a_day_row_rolls_up_to_its_week_and_month(self, client):
+        body = client.get("/project/infrastructure").text
+        days = dashboard.DEFAULT_RANGE
+        assert f'href="/week/{dashboard.week_key(TODAY)}?days={days}"' in body
+        assert f'href="/month/{TODAY[:7]}?days={days}"' in body
+
     def test_a_detail_row_opens_the_next_entity(self, client):
         body = client.get("/project/infrastructure").text
         assert f'href="/machine/neo?days={dashboard.DEFAULT_RANGE}"' in body
+
+
+class TestThePeriodPages:
+    def test_a_week_charts_seven_days_from_its_monday(self, client):
+        monday = date.fromisoformat(dashboard.week_key(TODAY))
+        for chart in _charts(client.get(f"/week/{TODAY}").text):
+            assert chart["axis"] == [(monday + timedelta(days=n)).isoformat() for n in range(7)]
+
+    def test_a_month_charts_every_calendar_day_it_holds(self, client):
+        month = TODAY[:7]
+        for chart in _charts(client.get(f"/month/{month}").text):
+            assert len(chart["axis"]) == calendar.monthrange(NOW.year, NOW.month)[1]
+            assert chart["axis"][0] == f"{month}-01"
+
+    def test_every_date_in_a_week_draws_the_same_week(self, client):
+        """The URL renders in place, so the seven dates are one page."""
+        monday = date.fromisoformat(dashboard.week_key(TODAY))
+        bodies = {client.get(f"/week/{monday + timedelta(days=n)}").text for n in range(7)}
+        assert len(bodies) == 1
+
+    def test_a_week_totals_the_days_it_holds(self, client):
+        """Which is also what says the day nine back is outside it."""
+        axis = _charts(client.get(f"/week/{TODAY}").text)[0]["axis"]
+        days = sum(_total(client.get(f"/day/{day}").text) for day in axis)
+        assert days == pytest.approx(_total(client.get(f"/week/{TODAY}").text), abs=0.005)
+
+    def test_a_month_totals_its_own_day_rows(self, app):
+        view = dashboard.build(app.state.db.connect(), dashboard.DEFAULT_RANGE,
+                               scope=dashboard.Scope("month", TODAY[:7]))
+        assert sum(row["cost"] for row in view.breakdowns["day"]) == pytest.approx(
+            view.total_cost, abs=0.005)
+
+    def test_a_period_a_key_cannot_name_is_a_404(self, client):
+        """A mistyped URL, where an empty page would read as an idle month."""
+        for path in ("/month/2026-13", "/month/nope", "/week/2026-07-32", "/day/2026-02-30"):
+            assert client.get(path).status_code == 404, path
+
+    def test_neither_has_a_range_toggle(self, client):
+        for path in (f"/week/{TODAY}", f"/month/{TODAY[:7]}"):
+            assert 'class="toggle' not in client.get(path).text, path
+
+    def test_a_period_page_prints_its_span_once(self, client):
+        body = client.get(f"/day/{TODAY}").text
+        assert body.count("<h1") == 1
+        assert body.count(f'data-day="{TODAY}"') == 1
+        assert f"<h1>{TODAY}</h1>" not in body
+
+    def test_a_page_about_a_thing_keeps_its_name_as_the_heading(self, client):
+        body = client.get("/project/infrastructure").text
+        assert body.count("<h1") == 1
+        assert "<h1>infrastructure</h1>" in body
+
+
+class TestPeriodKeys:
+    def test_a_monday_is_its_own_week(self):
+        assert dashboard.week_key("2026-07-27") == "2026-07-27"
+
+    def test_a_sunday_belongs_to_the_monday_before_it(self):
+        assert dashboard.week_key("2026-08-02") == "2026-07-27"
+
+    def test_a_month_over_a_clock_change_keeps_every_day(self):
+        """(end - start).days is one short where an hour went missing."""
+        for month, length in (("2026-03", 31), ("2026-10", 31), ("2028-02", 29)):
+            _, _, axis = dashboard.period_span("month", month)
+            assert len(axis) == length, month
+            assert axis[-1] == f"{month}-{length:02d}"

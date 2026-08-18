@@ -179,11 +179,17 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   label and a redacted project bucket each reach their own rows, and it is
   never cached: `cached_build` holds the whole-server view per range, which is
   the page a browser opens over and over
-- A day page is its own range and charts by hour, so it is the one build that
-  calls `reports.load` — `load_grouped` folds the hour away. It widens the ts
-  window by a day at each end and matches `day_key()` afterwards, because `day`
-  is the machine's calendar day and a machine on another clock keeps records
-  whose instant falls outside this server's day
+- The three `dashboard.PERIODS` — day, week, month — are their own range and
+  print no toggle: the span is the page. A day charts by hour, so it is the one
+  build that calls `reports.load`; a week and a month chart by day and take
+  `load_grouped`, which folds the hour away. All three widen the ts window by a
+  day at each end and match `day_key()` afterwards, because `day` is the
+  machine's calendar day and a machine on another clock keeps records whose
+  instant falls outside this server's day. `period_span` counts the axis over
+  `date` arithmetic rather than `(end - start).days`, which is one short in a
+  month that changed clocks. A week is keyed on any date it holds and opens on
+  that date's Monday, so its seven URLs draw one page, and a key the period
+  cannot parse is a 404 rather than an empty page that reads as an idle month
 - A detail page draws four charts rather than one with a toggle, and each has
   one scale: cost, cost by model, tokens by kind and calls do not share an
   axis. Series colours come from `static/palette.js` in fixed order, so a

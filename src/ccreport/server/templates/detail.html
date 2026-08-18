@@ -5,16 +5,22 @@
 {% block content %}
 
 <div class="range">
-  <span class="dim span">{{ scope.dimension }} ·
+  {# A period page says what span it drew here and nowhere else: its key and its
+     dates are the same fact, and printing both left the date on screen twice. #}
+  {% if scope.is_period %}
+  <h1 class="dim span">{{ scope.dimension }} ·
     {% if scope.dimension == "day" %}
-    <span data-day="{{ view.start }}">{{ view.start }}</span> —
-    <span data-day="{{ view.end }}">{{ view.end }}</span>
+    <span data-day="{{ view.start }}">{{ view.start }}</span>
     {% else %}
     <a href="/day/{{ view.start }}" data-day="{{ view.start }}">{{ view.start }}</a> —
     <a href="/day/{{ view.end }}" data-day="{{ view.end }}">{{ view.end }}</a>
     {% endif %}
+  </h1>
+  {% else %}
+  <span class="dim span">{{ scope.dimension }} ·
+    <a href="/day/{{ view.start }}" data-day="{{ view.start }}">{{ view.start }}</a> —
+    <a href="/day/{{ view.end }}" data-day="{{ view.end }}">{{ view.end }}</a>
   </span>
-  {% if scope.dimension != "day" %}
   <span class="toggles">
     {% for days in ranges %}
     <a class="toggle {% if days == view.days %}on{% endif %}"
@@ -26,7 +32,7 @@
 </div>
 
 <section class="headline detail-head">
-  <h1>{{ scope.key }}</h1>
+  {% if not scope.is_period %}<h1>{{ scope.key }}</h1>{% endif %}
   <div class="figure" data-usd="{{ view.total_cost }}">{{ "${:,.2f}".format(view.total_cost) }}</div>
   {% if view.nok_enabled %}
   <div class="dim"><span data-nok="{{ view.total_cost_nok }}">{{ "kr {:,.0f}".format(view.total_cost_nok) }}</span> incl. MVA</div>

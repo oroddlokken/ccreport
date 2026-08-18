@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 
 from ccreport import aggregate, pricing
 from ccreport.server import db, reports
@@ -31,8 +31,11 @@ DEFAULT_RANGE = ALL_TIME
 EMPTY_SPAN_DAYS = 30
 """How wide all-time is when there is nothing stored to measure it from."""
 
-DIMENSIONS = ("model", "day", "project", "machine")
-"""What the breakdown table switches between. Same columns throughout."""
+DIMENSIONS = ("model", "day", "week", "month", "project", "machine")
+"""What the breakdown table switches between. Same columns throughout.
+
+The three periods run day, week, month so a row leads to the page one step
+wider than the row above it."""
 
 METRICS = ("cost", "tokens")
 """Which series the chart draws. Both are in the payload either way."""
@@ -42,6 +45,10 @@ SCOPES = ("model", "account", *(name for name in DIMENSIONS if name != "model"))
 One more than the dashboard's tabs: the accounts have a column of their own
 there rather than a table. Model leads, because which model was billed is the
 first question a page about one project or one day is opened with."""
+
+PERIODS = ("day", "week", "month")
+"""The scopes that are a span of time rather than something spending over one.
+Each is its own range: the toggle cannot widen a page that is about one week."""
 
 TRACE_LIMIT = 6
 """Series per chart before the rest fold into one. Past this the eye is reading
@@ -71,6 +78,43 @@ def all_time_bounds(oldest: float | None, now: datetime) -> tuple[datetime, date
     start = datetime.fromtimestamp(oldest, tz=now.tzinfo or UTC).astimezone(now.tzinfo)
     start = start.replace(hour=0, minute=0, second=0, microsecond=0)
     return min(start, end - timedelta(days=1)), end
+
+
+def week_key(day: str) -> str:
+    """The Monday that opens the week a calendar day falls in."""
+    parsed = date.fromisoformat(day)
+    return (parsed - timedelta(days=parsed.weekday())).isoformat()
+
+
+def _period_dates(dimension: str, key: str) -> tuple[date, date]:
+    """The first calendar day one period holds and the first day after it.
+
+    Raises ValueError on a key the period cannot parse. A week is keyed on any
+    date it contains and opens on that date's Monday, so the seven URLs of one
+    week all draw it.
+    """
+    if dimension == "month":
+        first = date.fromisoformat(f"{key}-01")
+        return first, (first.replace(day=28) + timedelta(days=4)).replace(day=1)
+    day = date.fromisoformat(key)
+    if dimension == "week":
+        first = day - timedelta(days=day.weekday())
+        return first, first + timedelta(days=7)
+    return day, day + timedelta(days=1)
+
+
+def period_span(dimension: str, key: str) -> tuple[datetime, datetime, list[str]]:
+    """One period page's bounds in this server's clock, and the days it covers.
+
+    The days are counted over dates rather than derived from the two bounds: an
+    hour of daylight saving inside the period leaves (end - start).days one
+    short of the calendar days the period holds, which drops a column and a
+    day of spend off the end of the axis.
+    """
+    first, stop = _period_dates(dimension, key)
+    axis = [(first + timedelta(days=offset)).isoformat() for offset in range((stop - first).days)]
+    return (datetime.combine(first, time.min).astimezone(),
+            datetime.combine(stop, time.min).astimezone(), axis)
 
 
 @dataclass
@@ -113,6 +157,11 @@ class Scope:
 
     dimension: str
     key: str
+
+    @property
+    def is_period(self) -> bool:
+        """Whether this page is a span of time, which has no range toggle."""
+        return self.dimension in PERIODS
 
 
 @dataclass
@@ -272,6 +321,8 @@ _DIMENSION_KEYS = {
     "account": lambda item: item.account,
     "model": lambda item: item.record.model,
     "day": lambda item: item.record.day_key(),
+    "week": lambda item: week_key(item.record.day_key()),
+    "month": lambda item: item.record.day_key()[:7],
     "project": lambda item: item.record.project,
     "machine": lambda item: item.machine,
 }
@@ -402,20 +453,22 @@ def cached_build(database: db.Database, days: int, now: datetime | None = None) 
     return view
 
 
-def _day_records(conn, key: str) -> tuple[list[reports.MergedRecord], datetime]:
-    """One calendar day's records, ungrouped, and the local midnight they open.
+def _period_records(conn, start: datetime, end: datetime, days: set[str],
+                    hourly: bool) -> list[reports.MergedRecord]:
+    """One period's records: the ones whose own calendar day the period holds.
 
-    Ungrouped because the hour is what this page plots and `load_grouped` folds
-    it away. The ts window is a day wider at each end and the day itself is
-    matched afterwards: `day` is the machine's own calendar day, and a machine
-    an hour off this server's clock keeps records whose instant falls outside
-    the local day they belong to.
+    The ts window is a day wider at each end and the day is matched afterwards:
+    `day` is the pushing machine's calendar day, and a machine an hour off this
+    server's clock keeps records whose instant falls outside the local day they
+    belong to.
+
+    A day page loads records one at a time because the hour is what it plots.
+    Anything wider plots by day and takes the grouped path, which folds the
+    hour away and hands back a few thousand rows instead of the corpus.
     """
-    midnight = datetime.strptime(key, "%Y-%m-%d").astimezone()
-    merged = reports.load(conn, reports.Filters(
-        since=midnight - timedelta(days=1), until=midnight + timedelta(days=2),
-    ))
-    return [item for item in merged if item.record.day_key() == key], midnight
+    filters = reports.Filters(since=start - timedelta(days=1), until=end + timedelta(days=1))
+    load = reports.load if hourly else reports.load_grouped
+    return [item for item in load(conn, filters) if item.record.day_key() in days]
 
 
 def build(conn, days: int, now: datetime | None = None,
@@ -423,17 +476,20 @@ def build(conn, days: int, now: datetime | None = None,
     """Everything the page shows, for one range toggle and one scope.
 
     With a *scope* the same fold runs over the records that match it alone, and
-    the page gains the four charts. A day scope is its own range: the toggle
-    cannot widen a page that is about one day.
+    the page gains the four charts. A period scope is its own range: the toggle
+    cannot widen a page that is about one day, one week or one month.
+
+    Raises ValueError where a period scope's key is not a date that period can
+    be keyed on.
     """
     now = now or datetime.now(tz=UTC).astimezone()
     days = days if days in RANGES else DEFAULT_RANGE
-    hourly = scope is not None and scope.dimension == "day"
-    if hourly:
-        merged, start = _day_records(conn, scope.key)  # type: ignore[union-attr]
-        end = start + timedelta(days=1)
-        axis = _hour_axis(scope.key)  # type: ignore[union-attr]
-        position_of = _hour_position(start)
+    if scope is not None and scope.is_period:
+        hourly = scope.dimension == "day"
+        start, end, day_axis = period_span(scope.dimension, scope.key)
+        merged = _period_records(conn, start, end, set(day_axis), hourly)
+        axis = _hour_axis(scope.key) if hourly else day_axis
+        position_of = _hour_position(start) if hourly else _day_position(axis)
     else:
         if days == ALL_TIME:
             start, end = all_time_bounds(db.oldest_record_ts(conn), now)
