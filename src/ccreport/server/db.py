@@ -421,6 +421,11 @@ def delete_machine(conn: sqlite3.Connection, machine_id: str) -> int:
 def machine_overview(conn: sqlite3.Connection) -> list[dict]:
     """Every machine with its token state and how much it has stored.
 
+    The record count is raw: it is what this machine pushed, which is also what
+    deleting the machine takes away. A call two machines both logged counts on
+    each of them here, where every report collapses it to one — the page says
+    "Pushed" for that reason.
+
     One query rather than a count per machine: the page is a table and the
     counts are what it is opened to compare.
     """
@@ -509,28 +514,6 @@ def set_account_alias(conn: sqlite3.Connection, account_uuid: str, alias: str, n
         "alias = excluded.alias, updated_at = excluded.updated_at",
         (account_uuid, alias, now),
     )
-
-
-def account_overview(conn: sqlite3.Connection) -> list[dict]:
-    """Every account with records here, its stored label, its alias and its spend.
-
-    The label is the newest one that account pushed: a person who changed their
-    login email has both in the table, and the older one is not who they are.
-    """
-    rows = conn.execute("""
-        SELECT r.account_uuid, COUNT(*), COALESCE(SUM(r.cost), 0),
-               (SELECT r2.account_label FROM server_records r2
-                 WHERE r2.account_uuid = r.account_uuid AND r2.account_label IS NOT NULL
-              ORDER BY r2.ts DESC LIMIT 1),
-               (SELECT a.alias FROM account_aliases a WHERE a.account_uuid = r.account_uuid)
-          FROM server_records r
-      GROUP BY r.account_uuid
-      ORDER BY SUM(r.cost) DESC
-    """).fetchall()
-    return [
-        {"account_uuid": row[0], "records": row[1], "cost": row[2], "label": row[3], "alias": row[4]}
-        for row in rows
-    ]
 
 
 def project_aliases(conn: sqlite3.Connection) -> dict[tuple[str, str], str]:

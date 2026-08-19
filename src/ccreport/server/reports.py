@@ -322,6 +322,35 @@ def _as_grouped(
     return MergedRecord(record=record, machine=labels.get(machine_id, machine_id), account=account)
 
 
+def account_overview(conn: sqlite3.Connection) -> list[dict]:
+    """Every account with records here, its stored label, its alias and its spend.
+
+    Deduped through _dedup_clause like every other read of this table, and here
+    rather than in db.py for that reason. Two machines that share session logs
+    push the same call twice; a raw SUM drew 2.2x what the dashboard drew for
+    the same corpus, on a page whose whole job is to say who spent what.
+
+    The label is the newest one that account pushed: a person who changed their
+    login email has both in the table, and the older one is not who they are.
+    """
+    dedup, params = _dedup_clause(Filters())
+    rows = conn.execute(f"""
+        SELECT a.account_uuid, COUNT(*), COALESCE(SUM(a.cost), 0),
+               (SELECT r.account_label FROM server_records r
+                 WHERE r.account_uuid = a.account_uuid AND r.account_label IS NOT NULL
+              ORDER BY r.ts DESC LIMIT 1),
+               (SELECT al.alias FROM account_aliases al WHERE al.account_uuid = a.account_uuid)
+          FROM server_records a
+         WHERE {dedup}
+      GROUP BY a.account_uuid
+      ORDER BY SUM(a.cost) DESC
+    """, params).fetchall()  # noqa: S608 - dedup is a literal clause; its filters bind parameters
+    return [
+        {"account_uuid": row[0], "records": row[1], "cost": row[2], "label": row[3], "alias": row[4]}
+        for row in rows
+    ]
+
+
 def nok_context(merged: list[MergedRecord], *, mva: bool = True) -> NokCtx:
     """A NokCtx over the rates this server holds for the dates in *merged*.
 

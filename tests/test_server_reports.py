@@ -18,7 +18,7 @@ from rich.console import Console
 
 from ccreport import aggregate
 from ccreport import ccreport as ccr
-from ccreport.server import reports
+from ccreport.server import db, reports
 from ccreport.server.factory import create_app
 
 
@@ -439,6 +439,50 @@ class TestRemoteFetch:
         monkeypatch.setattr(remote.urllib.request, "urlopen", fail)
         with pytest.raises(remote.RemoteError, match="403"):
             remote.fetch_report("https://ccr.example.net", "day")
+
+
+class TestAccountOverview:
+    """The /settings/accounts rows. Deduped, because the dashboard beside them is."""
+
+    def test_a_synced_call_stored_twice_is_one_record(self, app):
+        """a2 sits under both machines; the page said 3 where every report says 2."""
+        rows = {r["account_uuid"]: r for r in reports.account_overview(app.state.db.connect())}
+        assert rows["u-work"]["records"] == 2
+
+    def test_the_cost_is_what_the_dashboard_draws_for_that_account(self, app):
+        conn = app.state.db.connect()
+        rows = {r["account_uuid"]: r for r in reports.account_overview(conn)}
+        for uuid, account in (("u-work", "me@work.example"), ("u-home", "me@home.example")):
+            merged = reports.load(conn, reports.Filters(account=account))
+            assert rows[uuid]["cost"] == pytest.approx(sum(m.record.cost() for m in merged))
+
+    def test_every_account_that_pushed_has_a_row(self, app):
+        rows = reports.account_overview(app.state.db.connect())
+        assert {r["account_uuid"] for r in rows} == {"u-work", "u-home"}
+
+    def test_the_rows_are_ordered_by_the_deduped_cost(self, app):
+        costs = [r["cost"] for r in reports.account_overview(app.state.db.connect())]
+        assert costs == sorted(costs, reverse=True)
+
+    def test_it_carries_the_pushed_label_and_the_alias(self, app):
+        conn = app.state.db.connect()
+        db.set_account_alias(conn, "u-work", "work", 1.0)
+        conn.commit()
+        rows = {r["account_uuid"]: r for r in reports.account_overview(conn)}
+        assert (rows["u-work"]["label"], rows["u-work"]["alias"]) == ("me@work.example", "work")
+        assert rows["u-home"]["alias"] is None
+
+    def test_a_record_with_no_dedup_key_is_counted(self, tmp_path):
+        """Nothing matched it to another copy; dropping it loses a real call."""
+        app = create_app(sf.config(tmp_path))
+        client = TestClient(app)
+        token = sf.mint_for(app)
+        client.post(
+            "/v1/ingest",
+            json=sf.batch([sf.record(mid="x1", dk=None), sf.record(mid="x2", dk=None)]),
+            headers=sf.auth(token),
+        )
+        assert reports.account_overview(app.state.db.connect())[0]["records"] == 2
 
 
 class TestAccountAliases:

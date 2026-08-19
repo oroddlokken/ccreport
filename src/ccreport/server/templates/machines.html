@@ -3,6 +3,8 @@
 <h1>Machines</h1>
 <p class="hint">The name shows instead of the machine id on the dashboard and in
 <span class="mono">ccreport --server</span>. Leave it empty to go back to the id.</p>
+<p class="hint">Pushed is the rows this machine sent, which is what deleting it takes away — a
+call two machines both logged counts on each, where the dashboard counts it once.</p>
 {% if note %}<p class="notice">{{ note }}</p>{% endif %}
 
 {% if machines %}
@@ -10,7 +12,7 @@
   <thead>
     <tr>
       <th scope="col">Machine</th><th scope="col">Last seen</th>
-      <th scope="col">Token last used</th><th scope="col" class="num">Records</th>
+      <th scope="col">Token last used</th><th scope="col" class="num">Pushed</th>
       <th scope="col">Token</th><th scope="col">Name</th>
     </tr>
   </thead>

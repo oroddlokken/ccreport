@@ -20,7 +20,7 @@ from fastapi import APIRouter, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from ccreport.server import dashboard, db, limits, tokens
+from ccreport.server import dashboard, db, limits, reports, tokens
 
 router = APIRouter(tags=["pages"])
 
@@ -161,7 +161,7 @@ def accounts(request: Request):
     """Every account that has pushed, each row a field for the name to draw it under."""
     conn = request.app.state.db.connect()
     return templates.TemplateResponse(
-        request, "accounts.html", {"accounts": db.account_overview(conn)},
+        request, "accounts.html", {"accounts": reports.account_overview(conn)},
     )
 
 

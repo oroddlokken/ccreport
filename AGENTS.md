@@ -390,6 +390,14 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   pair. `dashboard.cached_build` then holds one view per range toggle against
   `db.content_stamp` and the render's local date, so a page is rebuilt when a
   push moved the records or the day rolled over, and not per request
+- Anything that sums or counts `server_records` goes through
+  `reports._dedup_clause`, and lives in `reports.py` for that reason —
+  `account_overview` is there rather than in `db.py`, which holds no total of
+  its own. Two machines that share session logs push the same call twice, so a
+  raw `SUM` is not a smaller answer than the deduped one but a different
+  number: /settings/accounts drew 2.2x the dashboard until it was moved. The
+  one count left raw is `db.machine_overview`'s, which is what a machine
+  pushed and what deleting it takes away — the column says `Pushed`
 - The dashboard's chart library is vendored under
   `server/static/vendor/`, not fetched from a CDN, so the page draws with no
   internet. Nothing updates it: a new version is a deliberate copy plus an edit
