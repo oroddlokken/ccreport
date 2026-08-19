@@ -486,11 +486,35 @@ else:
   `init_ccreport_meta()` writes all three. Any mismatch resets mtime/size to
   force re-parse and NULLs costs for recompute, but preserves orphaned records
 - **Per-file change detection**: `mtime_ns` + `size` in `ccreport_files`
-- **Records**: stored as individual rows in `ccreport_records` (indexed on `file_path` and `ts`)
+- **Records**: stored as individual rows in `ccreport_records`, keyed to their file by an
+  integer `file_id` into `ccreport_files` (indexed on `file_id` and `ts`). Every reader
+  joins that table back in to answer with the path
 - **Orphan preservation**: when JSONL files are purged from disk (e.g. Claude Code auto-cleanup),
   their cached records are kept in SQLite. `load_all_records()` picks them out of the
   `bulk_load_ccreport_cache()` result — every cached file whose path was not seen on disk
   this run — preserving historic usage data beyond the ~1 month JSONL retention window
+- **Pulled remote costs**: `remote_window_costs` and `remote_day_costs` hold
+  what a ccreport server said this account's *other* machines spent, written by
+  `ccreport server pull` / `server sync` and read by the status line's cost
+  windows and by `ccreport -A`. The server computes the remainder by dedup
+  identity — its copy of the asking machine's rows, then any record whose dedup
+  key that machine also pushed — so the local half and the remote half add
+  without overlapping. Both tables are scoped to the account signed in right now
+  on read as well as on write; rows for a previous login stay and are invisible.
+  `ccreport` never opens a socket to read them
+- **Archiving**: `ccreport archive` folds a purged file's records into
+  `ccreport_archive` at (day, oslo_date, sid, project, model, cwd, repo,
+  dir_prefix) grain and deletes the rows, marking the file `archived = 1`. It
+  only ever takes a whole file, only one already gone from disk, and only behind
+  a cutoff that is the older of `ARCHIVE_MIN_AGE_DAYS` back from local midnight
+  and the oldest `rate_limit_snapshots` reading minus one window span. A file
+  whose span holds an `account_events` row is held back, so no archived row
+  straddles a change of account. Identity goes in raw and the account is
+  resolved from `min_ts` at read time, which is what keeps `ccreport merge` and
+  `ccreport adopt` working on an archived day. `--dry-run` prints the fold and
+  writes nothing. Nothing rebuilds this table — it is the only copy of the days
+  it covers, and `ccreport server push --full` stops being a way to rebuild a
+  server from this machine once it has rows
 - **Writes are batched**: freshly parsed files accumulate and flush through
   `save_ccreport_files()` every `_SAVE_BATCH` files, one write transaction per batch
 - **Cost computation reads it too**: `compute_costs` sums a live file from
@@ -533,8 +557,8 @@ unit is a commit.
   `write_update_check()`
 - **Written by**: `update_check.py`, run as `python3 -m ccreport.update_check`
   from a detached spawn on a slow render (`statusline._render_update`), when
-  `update_checked_at` is older than `UPDATE_CHECK_INTERVAL_S` (43200 s, twice a
-  day). The API call never happens on the render path
+  `update_checked_at` is older than `UPDATE_CHECK_INTERVAL_S` (129600 s, 36
+  hours). The API call never happens on the render path
 - **Asked on demand**: `ccreport update` (`ccreport.cmd_update`) calls the same
   three readers inline — no spawn, no interval, since the user asked now — and
   stores the answer through the same keys, so a CLI check also paces the next

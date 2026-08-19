@@ -5,6 +5,10 @@ account push readings of the same window instance. Here they are unioned into
 one fill curve — the thing the client's own `ccreport limits` cannot show,
 because it only ever saw the part its own renders caught.
 
+The Extra column is the one thing that is not unioned. It reads cumulative
+account spend, so every machine reports the same dollars rather than a share of
+them, and one machine's series answers for the window.
+
 Everything the rows say about a window comes from `windows.py`, the module the
 CLI's tables read. What this adds is the merge and the shapes uPlot wants.
 """
@@ -159,19 +163,71 @@ def _spend_indexes(
 _EMPTY_INDEX = windows.SpendIndex([])
 
 
+def _extra_series(
+    conn, aliases: dict[str, str],
+) -> dict[str, dict[str, list[tuple[float, float]]]]:
+    """Account -> machine -> its Extra readings, oldest first.
+
+    Unbounded in time on purpose. A span needs a reading at or before it to
+    subtract from, and on a series sampled a few times a day that reading can
+    be older than any bound a page would set; the table holds one row per
+    reading per machine, not one per call.
+
+    Keyed on the displayed account, as the window rows are, so an alias typed on
+    /settings/accounts selects the same readings the email does.
+    """
+    per_account: dict[str, dict[str, list[tuple[float, float]]]] = {}
+    for (uuid, label, machine), series in db.load_extra_samples(conn).items():
+        account = reports.account_display(uuid, label, aliases)
+        per_account.setdefault(account, {})[machine] = series
+    return per_account
+
+
+def _instance_extra(
+    instance: windows.WindowInstance,
+    machines: dict[str, list[tuple[float, float]]],
+    now: float,
+) -> float | None:
+    """Extra billed while *instance* ran, from one machine's readings alone.
+
+    Every machine on the account reports the *same* cumulative dollars, so the
+    answer is one machine's, not a sum and not a merged series: a machine whose
+    fetch lagged would report a lower figure after a higher one, and a drop in
+    this series is what says the billing month rolled over.
+
+    Which machine is whichever has the most readings inside the span, among
+    those that can answer at all — the one that watched the window most closely.
+    Ties go to the lower machine name, so the page does not change under a
+    reader who reloads it.
+    """
+    start = instance.started_at if instance.started_at is not None else instance.first_ts
+    end = min(instance.resets_at, now)
+    best: tuple[int, str] | None = None
+    answer: float | None = None
+    for machine, series in sorted(machines.items()):
+        spent = windows.ExtraIndex(series).spent_between(start, end)
+        if spent is None:
+            continue
+        inside = sum(1 for ts, _s in series if start <= ts <= end)
+        if best is None or inside > best[0]:
+            best = (inside, machine)
+            answer = spent
+    return answer
+
+
 def _rows(conn, samples: list[dict], now: float) -> list[WindowRow]:
     """Every window the samples describe, priced, in the CLI's printed order."""
     aliases = db.account_aliases(conn)
     instances = _merged_instances(samples, aliases)
     indexes = _spend_indexes(conn, instances)
+    extra = _extra_series(conn, aliases)
     rows = [
         WindowRow(
             instance=instance,
             account=account,
-            # The server has no Extra-usage series: that is a reading of one
-            # machine's status line, and nothing pushes it.
             spend=windows.instance_spend(
                 instance, indexes.get(account, _EMPTY_INDEX), now,
+                _instance_extra(instance, extra.get(account, {}), now),
             ),
             machines=machines,
         )
@@ -278,7 +334,7 @@ def _window_records(conn, row: WindowRow) -> list[reports.MergedRecord]:
 
 
 def _tiles(row: WindowRow) -> list[dashboard.Tile]:
-    """The five numbers the table row carries, each read against its own line."""
+    """The six numbers the table row carries, each read against its own line."""
     instance, spend = row.instance, row.spend
     fill = instance.fill_s / 3600
     rate = instance.burn_pph
@@ -299,6 +355,12 @@ def _tiles(row: WindowRow) -> list[dashboard.Tile]:
         dashboard.Tile(
             "$/pp", "—" if spend.per_pp is None else f"${spend.per_pp:,.2f}",
             f"{instance.rise:.1f} points gained",
+        ),
+        dashboard.Tile(
+            "Extra", "—" if spend.extra_usd is None else f"${spend.extra_usd:,.2f}",
+            "billed as credits while the window ran"
+            if spend.extra_usd is not None
+            else "no reading bounds this window",
         ),
         dashboard.Tile(
             "Cache", "—" if share is None else f"{share * 100:.0f}%",

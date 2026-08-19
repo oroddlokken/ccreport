@@ -177,6 +177,31 @@ CREATE TABLE IF NOT EXISTS rate_limit_samples (
 -- Every window page bounds itself in instants, the way every record page does.
 CREATE INDEX IF NOT EXISTS idx_rl_ts ON rate_limit_samples(ts);
 
+-- Extra-usage readings: cumulative dollars Anthropic billed as credits within a
+-- billing month, as one machine's status line read them. The only real money in
+-- a window report; everything else there is an API-price valuation.
+--
+-- Never pruned, unlike the client's own copy, which write_usage_cache holds to
+-- 31 days. Past that this is the only copy there is, which makes the table a
+-- database rather than a cache of one — the same answer ccreport_archive gives
+-- on the client when the source is gone.
+--
+-- Keyed per machine even though the figure is the account's: two machines
+-- signed into one account read the *same* dollars, so the reader picks one
+-- machine's series per window rather than merging them. Merged, a machine whose
+-- fetch lagged would report a lower figure after a higher one, and a drop in
+-- this series is what says the billing month rolled over.
+CREATE TABLE IF NOT EXISTS extra_usage_samples (
+    machine_id    TEXT NOT NULL REFERENCES machines(machine_id) ON DELETE CASCADE,
+    ts            REAL NOT NULL,
+    spent         REAL NOT NULL,
+    account_uuid  TEXT NOT NULL,
+    account_label TEXT,
+    PRIMARY KEY (machine_id, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_extra_ts ON extra_usage_samples(ts);
+
 -- The same shape exchange.py already caches on every client, because the
 -- server converts to NOK for all of them and reuses that module's Norges Bank
 -- walk-back and negative cache rather than owning a second copy of either.
@@ -242,6 +267,7 @@ MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(4, "machines.label_updated_at", _add_label_updated_at),
     migrations.Step(5, "project_aliases"),
     migrations.Step(6, "rate_limit_samples"),
+    migrations.Step(7, "extra_usage_samples"),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 
@@ -630,7 +656,8 @@ def content_stamp(conn: sqlite3.Connection) -> tuple:
     rate_limit_samples is here because a push can carry samples and no file at
     all — a machine whose logs have not changed still renders, and the windows
     it watched moved. Both parts, because a machine deleted by a cascade takes
-    its samples with it and moves only the count.
+    its samples with it and moves only the count. extra_usage_samples arrives
+    the same way and prices the Extra column beside them.
 
     A rate arriving in exchange_rates is deliberately not in it: nothing here
     would notice a rate updated in place, and the NOK column it moves is
@@ -644,7 +671,9 @@ def content_stamp(conn: sqlite3.Connection) -> tuple:
                (SELECT COUNT(*) FROM project_aliases),
                (SELECT COALESCE(MAX(updated_at), 0) FROM project_aliases),
                (SELECT COUNT(*) FROM rate_limit_samples),
-               (SELECT COALESCE(MAX(ts), 0) FROM rate_limit_samples)
+               (SELECT COALESCE(MAX(ts), 0) FROM rate_limit_samples),
+               (SELECT COUNT(*) FROM extra_usage_samples),
+               (SELECT COALESCE(MAX(ts), 0) FROM extra_usage_samples)
           FROM ingest_files
     """).fetchone()
 
@@ -724,6 +753,78 @@ def load_rate_limit_samples(
         sample["machine"] = row[-1]
         samples.append(sample)
     return samples
+
+
+EXTRA_SAMPLE_COLS = ("machine_id", "ts", "spent", "account_uuid", "account_label")
+"""Every extra_usage_samples column, in CREATE TABLE order."""
+
+_EXTRA_SELECT = ", ".join(EXTRA_SAMPLE_COLS)
+_EXTRA_PLACEHOLDERS = ", ".join("?" * len(EXTRA_SAMPLE_COLS))
+
+
+def store_extra_samples(
+    conn: sqlite3.Connection, machine_id: str, samples: list[dict],
+) -> int:
+    """Store one machine's Extra-usage readings, and say how many landed.
+
+    REPLACE for the reason store_rate_limit_samples uses it: a reading re-sent
+    after a --full is the same reading of the same instant, and the newer copy
+    carries whatever account the machine has since learned to attribute it to.
+    """
+    if not samples:
+        return 0
+    rows = [
+        tuple(sample.get(name) for name in EXTRA_SAMPLE_COLS[1:])
+        for sample in samples
+    ]
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.executemany(
+            f"INSERT OR REPLACE INTO extra_usage_samples ({_EXTRA_SELECT}) "  # noqa: S608
+            f"VALUES ({_EXTRA_PLACEHOLDERS})",
+            [(machine_id, *row) for row in rows],
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    return len(rows)
+
+
+def load_extra_samples(
+    conn: sqlite3.Connection, since: float | None = None, until: float | None = None,
+) -> dict[tuple[str, str | None, str], list[tuple[float, float]]]:
+    """(account_uuid, account_label, machine_id) -> `(ts, spent)`, oldest first.
+
+    The label rides in the key because the caller names an account the way the
+    window rows do — alias, then the label the push carried, then the uuid — and
+    a uuid alone would key the readings under a name no row uses.
+
+    Grouped per machine rather than handed over as one series, because the
+    figure is cumulative account spend and every machine on the account reports
+    the same dollars. The reader picks one machine per window; merging them
+    would let a lagging reading read as the monthly reset.
+
+    The bounds are widened by the caller, not here: a range needs a reading at
+    or before its start to subtract from, and that reading is older than the
+    range.
+    """
+    clauses, params = [], []
+    if since is not None:
+        clauses.append("ts >= ?")
+        params.append(since)
+    if until is not None:
+        clauses.append("ts < ?")
+        params.append(until)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    series: dict[tuple[str, str | None, str], list[tuple[float, float]]] = {}
+    for account, label, machine, ts, spent in conn.execute(
+        "SELECT account_uuid, account_label, machine_id, ts, spent "  # noqa: S608
+        f"FROM extra_usage_samples{where} ORDER BY ts",
+        params,
+    ):
+        series.setdefault((account, label, machine), []).append((ts, spent))
+    return series
 
 
 def oldest_sample_ts(conn: sqlite3.Connection) -> float | None:

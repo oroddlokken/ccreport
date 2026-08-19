@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from rich.console import Console
 from test_push import TS, _cached_file, _write_config
 
-from ccreport import cache_db, push
+from ccreport import cache_db, protocol, push
 from ccreport import ccreport as ccr
 from ccreport.server.factory import create_app
 
@@ -306,7 +306,8 @@ class TestConnectCommand:
 
             if token != "good":
                 raise RemoteError(f"{base} refused that token")
-            return {"label": "Laptop", "machine_id": "laptop-1", "records": 0}
+            return {"label": "Laptop", "machine_id": "laptop-1", "records": 0,
+                    "protocol": protocol.PROTOCOL_VERSION}
 
         monkeypatch.setattr("ccreport.remote.fetch_health", fetch)
 
@@ -487,7 +488,8 @@ class TestStatusPrintsTheInterval:
     def health(self, monkeypatch):
         monkeypatch.setattr(
             "ccreport.remote.fetch_health",
-            lambda base, token: {"label": "Laptop", "machine_id": "laptop-1", "records": 3},
+            lambda base, token: {"label": "Laptop", "machine_id": "laptop-1", "records": 3,
+                                 "protocol": protocol.PROTOCOL_VERSION},
         )
 
     def _status(self, monkeypatch, path) -> str:
@@ -611,7 +613,8 @@ class TestStatusCommand:
     def reachable(self, monkeypatch):
         monkeypatch.setattr(
             "ccreport.remote.fetch_health",
-            lambda base, token: {"label": "Laptop", "machine_id": "laptop-1", "records": 12},
+            lambda base, token: {"label": "Laptop", "machine_id": "laptop-1", "records": 12,
+                                 "protocol": protocol.PROTOCOL_VERSION},
         )
 
     def test_an_unconfigured_machine_says_so(self, tmp_path, monkeypatch):
@@ -679,7 +682,7 @@ class TestStatusCommand:
         path = _write_config(tmp_path)
         monkeypatch.setattr(
             push, "push_to",
-            lambda server, full=False, db_path=None: push.PushResult(
+            lambda server, full=False, pull=False, db_path=None: push.PushResult(
                 server=server.url, accepted=["/p/a.jsonl"], records=7,
             ),
         )

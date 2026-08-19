@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from ccreport import protocol
+
 CONFIG_PATH = Path.home() / ".config" / "ccreport" / "push.toml"
 
 BASE_INTERVAL_S = 30 * 60
@@ -108,6 +110,11 @@ class PushResult:
     """Rate-limit utilization samples stored. Counted apart from records: they
     come from a different table and answer a different question, and a run that
     sent nothing but samples has not sent no data."""
+    extra: int = 0
+    """Extra-usage readings stored, counted apart for the same reason."""
+    pulled: int = 0
+    """Contributing machines the reply named. Zero on a plain push, which asks
+    for no remainder, and on a machine signed in to no account at all."""
     blocked_by: tuple[str, ...] = ()
     """The CIDRs a blocked push wanted and could not find an address inside.
 
@@ -230,6 +237,36 @@ def write_server(path: Path, url: str, fields: dict) -> None:
     """
     entries = read_raw(path)
     entries[url] = {**entries.get(url, {}), **fields}
+    _write_entries(path, entries)
+    if entries[url].get("restricted"):
+        _marker_path(path).write_text(
+            "This machine pushes under a restriction. Deleting this file does not\n"
+            "lift it: push.toml is what says so, and this only stops a lost\n"
+            "`restricted = true` from reading as permission to send real names.\n",
+        )
+
+
+def remove_server(path: Path, url: str) -> bool:
+    """Take one server's table out of push.toml. True if there was one.
+
+    Every other entry is rewritten as it stood, for the reason write_server
+    merges rather than replaces: a config you can only rewrite wholesale is one
+    people edit by hand and get wrong.
+
+    The `.restricted` marker is deliberately left alone. It is a claim about
+    this machine having pushed under a restriction, not about one server, and
+    clearing it here is how a later reconnect would read as open.
+    """
+    entries = read_raw(path)
+    if url not in entries:
+        return False
+    del entries[url]
+    _write_entries(path, entries)
+    return True
+
+
+def _write_entries(path: Path, entries: dict) -> None:
+    """Write the whole `[server."URL"]` set at mode 0600, because it holds tokens."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = []
     for server_url, entry in entries.items():
@@ -238,12 +275,6 @@ def write_server(path: Path, url: str, fields: dict) -> None:
         lines.append("")
     path.write_text("\n".join(lines))
     path.chmod(0o600)
-    if entries[url].get("restricted"):
-        _marker_path(path).write_text(
-            "This machine pushes under a restriction. Deleting this file does not\n"
-            "lift it: push.toml is what says so, and this only stops a lost\n"
-            "`restricted = true` from reading as permission to send real names.\n",
-        )
 
 
 def _toml_value(value) -> str:
@@ -407,8 +438,16 @@ def changed_files(
     Straight off ccreport_files rather than off the disk: the cache is what
     holds the records about to be sent, and a file that has grown since it was
     cached is the next `ccreport` run's business, not this one's.
+
+    Archived files are left out. Their records folded into ccreport_archive and
+    the rows themselves are gone, so offering one would send a file with no
+    records — and the server keys a file on (machine, path) and replaces what it
+    holds, so a `--full` would empty out history it is the only copy of.
     """
-    rows = conn.execute("SELECT path, mtime_ns, size FROM ccreport_files ORDER BY path").fetchall()
+    rows = conn.execute(
+        "SELECT path, mtime_ns, size FROM ccreport_files "
+        "WHERE archived = 0 ORDER BY path"
+    ).fetchall()
     return [
         (path, mtime_ns, size)
         for path, mtime_ns, size in rows
@@ -420,9 +459,9 @@ def _records_for(conn: sqlite3.Connection, path: str) -> list[dict]:
     """One file's cached records, as the rows they were stored as."""
     from ccreport.cache_db import _CCR_COLS
 
-    cols = ", ".join(_CCR_COLS)
     rows = conn.execute(
-        f"SELECT {cols} FROM ccreport_records WHERE file_path = ? ORDER BY id",  # noqa: S608
+        f"SELECT {', '.join('r.' + c for c in _CCR_COLS)} FROM ccreport_records r "  # noqa: S608
+        "JOIN ccreport_files f ON f.id = r.file_id WHERE f.path = ? ORDER BY r.id",
         (path,),
     ).fetchall()
     return [dict(zip(_CCR_COLS, row, strict=True)) for row in rows]
@@ -518,17 +557,62 @@ def build_samples(conn: sqlite3.Connection, timeline, since: float) -> list[dict
     return samples
 
 
-def pack_samples(samples: list[dict], label: str) -> list[dict]:
-    """The sample-only requests a batch of them travels in.
+def build_extra(conn: sqlite3.Connection, timeline, since: float) -> list[dict]:
+    """The Extra-usage readings newer than the watermark, as the ingest accepts.
+
+    The account is resolved here, as a sample's is. Nothing is redacted: a
+    reading is an instant and a dollar figure, neither of which names a project
+    or a session.
+
+    The client prunes this table to 31 days on every usage-cache write, so a
+    machine that has not pushed in a month has already lost what it never sent.
+    The server keeps what does arrive for good, which is what lets `/limits`
+    price a window `ccreport limits` can no longer reach.
+    """
+    rows = conn.execute(
+        "SELECT ts, spent FROM extra_usage_snapshots WHERE ts > ? ORDER BY ts",
+        (since,),
+    ).fetchall()
+    readings = []
+    for ts, spent in rows:
+        when = datetime.fromtimestamp(ts, tz=UTC)
+        readings.append({
+            "ts": ts,
+            "spent": spent,
+            "account_uuid": timeline.uuid_at(when) or "unknown",
+            "account_label": timeline.label_at(when),
+        })
+    return readings
+
+
+def pack_samples(samples: list[dict], extra: list[dict], label: str) -> list[dict]:
+    """The side-channel requests a batch of samples and readings travels in.
 
     Their own requests rather than a field on the file batches: a machine whose
     logs have not changed still has new samples to send, and there are no file
     batches on that run to attach them to.
+
+    The two series are zipped into the same requests rather than sent as two
+    runs of them. They are the same size and the same shape, and a run that
+    carried both would otherwise open twice as many connections to say so.
     """
+    chunks = max(
+        _chunk_count(samples), _chunk_count(extra),
+    )
     return [
-        {"label": label, "files": [], "samples": samples[at:at + SAMPLES_PER_BATCH]}
-        for at in range(0, len(samples), SAMPLES_PER_BATCH)
+        {
+            "label": label,
+            "files": [],
+            "samples": samples[at * SAMPLES_PER_BATCH:(at + 1) * SAMPLES_PER_BATCH],
+            "extra": extra[at * SAMPLES_PER_BATCH:(at + 1) * SAMPLES_PER_BATCH],
+        }
+        for at in range(chunks)
     ]
+
+
+def _chunk_count(items: list[dict]) -> int:
+    """How many SAMPLES_PER_BATCH requests *items* needs."""
+    return -(-len(items) // SAMPLES_PER_BATCH)
 
 
 def pack_batches(files: list[dict], label: str, max_body: int) -> list[dict]:
@@ -558,11 +642,16 @@ def post_batch(server: ServerConfig, batch: dict) -> dict:
     """Send one batch and return the server's verdict.
 
     Raises:
-        PushError: the request failed. A 401 is terminal — a revoked token is
-            not a transient failure, and retrying it every interval forever is
-            how a revoked laptop keeps knocking for a week.
+        PushError: the request failed. A 401 and a 409 are terminal — a revoked
+            token and a server too old to read this build are both settled until
+            somebody acts, and retrying either every interval forever is how a
+            revoked laptop keeps knocking for a week.
     """
-    body = json.dumps({**batch, "client_version": _client_version()}).encode()
+    body = json.dumps({
+        **batch,
+        "protocol": protocol.PROTOCOL_VERSION,
+        "client_version": _client_version(),
+    }).encode()
     request = urllib.request.Request(  # noqa: S310
         f"{server.url.rstrip('/')}/v1/ingest",
         data=body,
@@ -573,15 +662,40 @@ def post_batch(server: ServerConfig, batch: dict) -> dict:
     )
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_S) as resp:  # noqa: S310
-            return json.loads(resp.read())
+            reply = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
-        terminal = exc.code == 401
-        reason = "the token was refused" if terminal else f"{exc.code} {exc.reason}"
+        terminal = exc.code in (401, 409)
+        reason = _refusal(exc)
         raise PushError(f"{server.url}: {reason}", terminal=terminal) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise PushError(f"{server.url}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise PushError(f"{server.url}: the reply was not JSON") from exc
+    # After the transport, because a server old enough to be behind is also old
+    # enough to answer 200 to a batch it only half read. This is the only thing
+    # that catches one that predates the protocol field entirely.
+    theirs = reply.get("protocol", protocol.PRE_VERSIONING)
+    if theirs < protocol.PROTOCOL_VERSION:
+        raise PushError(f"{server.url}: {protocol.describe(theirs)}", terminal=True)
+    return reply
+
+
+def _refusal(exc: urllib.error.HTTPError) -> str:
+    """What a refused request is reported as, in the words the person needs.
+
+    A 409 carries the server's own sentence about the two protocol versions;
+    printing "409 Conflict" over it would throw away the only part that says
+    what to do.
+    """
+    if exc.code == 401:
+        return "the token was refused"
+    if exc.code == 409:
+        try:
+            detail = json.loads(exc.read()).get("detail")
+        except Exception:  # noqa: BLE001 - the status line is the answer either way
+            detail = None
+        return detail or "the server refused this build's protocol version"
+    return f"{exc.code} {exc.reason}"
 
 
 def _client_version() -> str:
@@ -597,8 +711,94 @@ def _fingerprints(files: list[dict]) -> dict[str, tuple[int, int]]:
     return {item["path"]: (item["mtime_ns"], item["size"]) for item in files}
 
 
-def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = None) -> PushResult:
+def _account_uuid_now() -> str | None:
+    """The account this machine is signed in to right now, or None.
+
+    What a pull scopes to, both when it asks and when the report reads back:
+    a login switch must not add a previous account's spend to this one's
+    windows.
+    """
+    from ccreport import cache_db
+    from ccreport.accounts import AccountTimeline
+
+    timeline = AccountTimeline(cache_db.load_account_events())
+    return timeline.uuid_at(datetime.now(tz=UTC))
+
+
+def store_pull(server_url: str, reply: dict, now: float) -> int:
+    """Store one pull reply's remainder. Returns the machines it named.
+
+    The window totals are summed here rather than on the server: the reply
+    carries per-minute cost buckets, and which rolling windows those answer is
+    pricing.ROLLING_WINDOWS, the list every other window key on this machine is
+    derived from. Summing server-side would have frozen that list into the
+    protocol.
+
+    all_time is summed off the day rows rather than off the buckets, which the
+    server bounds to the longest rolling window — the daily table is the one
+    that keeps every day, and it is exact over all of them.
+    """
+    from ccreport import cache_db, pricing
+
+    remainder = reply.get("pull") or {}
+    account_uuid = remainder.get("account_uuid")
+    if not account_uuid:
+        return 0
+    machines = remainder.get("machines") or []
+    windows: list[tuple[str, str, str, float, float]] = []
+    days: list[tuple] = []
+    for machine in machines:
+        machine_id = machine["machine_id"]
+        label = machine.get("label") or machine_id
+        pushed_at = float(machine.get("last_seen") or 0.0)
+        buckets = [(float(ts), float(cost)) for ts, cost in machine.get("buckets", ())]
+        for window in pricing.ROLLING_WINDOWS:
+            start = now - window.delta.total_seconds()
+            windows.append((
+                machine_id, label, window.name,
+                sum(cost for ts, cost in buckets if ts >= start), pushed_at,
+            ))
+        all_time = 0.0
+        for row in machine.get("days", ()):
+            day, project, cost, *counts = row
+            all_time += float(cost)
+            days.append((
+                machine_id, day, project, float(cost), *(int(v) for v in counts),
+                pushed_at,
+            ))
+        windows.append((machine_id, label, "all_time", all_time, pushed_at))
+    cache_db.save_remote_costs(server_url, account_uuid, windows, days, now)
+    return len(machines)
+
+
+def pull_from(server: ServerConfig) -> PushResult:
+    """Ask *server* for the spend this machine does not have, and store it.
+
+    An empty batch with a pull attached, so it goes through the token-authed
+    ingest endpoint and works from wherever the laptop is. `ccreport server
+    sync` is a push followed by one of these, and both spellings exist so each
+    half is testable on its own.
+    """
+    result = PushResult(server=server.url)
+    account_uuid = _account_uuid_now()
+    if not account_uuid:
+        return result
+    now = time.time()
+    reply = post_batch(server, {
+        "label": server.label, "files": [], "samples": [], "extra": [],
+        "pull": {"account_uuid": account_uuid},
+    })
+    result.pulled = store_pull(server.url, reply, now)
+    return result
+
+
+def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = None,
+            pull: bool = False) -> PushResult:
     """Send everything *server* has not acknowledged, and record what it stored.
+
+    *pull* attaches the remainder request to the last batch, so a sync costs one
+    round trip rather than two and the reply is computed after this run's own
+    files are stored.
 
     Raises:
         PushError: nothing was sent. A file the server rejected is reported in
@@ -624,13 +824,15 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
     timeline = AccountTimeline(cache_db.load_account_events())
 
     # Cleared with the file watermark by --full and by a policy change, so a
-    # repaired server is offered the whole history of both tables.
+    # repaired server is offered the whole history of all three tables.
     samples_at = cache_db.read_push_samples_at(server.url)
+    extra_at = cache_db.read_push_extra_at(server.url)
     conn = _read_only(db_path or cache_db.DB_PATH)
     try:
         pending = changed_files(conn, watermark)
         files = build_files(conn, pending, timeline, override)
         samples = build_samples(conn, timeline, samples_at)
+        extra = build_extra(conn, timeline, extra_at)
     finally:
         conn.close()
     for item in files:
@@ -641,12 +843,25 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
     result = PushResult(server=server.url)
     acknowledged: list[tuple[str, int, int]] = []
     sent_samples_at = samples_at
+    sent_extra_at = extra_at
     batches = pack_batches(files, server.label, server.max_body) + pack_samples(
-        samples, server.label,
+        samples, extra, server.label,
     )
+    account_uuid = _account_uuid_now() if pull else None
+    if account_uuid:
+        # On the last batch, and one of its own where there is none: the
+        # remainder is computed after the files in the same request are stored,
+        # so a sync reads a server that already holds what it just sent.
+        if not batches:
+            batches = [{"label": server.label, "files": []}]
+        batches[-1]["pull"] = {"account_uuid": account_uuid}
+    pulled_at = time.time()
     for batch in batches:
         reply = post_batch(server, batch)
         result.samples += reply.get("samples") or 0
+        result.extra += reply.get("extra") or 0
+        for reading in batch.get("extra", ()):
+            sent_extra_at = max(sent_extra_at, reading["ts"])
         # Accumulated across the run and written once at the end, so a batch
         # that raises leaves the watermark where it was and the earlier ones are
         # offered again. Re-sending a stored sample is a no-op: the server keys
@@ -664,11 +879,14 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
             result.records += entry.get("records") or 0
             mtime_ns, size = prints[path]
             acknowledged.append((path, mtime_ns, size))
+        if reply.get("pull"):
+            result.pulled = store_pull(server.url, reply, pulled_at)
 
     # The only writes, and only for what the server said it stored. A rejected
     # file stays unrecorded on purpose, so the next run offers it again.
     cache_db.save_push_state(server.url, acknowledged, time.time())
     cache_db.write_push_samples_at(server.url, sent_samples_at)
+    cache_db.write_push_extra_at(server.url, sent_extra_at)
     cache_db.write_push_policy(server.url, policy)
     return result
 
@@ -703,12 +921,17 @@ def refresh_cache() -> None:
 
 
 def run_once(*, full: bool = False, only: str | None = None,
-             config_path: Path | None = None, force: bool = False) -> list[PushResult]:
+             config_path: Path | None = None, force: bool = False,
+             pull: bool = True) -> list[PushResult]:
     """Push to every configured server that is due, and stamp each attempt.
 
     *force* skips the interval, which is what the manual command wants and the
     spawn does not. The cache is refreshed once a server has cleared every
     gate, so a run that sends nothing parses nothing either.
+
+    *pull* asks each server for the spend this machine does not have and stores
+    it, on the same request that carried the push. Off for `ccreport server
+    push`, which is the half that only sends.
     """
     from ccreport import cache_db
 
@@ -735,7 +958,7 @@ def run_once(*, full: bool = False, only: str | None = None,
             refresh_cache()
             refreshed = True
         try:
-            result = push_to(server, full=full)
+            result = push_to(server, full=full, pull=pull)
         except PushError as exc:
             # Stamped on every outcome, failures included: without it an
             # unreachable server would be probed once per render.

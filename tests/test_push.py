@@ -128,7 +128,7 @@ class TestCacheRefresh:
         """The paths each push_to call found pending, without a server."""
         sent: list[list[str]] = []
 
-        def record(server, full=False, db_path=None):
+        def record(server, full=False, pull=False, db_path=None):
             conn = push._read_only(cache_db.DB_PATH)
             sent.append([path for path, _m, _s in push.changed_files(conn, {})])
             conn.close()
@@ -167,7 +167,7 @@ class TestCacheRefresh:
         )
         calls = []
         monkeypatch.setattr(push, "push_to",
-                            lambda server, full=False, db_path=None: push.PushResult(server.url))
+                            lambda server, full=False, pull=False, db_path=None: push.PushResult(server.url))
         monkeypatch.setattr(push, "refresh_cache", lambda: calls.append(1))
         push.run_once(config_path=path, force=True)
         assert calls == [1]
@@ -555,6 +555,63 @@ class TestAgainstAServer:
         [row] = db.load_rate_limit_samples(app.state.db.connect())
         assert (row["window"], row["used_pct"]) == ("session", 5.0)
 
+    @staticmethod
+    def _seed_extra(*readings):
+        """Write Extra-usage readings the way write_usage_cache would."""
+        conn = cache_db.get_connection()
+        conn.executemany(
+            "INSERT OR REPLACE INTO extra_usage_snapshots (ts, spent) VALUES (?, ?)",
+            readings,
+        )
+        conn.commit()
+
+    def test_a_push_carries_the_extra_usage_readings(self, wired):
+        from ccreport.server import db
+
+        app, _client, config = wired
+        self._seed_extra((TS, 0.0), (TS + 3600, 4.25))
+        result = push.push_to(config)
+        assert result.extra == 2
+        series = db.load_extra_samples(app.state.db.connect())
+        assert [spent for _ts, spent in next(iter(series.values()))] == [0.0, 4.25]
+
+    def test_a_reading_already_stored_is_not_offered_again(self, wired):
+        _app, _client, config = wired
+        self._seed_extra((TS, 1.0))
+        push.push_to(config)
+        assert push.push_to(config).extra == 0
+
+    def test_full_offers_every_reading_again(self, wired):
+        _app, _client, config = wired
+        self._seed_extra((TS, 1.0))
+        push.push_to(config)
+        assert push.push_to(config, full=True).extra == 1
+
+    def test_a_restricted_machine_sends_the_readings_unchanged(self, wired):
+        """An instant and a dollar figure name no project and no session."""
+        from dataclasses import replace
+
+        from ccreport.server import db
+
+        app, _client, config = wired
+        self._seed_extra((TS, 7.5))
+        push.push_to(replace(config, restricted=True, allow=()))
+        series = db.load_extra_samples(app.state.db.connect())
+        assert [spent for _ts, spent in next(iter(series.values()))] == [7.5]
+
+    def test_deleting_a_machine_takes_its_readings_with_it(self, wired):
+        from ccreport.server import db
+
+        app, _client, config = wired
+        self._seed_extra((TS, 7.5))
+        push.push_to(config)
+        conn = app.state.db.connect()
+        [machine_id] = [
+            row[0] for row in conn.execute("SELECT machine_id FROM machines")
+        ]
+        db.delete_machine(conn, machine_id)
+        assert db.load_extra_samples(conn) == {}
+
     def test_a_revoked_token_is_terminal(self, wired):
         from ccreport.server import db, tokens
 
@@ -577,7 +634,7 @@ class TestRunOnce:
 
     def test_a_failure_still_stamps_the_attempt(self, config_path, monkeypatch):
         """Else an unreachable server is probed once per render."""
-        def boom(server, full=False, db_path=None):
+        def boom(server, full=False, pull=False, db_path=None):
             raise push.PushError("refused")
 
         monkeypatch.setattr(push, "push_to", boom)
@@ -589,7 +646,7 @@ class TestRunOnce:
 
     def test_a_failure_keeps_its_reason(self, config_path, monkeypatch):
         """A count alone cannot tell connection-refused from a 500."""
-        def boom(server, full=False, db_path=None):
+        def boom(server, full=False, pull=False, db_path=None):
             raise push.PushError("https://ccr.example.net: refused")
 
         monkeypatch.setattr(push, "push_to", boom)
@@ -599,7 +656,7 @@ class TestRunOnce:
     def test_consecutive_failures_accumulate(self, config_path, monkeypatch):
         monkeypatch.setattr(
             push, "push_to",
-            lambda server, full=False, db_path=None: (_ for _ in ()).throw(push.PushError("no")),
+            lambda server, full=False, pull=False, db_path=None: (_ for _ in ()).throw(push.PushError("no")),
         )
         push.run_once(config_path=config_path, force=True)
         push.run_once(config_path=config_path, force=True)
@@ -610,7 +667,7 @@ class TestRunOnce:
         cache_db.write_push_attempt(url, 100.0, 4)
         monkeypatch.setattr(
             push, "push_to",
-            lambda server, full=False, db_path=None: push.PushResult(server=server.url),
+            lambda server, full=False, pull=False, db_path=None: push.PushResult(server=server.url),
         )
         push.run_once(config_path=config_path, force=True)
         assert cache_db.read_push_attempt(url)[1] == 0
@@ -620,7 +677,7 @@ class TestRunOnce:
         url = "https://ccr.example.net"
         calls = []
 
-        def refuse(server, full=False, db_path=None):
+        def refuse(server, full=False, pull=False, db_path=None):
             calls.append(server.url)
             raise push.PushError("token refused", terminal=True)
 
@@ -635,7 +692,7 @@ class TestRunOnce:
         cache_db.write_push_attempt("https://ccr.example.net", time.time(), 0)
         monkeypatch.setattr(
             push, "push_to",
-            lambda server, full=False, db_path=None: calls.append(1),
+            lambda server, full=False, pull=False, db_path=None: calls.append(1),
         )
         push.run_once(config_path=config_path)
         assert calls == []
@@ -646,7 +703,7 @@ class TestRunOnce:
         calls = []
         monkeypatch.setattr(
             push, "push_to",
-            lambda server, full=False, db_path=None: calls.append(1) or push.PushResult("x"),
+            lambda server, full=False, pull=False, db_path=None: calls.append(1) or push.PushResult("x"),
         )
         cache_db.write_push_attempt(url, time.time() - 4 * 60, 0)
         push.run_once(config_path=path)
@@ -661,7 +718,7 @@ class TestRunOnce:
         cache_db.write_push_attempt("https://ccr.example.net", time.time(), 0)
         monkeypatch.setattr(
             push, "push_to",
-            lambda server, full=False, db_path=None: calls.append(1) or push.PushResult("x"),
+            lambda server, full=False, pull=False, db_path=None: calls.append(1) or push.PushResult("x"),
         )
         push.run_once(config_path=config_path, force=True)
         assert calls == [1]
@@ -675,7 +732,9 @@ class TestRunOnce:
         seen = []
         monkeypatch.setattr(
             push, "push_to",
-            lambda server, full=False, db_path=None: seen.append(server.url) or push.PushResult("x"),
+            lambda server, full=False, pull=False, db_path=None: (
+                seen.append(server.url) or push.PushResult("x")
+            ),
         )
         push.run_once(config_path=path, only="https://b.example", force=True)
         assert seen == ["https://b.example"]

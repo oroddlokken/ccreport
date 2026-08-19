@@ -142,7 +142,7 @@ def _tables(conn: sqlite3.Connection) -> set[str]:
 
 _INSERT_RECORD = (
     "INSERT INTO ccreport_records "
-    "(file_path, mid, model, ts, sid, project, cost, "
+    "(file_id, mid, model, ts, sid, project, cost, "
     " input_tokens, output_tokens, cache_create, cache_read) "
     "VALUES (?, ?, ?, ?, 's1', 'proj', ?, 0, 0, 0, 0)"
 )
@@ -174,7 +174,10 @@ def _seed_ccreport(conn, rows, *, path="/tmp/proj/a.jsonl") -> None:
         "INSERT OR REPLACE INTO ccreport_files (path, mtime_ns, size) VALUES (?, 1, 1)",
         (path,),
     )
-    conn.executemany(_INSERT_RECORD, [(path, *r) for r in rows])
+    file_id = conn.execute(
+        "SELECT id FROM ccreport_files WHERE path = ?", (path,)
+    ).fetchone()[0]
+    conn.executemany(_INSERT_RECORD, [(file_id, *r) for r in rows])
     conn.commit()
 
 
@@ -1257,7 +1260,8 @@ class TestInvalidateCcreport:
         without it, so these assertions go to the table directly.
         """
         return conn.execute(
-            "SELECT cost FROM ccreport_records WHERE file_path = ?", (path,)
+            "SELECT r.cost FROM ccreport_records r "
+            "JOIN ccreport_files f ON f.id = r.file_id WHERE f.path = ?", (path,)
         ).fetchone()[0]
 
     def test_only_live_records_lose_their_cached_cost(self, two_files):
@@ -1814,8 +1818,8 @@ class TestIndexShape:
         assert _index_names(old_shaped, "ccreport_records") & _DEAD_INDEXES == set()
         assert _index_names(old_shaped, "dedup_keys") & _DEAD_INDEXES == set()
 
-    def test_the_composite_index_leads_with_file_path(self, db):
-        assert _index_columns(db, "idx_ccr_file_ts") == ["file_path", "ts"]
+    def test_the_composite_index_leads_with_file_id(self, db):
+        assert _index_columns(db, "idx_ccr_file_ts") == ["file_id", "ts"]
 
     @pytest.mark.parametrize("fixture", ["db", "old_shaped"])
     def test_dedup_keys_is_keyed_file_path_first(self, fixture, request):
@@ -1835,6 +1839,105 @@ class TestIndexShape:
         assert cache_db._get_meta(old_shaped, "migrated_drop_dead_indexes") == "1"
         assert cache_db._get_meta(old_shaped, "migrated_dedup_keys_pk_order") == "1"
         assert cache_db._run_migrations(old_shaped) is False
+
+
+_V11_RECORDS_SQL = """
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+CREATE TABLE ccreport_files (
+    path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL)
+    WITHOUT ROWID;
+CREATE TABLE ccreport_records (
+    id INTEGER PRIMARY KEY,
+    file_path TEXT NOT NULL REFERENCES ccreport_files(path) ON DELETE CASCADE,
+    mid TEXT, model TEXT NOT NULL, ts REAL NOT NULL, sid TEXT NOT NULL,
+    project TEXT NOT NULL, cwd TEXT, repo TEXT, dk TEXT, cost REAL,
+    input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+    cache_create INTEGER NOT NULL, cache_read INTEGER NOT NULL);
+CREATE INDEX idx_ccr_file_ts ON ccreport_records(file_path, ts);
+CREATE INDEX idx_ccr_sid ON ccreport_records(sid);
+INSERT INTO ccreport_files VALUES ('/p/-tmp-a/one.jsonl', 11, 12),
+                                  ('/p/-tmp-b/two.jsonl', 21, 22);
+INSERT INTO ccreport_records VALUES
+    (1, '/p/-tmp-a/one.jsonl', 'm1', 'claude-opus-5', 100.0, 's1', 'a',
+     '/tmp/a', 'repo-a', 'd1', 1.5, 1, 2, 3, 4),
+    (2, '/p/-tmp-b/two.jsonl', 'm2', 'claude-opus-5', 200.0, 's2', 'b',
+     '/tmp/b', 'repo-b', 'd2', 2.5, 5, 6, 7, 8),
+    (3, '/p/-tmp-gone/three.jsonl', 'm3', 'claude-opus-5', 300.0, 's3', 'c',
+     '/tmp/c', 'repo-c', 'd3', 3.5, 9, 9, 9, 9);
+"""
+"""A DB in the shape shipped at MIGRATION_BASELINE, plus one parentless record.
+
+The seed connection leaves foreign_keys off, which is how the real machines
+grew rows like record 3: their ccreport_files parent went away under a build
+that did not enforce the reference.
+"""
+
+
+class TestRecordsFileIdMigration:
+    """ccreport_records.file_path becomes an integer id into ccreport_files."""
+
+    @pytest.fixture
+    def migrated(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_DISABLE", "1")
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_DIR", str(tmp_path / "snaps"))
+        path = tmp_path / "v11.db"
+        seed = sqlite3.connect(path)
+        seed.executescript(_V11_RECORDS_SQL)
+        seed.commit()
+        seed.close()
+        monkeypatch.setattr(cache_db, "DB_PATH", path)
+        monkeypatch.setattr(cache_db, "_conn", None)
+        conn = cache_db.get_connection()
+        cache_db.init_ccreport_meta(1, "test-hash")
+        yield conn
+        cache_db.close_connection()
+
+    def test_the_path_column_is_gone_and_the_id_is_there(self, migrated):
+        cols = _columns(migrated, "ccreport_records")
+        assert "file_path" not in cols
+        assert "file_id" in cols
+
+    def test_every_record_still_reads_back_under_its_own_path(self, migrated):
+        loaded = cache_db.bulk_load_ccreport_cache()[1]
+        assert sorted(loaded) == ["/p/-tmp-a/one.jsonl", "/p/-tmp-b/two.jsonl"]
+        one = loaded["/p/-tmp-a/one.jsonl"][0]
+        assert one["mid"] == "m1"
+        assert one["cost"] == 1.5
+        assert one["t"] == [1, 2, 3, 4]
+
+    def test_the_file_fingerprints_survive(self, migrated):
+        assert cache_db.load_ccreport_file_meta() == {
+            "/p/-tmp-a/one.jsonl": (11, 12),
+            "/p/-tmp-b/two.jsonl": (21, 22),
+        }
+
+    def test_record_ids_are_carried_over_so_insert_order_holds(self, migrated):
+        rows = migrated.execute("SELECT id, mid FROM ccreport_records ORDER BY id")
+        assert list(rows) == [(1, "m1"), (2, "m2")]
+
+    def test_the_parentless_record_is_dropped_rather_than_carried(self, migrated):
+        assert migrated.execute(
+            "SELECT COUNT(*) FROM ccreport_records WHERE mid = 'm3'"
+        ).fetchone()[0] == 0
+
+    def test_both_indexes_come_back_over_the_new_column(self, migrated):
+        assert _index_names(migrated, "ccreport_records") >= _WANTED_CCR_INDEXES
+        assert _index_columns(migrated, "idx_ccr_file_ts") == ["file_id", "ts"]
+
+    def test_the_cascade_still_takes_a_files_records_with_it(self, migrated):
+        migrated.execute("DELETE FROM ccreport_files WHERE path = '/p/-tmp-a/one.jsonl'")
+        migrated.commit()
+        assert migrated.execute(
+            "SELECT COUNT(*) FROM ccreport_records"
+        ).fetchone()[0] == 1
+
+    def test_no_v11_scaffolding_is_left_behind(self, migrated):
+        assert {"ccreport_records_v11", "ccreport_files_v11"} & _tables(migrated) == set()
+
+    def test_a_fresh_db_never_runs_the_rebuild(self, db):
+        """The step is a no-op where _SCHEMA_SQL already built the new shape."""
+        assert cache_db._migrate_records_file_id(db) is None
+        assert "file_id" in _columns(db, "ccreport_records")
 
 
 class TestDedupKeysRebuildWithOrphans:
@@ -2403,6 +2506,27 @@ class TestSnapshotCompression:
         """11 of these were on the machine, the oldest for a long-gone .db."""
         (snaps / "2026-07-06.db-shm").write_bytes(b"shm")
         (snaps / "2026-07-06.db-wal").write_bytes(b"wal")
+        (snaps / "2026-08-07.db").write_bytes(b"page" * 4096)
+        cache_db._rotate_snapshots(snaps)
+        assert self._names(snaps) == ["2026-08-07.db"]
+
+    def test_stale_tmp_files_are_swept_and_the_live_one_is_not(self, snaps):
+        """2.1 GB of these sat on one machine, under a name nothing globs for."""
+        stale = snaps / "2026-04-11.db.54321.tmp"
+        stale.write_bytes(b"partial")
+        old = time.time() - cache_db._SNAPSHOT_TMP_STALE_S - 60
+        os.utime(stale, (old, old))
+        live = snaps / "2026-08-07.db.tmp"
+        live.write_bytes(b"in flight")
+        (snaps / "2026-08-07.db").write_bytes(b"page" * 4096)
+        cache_db._rotate_snapshots(snaps)
+        assert self._names(snaps) == ["2026-08-07.db", "2026-08-07.db.tmp"]
+
+    def test_the_sweep_takes_the_journal_with_the_tmp(self, snaps):
+        old = time.time() - cache_db._SNAPSHOT_TMP_STALE_S - 60
+        for name in ("2026-04-11.db.54321.tmp", "2026-04-11.db.54321.tmp-journal"):
+            (snaps / name).write_bytes(b"partial")
+            os.utime(snaps / name, (old, old))
         (snaps / "2026-08-07.db").write_bytes(b"page" * 4096)
         cache_db._rotate_snapshots(snaps)
         assert self._names(snaps) == ["2026-08-07.db"]

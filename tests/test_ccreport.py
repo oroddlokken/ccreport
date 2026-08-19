@@ -2430,7 +2430,7 @@ class TestInstanceSpend:
             ]
         )
         return ccr._instance_spend(
-            _instances()[0], index, ccr._ExtraIndex(list(extra)), _local_epoch(now_iso)
+            _instances()[0], index, ccr.ExtraIndex(list(extra)), _local_epoch(now_iso)
         )
 
     def test_the_spend_is_what_the_fill_span_cost(self):
@@ -2505,7 +2505,7 @@ class TestExtraIndex:
     """Extra-usage dollars over a range, from a coarse cumulative series."""
 
     def _spent(self, points, start_iso, end_iso):
-        index = ccr._ExtraIndex([(_local_epoch(i), v) for i, v in points])
+        index = ccr.ExtraIndex([(_local_epoch(i), v) for i, v in points])
         return index.spent_between(_local_epoch(start_iso), _local_epoch(end_iso))
 
     def test_the_range_is_the_rise_from_the_reading_before_it(self):
@@ -2556,7 +2556,7 @@ class TestInstanceExtra:
     def _extra(self, pcts, points=(), *, now_iso="2026-06-15T14:00", window="session",
                first="2026-06-15T08:00"):
         _seed_samples(window, _W1_RESET, _local_epoch(first), pcts)
-        index = ccr._ExtraIndex([(_local_epoch(i), v) for i, v in points])
+        index = ccr.ExtraIndex([(_local_epoch(i), v) for i, v in points])
         return ccr._instance_extra(_instances()[0], index, _local_epoch(now_iso))
 
     # The window opens at 08:00 and resets at 13:00, so 07:30 is the baseline
@@ -2930,7 +2930,7 @@ class TestLimitsRendering:
         )
         instances = _instances()
         stamp = _local_epoch(now) if now else _W1_START
-        index, extras = ccr.SpendIndex(list(records)), ccr._ExtraIndex(list(extra))
+        index, extras = ccr.SpendIndex(list(records)), ccr.ExtraIndex(list(extra))
         spends = {
             i.key: ccr._instance_spend(i, index, extras, stamp) for i in instances
         }

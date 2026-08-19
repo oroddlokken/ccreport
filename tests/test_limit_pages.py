@@ -105,6 +105,57 @@ class TestTheWindowList:
         assert gated.get("/limits").status_code == 403
 
 
+class TestTheExtraColumn:
+    """Real billed credits, the one figure that is not an API-price valuation."""
+
+    @staticmethod
+    def _push_extra(app, machine: str, label: str, readings: list[tuple[float, float]]):
+        token = sf.mint_for(app, machine, label)
+        TestClient(app).post("/v1/ingest", headers=sf.auth(token), json={
+            "label": label, "files": [], "samples": [],
+            "extra": [sf.extra(ts=ts, spent=spent) for ts, spent in readings],
+        })
+
+    def test_a_bounded_window_prints_what_it_billed(self, app, client):
+        self._push_extra(app, "laptop-1", "Laptop",
+                         [(_ts(5.0), 2.0), (_ts(0.5), 9.5)])
+        assert "$7.50" in client.get("/limits").text
+
+    def test_no_reading_before_the_window_reads_as_absent(self, app, client):
+        """A dash, never $0.00: a billed window that reads as a free one."""
+        self._push_extra(app, "laptop-1", "Laptop", [(_ts(0.5), 9.5)])
+        body = client.get("/limits").text
+        assert "$9.50" not in body
+        assert "Extra" in body
+
+    def test_two_machines_on_one_account_do_not_double_the_figure(self, app, client):
+        """Both read the same cumulative dollars, so the answer is one machine's."""
+        self._push_extra(app, "laptop-1", "Laptop",
+                         [(_ts(5.0), 2.0), (_ts(3.0), 6.0), (_ts(0.5), 9.5)])
+        self._push_extra(app, "desk-1", "Desk", [(_ts(5.1), 2.0), (_ts(0.6), 9.5)])
+        body = client.get("/limits").text
+        assert "$7.50" in body
+        assert "$15.00" not in body
+
+    def test_the_machine_that_watched_most_closely_answers(self, app):
+        """A lagging second machine cannot be read as the monthly reset."""
+        self._push_extra(app, "laptop-1", "Laptop",
+                         [(_ts(5.0), 2.0), (_ts(3.0), 6.0), (_ts(0.5), 9.5)])
+        self._push_extra(app, "desk-1", "Desk", [(_ts(5.1), 2.0), (_ts(0.6), 4.0)])
+        view = limits.build(app.state.db.connect(), 30, NOW)
+        [row] = view.groups[0].rows
+        assert row.spend.extra_usd == pytest.approx(7.5)
+
+    def test_the_window_page_carries_the_tile(self, app, client):
+        self._push_extra(app, "laptop-1", "Laptop",
+                         [(_ts(5.0), 2.0), (_ts(0.5), 9.5)])
+        body = client.get(_window_url(client.get("/limits").text)).text
+        assert "billed as credits while the window ran" in body
+
+    def test_the_page_says_a_dash_is_retention_and_not_a_free_window(self, client):
+        assert "Extra is the only" in client.get("/limits").text
+
+
 class TestOneWindowsPage:
     def test_the_row_links_to_the_window(self, client):
         resp = client.get(_window_url(client.get("/limits").text))

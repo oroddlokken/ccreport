@@ -403,6 +403,58 @@ class SpendIndex:
         )
 
 
+class ExtraIndex:
+    """Extra-usage spend over a time range, from the stored snapshot series.
+
+    The series is cumulative dollars within a billing month, sampled by the
+    status line on slow renders alone, so it is coarse and it restarts at 0
+    every month. A range is therefore walked rather than subtracted end to end:
+    a reading below the one before it is the monthly reset, and the whole of
+    that reading is spend since it.
+
+    *snapshots* are `(ts, spent)` in ts order, as cache_db.load_extra_snapshots
+    returns them for this machine and db.load_extra_samples does per machine
+    on the server. One machine's readings, never two merged: the figure is
+    cumulative account spend, so a second machine reporting a slightly older
+    one after a fresher one is a drop, and a drop here means the month rolled
+    over.
+    """
+
+    def __init__(self, snapshots: list[tuple[float, float]]) -> None:
+        self._ts = [ts for ts, _spent in snapshots]
+        self._spent = [spent for _ts, spent in snapshots]
+
+    def spent_between(self, start: float, end: float) -> float | None:
+        """Dollars accrued in (*start*, *end*], or None where nothing bounds it.
+
+        Needs a reading at or before *start* to subtract from and one inside the
+        range to subtract it from. Missing either, the answer is unknown and not
+        $0.00 — the series is pruned at 31 days and skipped by every costs-only
+        refresh, so an absent reading says nothing about what was spent.
+
+        One exception, and it is what makes a week reconcile with the sessions
+        inside it: a reading of $0.00 has nothing behind it, so where the series
+        begins inside the range at zero it is a baseline of its own. Without it
+        the oldest window of every type is unknown however much it billed, since
+        the series can only start after it opened.
+        """
+        base = bisect.bisect_right(self._ts, start) - 1
+        last = bisect.bisect_right(self._ts, end)
+        if base < 0:
+            opening = bisect.bisect_left(self._ts, start)
+            if opening >= last or self._spent[opening] != 0.0:
+                return None
+            base = opening
+        if last <= base + 1:
+            return None
+        total = 0.0
+        prev = self._spent[base]
+        for spent in self._spent[base + 1:last]:
+            total += spent - prev if spent >= prev else spent
+            prev = spent
+        return total
+
+
 @dataclass(frozen=True)
 class WindowSpend:
     """What one window instance's observed rise cost, in API-priced dollars.
@@ -462,7 +514,9 @@ def instance_spend(
 
     *extra_usd* survives that early return: it is metered by the clock rather
     than by the rise, so a window nobody watched rising still billed what it
-    billed. The server has no Extra series and passes None.
+    billed. Both ends pass it — the CLI off this machine's snapshot table, the
+    server off the readings one machine on the account pushed — and None where
+    no reading bounds the span.
     """
     if index.empty or inst.rise <= 0:
         return WindowSpend(None, None, None, extra_usd)

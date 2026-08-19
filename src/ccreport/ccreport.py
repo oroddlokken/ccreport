@@ -6,7 +6,6 @@ update that document to match.
 """
 
 import argparse
-import bisect
 import hashlib
 import json
 import os
@@ -16,14 +15,22 @@ import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from rich import box
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from ccreport import accounts, aggregate, cache_db, exchange, pricing, project_identity
+from ccreport import (
+    accounts,
+    aggregate,
+    cache_db,
+    exchange,
+    pricing,
+    project_identity,
+    protocol,
+)
 from ccreport.accounts import AccountTimeline
 from ccreport.aggregate import (
     UNKNOWN_ACCOUNT,
@@ -43,11 +50,13 @@ from ccreport.cache_db import (
     _ACCOUNT_TIER_COLS,
     ADOPTED_TS,
     add_project_override,
+    archived_file_paths,
     clear_adopted_account,
     count_ccreport_records_without_signals,
     delete_project_override,
     get_project_overrides,
     load_account_events,
+    load_ccreport_archive,
     load_ccreport_file_meta,
     load_ccreport_file_meta_before,
     load_ccreport_records_in_range,
@@ -57,11 +66,12 @@ from ccreport.cache_db import (
     read_adopted_account,
     read_ccreport_rollup_fingerprint,
     read_latest_account,
+    save_ccreport_archive,
     save_ccreport_rollups,
     set_adopted_account,
 )
 from ccreport.exchange import RateFetch, get_rate, load_rates
-from ccreport.pricing import _local_tz, dedup_identity
+from ccreport.pricing import _get_projects_dirs, _local_tz, _project_dir_prefix, dedup_identity
 
 # Reading the logs into the cache moved to scan.py so the detached push could
 # refresh it without importing rich, as the account timeline moved to
@@ -80,6 +90,7 @@ from ccreport.windows import (
 )
 from ccreport.windows import (
     LIMIT_WINDOWS,
+    ExtraIndex,
     SpendIndex,
     WindowInstance,
     WindowSpend,
@@ -343,7 +354,10 @@ def _load_full(
     all_records += [r for r in orphaned if _keep(r, **filters)]
 
     all_records.sort(key=lambda r: r.timestamp)
-    return all_records
+    # The archive first, as _load_with_rollups puts its rollup groups first:
+    # every archived day ends before the oldest record left in the table, since
+    # `ccreport archive` only ever folds whole purged files behind its cutoff.
+    return _archived_for_load(filters) + all_records
 
 
 # --- Per-day rollups for the days that can no longer change ---
@@ -421,6 +435,11 @@ def _rollup_fingerprint(
     ]
     parts.append("orphans")
     parts += sorted(orphans)
+    # A rollup built before an archive run froze totals over records that have
+    # since been folded away, and the load that rebuilds it reads them from the
+    # archive instead. save_ccreport_archive drops the stored fingerprint too;
+    # this is what covers a database restored from a snapshot on either side.
+    parts.append(cache_db.archive_stamp())
     h = hashlib.sha256()
     for part in parts:
         h.update(part.encode())
@@ -499,6 +518,80 @@ def _rollup_records(rows: list[tuple]) -> list[UsageRecord]:
         )))
     pairs.sort(key=lambda pair: pair[0])
     return [rec for _min_ts, rec in pairs]
+
+
+def _archive_records(
+    rows: list[tuple],
+    *,
+    since: datetime | None,
+    until: datetime | None,
+    project_filter: str | None,
+    account_filter: str | None,
+    override: "Callable[[str | None, str | None, str], str] | None",
+    accounts: "AccountTimeline | None",
+) -> list[UsageRecord]:
+    """Archive rows as one synthetic record each, oldest group first.
+
+    Not run through _keep, for the reason _rollup_records is not: these rows
+    were deduped when they were folded, and deduping a whole day of a session
+    again would leave one call of it. The two read-time attributions do run —
+    the override renames the raw project the row stored and the change log
+    stamps the account off min_ts — which is what makes `ccreport merge` and
+    `ccreport adopt` still reach an archived day.
+
+    The account comes from min_ts rather than from the timestamp the record
+    carries, because `ccreport archive` refuses a file whose span holds a change
+    log event: both ends of a row therefore resolve to the same account, and
+    min_ts is the end that decides which side of an adoption the row is on.
+    """
+    pairs: list[tuple[float, UsageRecord]] = []
+    for (_day, oslo_date, sid, project, model, cwd, repo, _prefix,
+         min_ts, max_ts, tin, tout, tcc, tcr, cost, n) in rows:
+        rec = UsageRecord(
+            message_id="",
+            model=model,
+            tokens=TokenCounts(input=tin, output=tout,
+                               cache_create=tcc, cache_read=tcr),
+            timestamp=datetime.fromtimestamp(max_ts, tz=UTC),
+            session_id=sid,
+            project=project,
+            cwd=cwd or None,
+            repo=repo or None,
+            # The frozen sum, as a rollup record carries it; see _rollup_records.
+            cost_usd=cost,
+            count=n,
+            oslo_date=date.fromisoformat(oslo_date),
+        )
+        if override:
+            rec.project = override(rec.repo, rec.cwd, rec.project)
+        if accounts is not None:
+            rec.account = accounts.label_at(datetime.fromtimestamp(min_ts, tz=UTC))
+        if since and rec.timestamp < since:
+            continue
+        if until and rec.timestamp > until:
+            continue
+        if project_filter and project_filter.lower() not in rec.project.lower():
+            continue
+        if account_filter and account_filter.lower() not in rec.account.lower():
+            continue
+        pairs.append((min_ts, rec))
+    pairs.sort(key=lambda pair: pair[0])
+    return [rec for _min_ts, rec in pairs]
+
+
+def _archived_for_load(filters: dict) -> list[UsageRecord]:
+    """The archive, filtered the way *filters* would have filtered its records.
+
+    Takes the same bundle _keep does so a filter added to one is a filter the
+    other is handed too; seen_keys is the one key it drops, on purpose.
+    """
+    return _archive_records(
+        load_ccreport_archive(),
+        since=filters["since"], until=filters["until"],
+        project_filter=filters["project_filter"],
+        account_filter=filters["account_filter"],
+        override=filters["override"], accounts=filters["accounts"],
+    )
 
 
 def _load_with_rollups(files: list[Path], live_paths: set[str]) -> list[UsageRecord]:
@@ -1392,6 +1485,14 @@ def cmd_server_connect(args) -> None:
     except RemoteError as exc:
         print(f"ccreport: {exc}", file=sys.stderr)
         sys.exit(1)
+    # At setup, not at the first background push half an hour later — the same
+    # reason the token is checked here at all. Only the direction that loses
+    # data stops: a server ahead of this machine reads everything it sends.
+    theirs = health.get("protocol", protocol.PRE_VERSIONING)
+    if theirs < protocol.PROTOCOL_VERSION:
+        print(f"ccreport: {args.url} — {protocol.describe(theirs)}.\n"
+              f"          Nothing was written to {path}.", file=sys.stderr)
+        sys.exit(1)
 
     existing = push.read_raw(path).get(args.url, {})
     fields: dict[str, Any] = {
@@ -1427,6 +1528,54 @@ def cmd_server_connect(args) -> None:
         console.print(f"Restricted: only {allowed} will be identified by name.")
     if "interval_minutes" in fields:
         console.print(f"Pushing every {fields['interval_minutes']} min.")
+
+
+def cmd_server_disconnect(args) -> None:
+    """Stop pushing to one server, and clear every local row keyed on it.
+
+    The server keeps everything it holds. What goes is this machine's side: the
+    entry in push.toml, the file watermark, the per-server meta keys, and the
+    pulled cost tables — those last because `-A` and the status line's merged
+    windows would otherwise go on adding a server nobody pushes to.
+    """
+    from ccreport import push
+
+    path = Path(getattr(args, "config", None) or push.CONFIG_PATH)
+    entries = push.read_raw(path)
+    if not entries:
+        print(f"No server in {path} — nothing to disconnect.", file=sys.stderr)
+        sys.exit(1)
+    url = args.url or (next(iter(entries)) if len(entries) == 1 else None)
+    if url is None:
+        print(f"ccreport: name the server — {path} has {', '.join(sorted(entries))}.",
+              file=sys.stderr)
+        sys.exit(1)
+    if url not in entries:
+        print(f"ccreport: {url} is not in {path}.", file=sys.stderr)
+        sys.exit(1)
+
+    counts = cache_db.count_server_rows(url)
+    pulled = counts["remote_window_costs"] + counts["remote_day_costs"]
+    console.print(f"Disconnect [bold]{url}[/bold]:")
+    console.print(f"  remove its entry from {path}")
+    console.print(f"  forget {counts['push_state']} acknowledged file(s) and "
+                  f"{counts['meta']} stored key(s) of push history")
+    if pulled:
+        console.print(f"  drop {pulled} pulled cost row(s) — [yellow]-A and the status "
+                      "line stop counting that server's machines[/yellow]")
+    console.print("  [dim]the server keeps its records; revoking the token or "
+                  "deleting the machine is the web UI's job[/dim]")
+    console.print("  [yellow]the token's plaintext is nowhere else — reconnecting "
+                  "needs one minted afresh in the web UI[/yellow]")
+    if not args.yes and not _confirm("Proceed?"):
+        print("Aborted.")
+        return
+
+    push.remove_server(path, url)
+    gone = cache_db.forget_server(url)
+    console.print(f"Disconnected. Removed {gone['push_state']} watermark row(s), "
+                  f"{gone['remote_window_costs'] + gone['remote_day_costs']} "
+                  f"pulled cost row(s) and {gone['meta']} stored key(s).")
 
 
 def _split_allow_targets(targets: Sequence[str], entries: dict, path: Path) -> tuple[str, list[str]]:
@@ -1497,14 +1646,24 @@ def cmd_server_status(args) -> None:
         return
     for server in servers:
         console.print(f"[bold]{server.url}[/bold]")
+        drift = None
         try:
             health = fetch_health(server.url, server.token)
             known_as = f"{health.get('label')} ({health.get('machine_id')})"
             holding = f"{health.get('records', 0)} records"
+            drift = protocol.describe(
+                health.get("protocol", protocol.PRE_VERSIONING),
+            )
         except RemoteError as exc:
             known_as, holding = "unreachable", str(exc)
         console.print(f"  known as     {known_as}")
         console.print(f"  holding      {holding}")
+        # None means the health call never landed, which is not the same claim
+        # as "agreed": nothing was compared.
+        agreement = "not compared" if drift is None else (drift or "agreed")
+        console.print(f"  protocol     {protocol.PROTOCOL_VERSION} on this machine")
+        console.print("               "
+                      + (f"[yellow]{agreement}[/yellow]" if drift else agreement))
         console.print(f"  restricted   {'yes' if server.restricted else 'no'}")
         if server.restricted:
             console.print(f"  identifying  {', '.join(server.allow) or 'nothing'}")
@@ -1516,7 +1675,11 @@ def cmd_server_status(args) -> None:
         success, reason = cache_db.read_push_outcome(server.url)
         console.print(f"  last push    {_fmt_epoch(success) if success else 'never'}")
         if stopped:
-            console.print("  last attempt [red]stopped: the token was refused[/red]")
+            # The stored reason, not a fixed sentence: a refused token and a
+            # protocol the server cannot read are both terminal, and which one
+            # happened is the whole of what a person needs here.
+            console.print(f"  last attempt [red]stopped: "
+                          f"{reason or 'the token was refused'}[/red]")
         elif failures and attempt:
             # The failure and its reason, not a count beside the attempt stamp:
             # the stamp moves whatever happened, so on its own it reads as a
@@ -1542,7 +1705,10 @@ def cmd_push(args) -> None:
               "run `ccreport server connect <url> --token ...` first.", file=sys.stderr)
         sys.exit(1)
 
-    results = push.run_once(full=args.full, only=args.server, config_path=config, force=True)
+    results = push.run_once(
+        full=getattr(args, "full", False), only=args.server, config_path=config,
+        force=True, pull=getattr(args, "server_command", None) == "sync",
+    )
     if not results:
         print(f"No server matched {args.server!r}.", file=sys.stderr)
         sys.exit(1)
@@ -1560,14 +1726,169 @@ def cmd_push(args) -> None:
         # moved since the last push has nothing to report there, and a "0
         # samples" on every line reads as a broken feature.
         samples = f", {result.samples} samples" if result.samples else ""
+        pulled = f", {result.pulled} machines pulled" if result.pulled else ""
         console.print(
             f"[bold]{result.server}[/bold]: {len(result.accepted)} sent, "
             f"{len(result.skipped)} unchanged, {len(result.rejected)} rejected "
-            f"({result.records} records{samples})",
+            f"({result.records} records{samples}{pulled})",
         )
         for path, detail in result.rejected:
             failed = True
             console.print(f"  [red]rejected[/red] {path or '(the request)'}: {detail}")
+    if failed:
+        sys.exit(1)
+
+
+REMOTE_MODEL = "<remote>"
+"""The model a pulled day row carries. It has none: the server folded the hour
+and the model away to answer at day grain. A `<...>` pseudo-model is what every
+report already leaves out of the Models column, and its cost travels stated so
+nothing prices it from tokens."""
+
+
+class RemoteSpend(NamedTuple):
+    """What the pulled tables hold for one report's filters."""
+
+    records: list[UsageRecord]
+    machines: set[str]
+    """Which machines contributed a record that survived the filters.
+
+    Counted here rather than off the records: a record's project is the name its
+    machine pushed, and two machines working on one repo push the same one. The
+    only row that carries a machine in its name is a redacted one, so counting
+    project prefixes said 48 where one machine had 48 projects."""
+
+
+def _remote_records(
+    since: datetime | None, until: datetime | None,
+    project_filter: str | None, account_filter: str | None,
+) -> RemoteSpend:
+    """Pulled remote day rows as synthetic records, for `-A`.
+
+    Scoped to the account signed in right now, on the read side as much as on
+    the write side: rows for a previous login stay in the table and a switch
+    back finds them, but nothing selects them meanwhile.
+
+    Never deduped against the local corpus and never needing to be — the server
+    excluded by dedup identity everything this machine pushed, so what these
+    rows carry is spend that is genuinely elsewhere.
+    """
+    account = cache_db.read_latest_account() or {}
+    uuid = account.get("account_uuid")
+    if not uuid:
+        return RemoteSpend([], set())
+    label = account.get("email") or uuid
+    labels = {
+        row["machine_id"]: row["label"]
+        for row in cache_db.load_remote_window_costs(uuid)
+    }
+    out: list[UsageRecord] = []
+    machines: set[str] = set()
+    for row in cache_db.load_remote_day_costs(uuid):
+        day = date.fromisoformat(row["day"])
+        # Local noon, so the day this buckets under is the machine's own and the
+        # Oslo date it converts at straddles as little as a day rows can.
+        when = datetime(day.year, day.month, day.day, 12, tzinfo=UTC).astimezone()
+        machine = labels.get(row["machine_id"], row["machine_id"])
+        project = row["project"] or f"{machine}/aggregated"
+        rec = UsageRecord(
+            message_id="",
+            model=REMOTE_MODEL,
+            tokens=TokenCounts(
+                input=row["input_tokens"], output=row["output_tokens"],
+                cache_create=row["cache_create"], cache_read=row["cache_read"],
+            ),
+            timestamp=when,
+            session_id="",
+            project=project,
+            cost_usd=row["cost"],
+            account=label,
+            count=row["n"],
+        )
+        rec._day = row["day"]  # noqa: SLF001 - the stored day is the machine's own
+        if since and rec.timestamp < since:
+            continue
+        if until and rec.timestamp > until:
+            continue
+        if project_filter and project_filter.lower() not in rec.project.lower():
+            continue
+        if account_filter and account_filter.lower() not in rec.account.lower():
+            continue
+        out.append(rec)
+        machines.add(machine)
+    return RemoteSpend(out, machines)
+
+
+def _remote_note(remote: RemoteSpend) -> str:
+    """One line naming the spend this table leaves out, or "".
+
+    Printed under a table that `-A` could have merged, so the figure and the
+    figure `-A` then prints come from the same rows and cannot disagree.
+    """
+    if not remote.records:
+        return ""
+    total = sum(rec.cost() for rec in remote.records)
+    n = len(remote.machines)
+    machine = "machine" if n == 1 else "machines"
+    return (
+        f"[dim]Not shown: {fmt_cost(total)} spent on this account from "
+        f"{n} other {machine}. `ccreport -A` merges it.[/dim]"
+    )
+
+
+def _session_note(merge_all: bool, remote: RemoteSpend) -> None:
+    """Why the session table is the one -A cannot merge.
+
+    A restricted machine strips the session id before it pushes, and a pulled
+    row is one day of one machine rather than one session either way. Saying so
+    beats printing a short list as if it were the whole of one.
+    """
+    if not remote.records:
+        return
+    if merge_all:
+        console.print(
+            "[dim]This table is this machine's sessions alone: a pulled row is "
+            "one day of one machine, and a restricted machine strips the session "
+            "id before it pushes.[/dim]"
+        )
+        return
+    console.print(_remote_note(remote))
+
+
+def cmd_pull(args) -> None:
+    """Fetch what this account's other machines spent, and store it locally.
+
+    The half of `server sync` that only reads. Nothing belonging to this machine
+    comes back: the server drops its copy of what this machine pushed and then
+    drops any remaining record whose dedup key this machine also pushed, so what
+    arrives is the remainder that is genuinely elsewhere.
+    """
+    from ccreport import push
+
+    config = Path(args.config) if getattr(args, "config", None) else None
+    if not push.configured(config):
+        print(f"No {config or push.CONFIG_PATH} — "
+              "run `ccreport server connect <url> --token ...` first.", file=sys.stderr)
+        sys.exit(1)
+    servers = [
+        server for server in push.load_config(config)
+        if not args.server or server.url == args.server
+    ]
+    if not servers:
+        print(f"No server matched {args.server!r}.", file=sys.stderr)
+        sys.exit(1)
+    failed = False
+    for server in servers:
+        try:
+            result = push.pull_from(server)
+        except push.PushError as exc:
+            failed = True
+            console.print(f"[bold]{server.url}[/bold]: [red]{exc}[/red]")
+            continue
+        console.print(
+            f"[bold]{server.url}[/bold]: {result.pulled} other machine(s) "
+            "on this account",
+        )
     if failed:
         sys.exit(1)
 
@@ -1838,56 +2159,8 @@ def cmd_adopt(args) -> None:
 _ABSENT = "—"
 
 
-class _ExtraIndex:
-    """Extra-usage spend over a time range, from the stored snapshot series.
-
-    The series is cumulative dollars within a billing month, sampled by the
-    status line on slow renders alone, so it is coarse and it restarts at 0
-    every month. A range is therefore walked rather than subtracted end to end:
-    a reading below the one before it is the monthly reset, and the whole of
-    that reading is spend since it.
-
-    *snapshots* are `(ts, spent)` in ts order, as cache_db.load_extra_snapshots
-    returns them.
-    """
-
-    def __init__(self, snapshots: list[tuple[float, float]]) -> None:
-        self._ts = [ts for ts, _spent in snapshots]
-        self._spent = [spent for _ts, spent in snapshots]
-
-    def spent_between(self, start: float, end: float) -> float | None:
-        """Dollars accrued in (*start*, *end*], or None where nothing bounds it.
-
-        Needs a reading at or before *start* to subtract from and one inside the
-        range to subtract it from. Missing either, the answer is unknown and not
-        $0.00 — the series is pruned at 31 days and skipped by every costs-only
-        refresh, so an absent reading says nothing about what was spent.
-
-        One exception, and it is what makes a week reconcile with the sessions
-        inside it: a reading of $0.00 has nothing behind it, so where the series
-        begins inside the range at zero it is a baseline of its own. Without it
-        the oldest window of every type is unknown however much it billed, since
-        the series can only start after it opened.
-        """
-        base = bisect.bisect_right(self._ts, start) - 1
-        last = bisect.bisect_right(self._ts, end)
-        if base < 0:
-            opening = bisect.bisect_left(self._ts, start)
-            if opening >= last or self._spent[opening] != 0.0:
-                return None
-            base = opening
-        if last <= base + 1:
-            return None
-        total = 0.0
-        prev = self._spent[base]
-        for spent in self._spent[base + 1:last]:
-            total += spent - prev if spent >= prev else spent
-            prev = spent
-        return total
-
-
 def _instance_extra(
-    inst: WindowInstance, extra: _ExtraIndex, now: float,
+    inst: WindowInstance, extra: ExtraIndex, now: float,
 ) -> float | None:
     """Extra usage billed while *inst* ran, or None where nothing bounds it.
 
@@ -1914,7 +2187,7 @@ def _instance_extra(
 
 
 def _instance_spend(
-    inst: WindowInstance, index: SpendIndex, extra: _ExtraIndex, now: float,
+    inst: WindowInstance, index: SpendIndex, extra: ExtraIndex, now: float,
 ) -> WindowSpend:
     """windows.instance_spend, with this machine's Extra series joined on.
 
@@ -1947,7 +2220,7 @@ def _load_instance_spend(
     since = _as_local(min(i.first_ts for i in instances))
     until = _as_local(max(i.peak_ts for i in instances))
     index = SpendIndex(load_all_records(since=since, until=until))
-    extra = _ExtraIndex(cache_db.load_extra_snapshots())
+    extra = ExtraIndex(cache_db.load_extra_snapshots())
     return {i.key: _instance_spend(i, index, extra, now) for i in instances}
 
 
@@ -2202,6 +2475,218 @@ def report_limits(
         _print_report(table)
 
 
+# --- Archiving the days that can no longer be re-read ---
+
+ARCHIVE_MIN_AGE_DAYS = 30
+"""How far back from local midnight a day has to be before it can be folded.
+
+Well past the ~30-day JSONL retention Claude Code applies, so a file this old
+whose log is already gone is gone for good. The cutoff below can only move it
+further back, never nearer.
+"""
+
+
+def _archive_cutoff(min_age_days: int) -> float:
+    """The newest instant `ccreport archive` may fold, as an epoch second.
+
+    Two bounds, and the older wins. The age bound is *min_age_days* back from
+    local midnight. The other is `ccreport limits`: it prices each rate-limit
+    window against the records covering its fill span, rate_limit_snapshots is
+    never pruned, and a window's span reaches back from its oldest reading by
+    the length of the window. Fold behind that and the report starts pricing
+    windows against a corpus with a hole in it, which reads as a cheap week.
+    """
+    from ccreport import windows
+
+    midnight = datetime.now().astimezone().replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    by_age = (midnight - timedelta(days=min_age_days)).timestamp()
+    oldest = cache_db.oldest_rate_limit_sample_ts()
+    if oldest is None:
+        return by_age
+    return min(by_age, oldest - max(windows.LIMIT_WINDOW_SPAN_S.values()))
+
+
+class ArchivePlan(NamedTuple):
+    """What one `ccreport archive` run would fold, and what it would leave."""
+
+    rows: list[tuple]
+    paths: set[str]
+    records: int
+    """Cached record rows the fold would delete.
+
+    Every row of every folded file, not the calls the archive ends up carrying:
+    more than half of them lost a dedup and were never in a report, and a
+    preview that counted only the survivors would under-report the delete by
+    that much."""
+    held_back: dict[str, str]
+    """Purged files it will not touch this run, path -> why."""
+
+
+def _archive_dedup_pass(files: list[Path], records_by_file: dict) -> dict:
+    """Walk the live half of the corpus for its dedup keys alone.
+
+    A full load claims a duplicated message for the first file it reaches, and
+    it reaches the live files first. Replaying that here means an orphan's copy
+    of a live message is dropped from the archive exactly as the report drops
+    it, rather than folded in and then added back beside the live one.
+
+    Returns the _keep bundle, so the orphan pass below carries on with the same
+    seen_keys. The override and the change log are deliberately left out: a
+    dedup key is a function of neither, and the archive stores the raw identity
+    that both of them resolve at read time.
+    """
+    filters = {
+        "since": None, "until": None, "project_filter": None,
+        "account_filter": None, "seen_keys": set(),
+        "override": None, "accounts": None,
+    }
+    for path in files:
+        for rec in _deserialize_records(records_by_file.pop(str(path), [])):
+            _keep(rec, **filters)
+    return filters
+
+
+def _plan_archive(min_age_days: int) -> tuple[ArchivePlan, float]:
+    """What a fold at the current cutoff would do. Returns (plan, cutoff_ts)."""
+    cutoff_ts = _archive_cutoff(min_age_days)
+    files = discover_jsonl_files()
+    live_paths = {str(p) for p in files}
+    _ensure_cache_valid(live_paths)
+    _refresh_changed_files(files, load_ccreport_file_meta())
+
+    records_by_file = load_ccreport_records_in_range(None, None)
+    filters = _archive_dedup_pass(files, records_by_file)
+
+    already = archived_file_paths()
+    event_ts = sorted(ev["ts"] for ev in load_account_events())
+    projects_dirs = _get_projects_dirs()
+
+    kept_by_path: dict[str, list[UsageRecord]] = {}
+    held_back: dict[str, str] = {}
+    for path, raw in records_by_file.items():
+        if path in live_paths or path in already:
+            continue
+        kept = [rec for rec in _deserialize_records(raw) if _keep(rec, **filters)]
+        stamps = [rec.timestamp.timestamp() for rec in kept]
+        if stamps and max(stamps) >= cutoff_ts:
+            held_back[path] = "newer than the cutoff"
+            continue
+        if stamps and any(min(stamps) <= ts <= max(stamps) for ts in event_ts):
+            held_back[path] = "spans an account change"
+            continue
+        kept_by_path[path] = kept
+
+    # A record archived here stops taking part in the dedup, so anything it beat
+    # and left in the table would start counting. Nothing on a real machine is
+    # in that state — a message id belongs to one session log — but a fold is
+    # not undoable, so the collision is checked rather than assumed away.
+    won = {
+        key
+        for path, kept in kept_by_path.items()
+        for key in (_dedup_keys(kept))
+    }
+    if won:
+        for path, raw in records_by_file.items():
+            if path in kept_by_path or path in already:
+                continue
+            for rec in _deserialize_records(raw):
+                clash = _dedup_keys([rec]) & won
+                if clash:
+                    for other, kept in list(kept_by_path.items()):
+                        if _dedup_keys(kept) & clash:
+                            del kept_by_path[other]
+                            held_back[other] = "a live copy of one of its messages"
+
+    rows: dict[tuple, list] = {}
+    n_records = 0
+    for path, kept in kept_by_path.items():
+        prefix = _project_dir_prefix(path, projects_dirs) or ""
+        n_records += len(records_by_file[path])
+        for rec in kept:
+            _fold_archive_row(rows, rec, prefix)
+    plan = ArchivePlan(
+        rows=[(*key, *row) for key, row in rows.items()],
+        paths=set(kept_by_path),
+        records=n_records,
+        held_back=held_back,
+    )
+    return plan, cutoff_ts
+
+
+def _dedup_keys(records: list[UsageRecord]) -> set[str]:
+    """The dedup identities *records* carry, skipping the ones that have none."""
+    keys = set()
+    for rec in records:
+        key = dedup_identity(
+            rec.dedup_key, rec.message_id, rec.session_id,
+            rec.timestamp.timestamp(), rec.model,
+            (rec.tokens.input, rec.tokens.output,
+             rec.tokens.cache_create, rec.tokens.cache_read),
+        )
+        if key is not None:
+            keys.add(key)
+    return keys
+
+
+def _fold_archive_row(rows: dict[tuple, list], rec: UsageRecord, prefix: str) -> None:
+    """Add one record to its archive bucket, creating the bucket if new."""
+    key = (
+        rec.day_key(), rec.fx_date().isoformat(), rec.session_id,
+        rec.project, rec.model, rec.cwd or "", rec.repo or "", prefix,
+    )
+    ts = rec.timestamp.timestamp()
+    t = rec.tokens
+    row = rows.get(key)
+    if row is None:
+        rows[key] = [ts, ts, t.input, t.output, t.cache_create, t.cache_read,
+                     rec.cost(), rec.count]
+        return
+    row[0] = min(row[0], ts)
+    row[1] = max(row[1], ts)
+    row[2] += t.input
+    row[3] += t.output
+    row[4] += t.cache_create
+    row[5] += t.cache_read
+    row[6] += rec.cost()
+    row[7] += rec.count
+
+
+def cmd_archive(args) -> None:
+    """Fold the purged half of the corpus into day rows, or say what that would be."""
+    plan, cutoff_ts = _plan_archive(args.min_age_days)
+    cutoff = datetime.fromtimestamp(cutoff_ts).astimezone()
+    console.print(f"Cutoff: [cyan]{cutoff:%Y-%m-%d %H:%M}[/cyan] "
+                  f"(nothing at or after it is folded)")
+    if not plan.paths:
+        console.print("Nothing to archive.")
+    else:
+        console.print(
+            f"Fold: [cyan]{len(plan.paths)}[/cyan] purged files, "
+            f"[cyan]{plan.records}[/cyan] record rows -> "
+            f"[cyan]{len(plan.rows)}[/cyan] archive rows"
+        )
+        console.print(f"Drop: [cyan]{plan.records}[/cyan] rows from ccreport_records")
+        console.print("[dim]Every folded file stops being pushed: the server keys "
+                      "a file on (machine, path) and replaces what it holds.[/dim]")
+    if plan.held_back:
+        reasons: dict[str, int] = {}
+        for reason in plan.held_back.values():
+            reasons[reason] = reasons.get(reason, 0) + 1
+        for reason, n in sorted(reasons.items()):
+            console.print(f"Held back: [yellow]{n}[/yellow] purged files — {reason}")
+    if args.dry_run:
+        console.print("[dim]--dry-run: nothing was written.[/dim]")
+        return
+    if not plan.paths:
+        return
+    deleted = save_ccreport_archive(plan.rows, plan.paths)
+    console.print(f"Archived. [green]{deleted}[/green] record rows deleted; "
+                  f"run [cyan]sqlite3 {cache_db.DB_PATH} 'VACUUM'[/cyan] "
+                  "to give the space back.")
+
+
 def cmd_limits(args) -> None:
     """Report how full each rate-limit window got, and how fast.
 
@@ -2294,6 +2779,7 @@ def main() -> None:
                "  ccreport monthly --account personal@example.com\n"
                "  ccreport adopt            # claim pre-capture history\n"
                "  ccreport limits -w session\n"
+               "  ccreport archive --dry-run  # what the purged half folds to\n"
                "  ccreport update           # is master ahead of this checkout?\n"
                "  ccreport migrate --dry-run\n"
                "  ccreport --server https://ccreport.example.net monthly\n"
@@ -2307,6 +2793,8 @@ def main() -> None:
     # Common args
     for name in ["daily", "monthly", "project", "session", "account"]:
         p = sub.add_parser(name)
+        p.add_argument("--all", "-A", action="store_true",
+                       help="Merge this account's spend from every pushing machine")
         p.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
         p.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
         p.add_argument("--project", "-p", help="Filter by project name (substring match)")
@@ -2381,9 +2869,12 @@ def main() -> None:
         ("deny", "Stop identifying projects by name"),
         ("status", "What each server knows this machine as"),
         ("push", "Push this machine's records to a ccreport server"),
+        ("pull", "Fetch what the account's other machines spent"),
+        ("sync", "Push, then pull, in one round trip"),
+        ("disconnect", "Stop pushing to a server and forget it locally"),
     ):
         sp = server_sub.add_parser(name, help=helptext)
-        verb = "Read" if name in ("status", "push") else "Write"
+        verb = "Read" if name in ("status", "push", "pull", "sync") else "Write"
         sp.add_argument("--config",
                         help=f"{verb} somewhere other than ~/.config/ccreport/push.toml")
         if name == "connect":
@@ -2402,10 +2893,17 @@ def main() -> None:
                             help="Project names, before or after a merge rule, after an optional "
                                  "leading server URL as push.toml spells it. The URL may be left "
                                  "out when push.toml names one server")
-        if name == "push":
+        if name in ("push", "pull", "sync"):
             sp.add_argument("--server", help="Only this server URL, as push.toml spells it")
+        if name in ("push", "sync"):
             sp.add_argument("--full", action="store_true",
                             help="Forget the watermark and offer every file again")
+        if name == "disconnect":
+            sp.add_argument("url", nargs="?",
+                            help="The server's URL as push.toml spells it. May be left "
+                                 "out when push.toml names one server")
+            sp.add_argument("--yes", "-y", action="store_true",
+                            help="Skip the confirmation prompt")
 
     # The same push, spelled the way it was before `server push` existed. The
     # status line spawns the module rather than either, so both are for people.
@@ -2416,6 +2914,16 @@ def main() -> None:
                     help="Forget the watermark and offer every file again")
 
     # Rate-limit utilization history, from the statusline's samples.
+    par = sub.add_parser(
+        "archive",
+        help="Fold the purged half of the record cache into day rows")
+    par.add_argument("--dry-run", "-n", action="store_true",
+                     help="Print what would be folded without writing anything")
+    par.add_argument("--min-age-days", type=int, default=ARCHIVE_MIN_AGE_DAYS,
+                     help=f"Days a record must be behind local midnight "
+                          f"(default: {ARCHIVE_MIN_AGE_DAYS}). The rate-limit "
+                          f"history can push the cutoff further back, never nearer")
+
     pl = sub.add_parser("limits", help="Rate-limit window utilization history")
     pl.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
     pl.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
@@ -2432,6 +2940,10 @@ def main() -> None:
     parser.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
     parser.add_argument("--models", "-m", action="store_true",
                         help="Show per-model breakdown rows in the daily table")
+    parser.add_argument("--all", "-A", action="store_true",
+                        help="Merge what this account spent on every machine that "
+                             "pushes to a configured server. Reads the local cache "
+                             "alone; `ccreport server pull` is what fills it")
     parser.add_argument("--server", help="Render the merged reports from this ccreport server")
     parser.add_argument("--machine", help="With --server: only this machine's records")
 
@@ -2458,6 +2970,10 @@ def main() -> None:
     if args.command == "limits":
         cmd_limits(args)
         return
+    # Writes the cache and prints its own summary; there is no report behind it.
+    if args.command == "archive":
+        cmd_archive(args)
+        return
     # Unlike the three above, this one loads records — its preview counts what
     # the adoption would cover — so it runs itself rather than falling through
     # to the report path, which would want a report to print.
@@ -2479,8 +2995,12 @@ def main() -> None:
         elif args.server_command in ("allow", "deny"):
             args.command = args.server_command
             cmd_server_allow(args)
-        elif args.server_command == "push":
+        elif args.server_command in ("push", "sync"):
             cmd_push(args)
+        elif args.server_command == "pull":
+            cmd_pull(args)
+        elif args.server_command == "disconnect":
+            cmd_server_disconnect(args)
         else:
             cmd_server_status(args)
         return
@@ -2514,6 +3034,19 @@ def main() -> None:
                          or wants_json),
     )
 
+    # Local rows alone, always. -A merges the pulled tables below; without it
+    # they answer the note under each table instead. Either way `ccreport` opens
+    # no socket: these are local rows a detached pull wrote.
+    remote = _remote_records(since, until, project_filter, account_filter)
+    merge_all = bool(getattr(args, "all", False))
+    # `local` stays this machine's own throughout. The session report reads it
+    # even under -A: a pulled row is one day of one machine and carries no
+    # session, so merging would add a bucket with no name to a table keyed on it.
+    local = records
+    note = "" if merge_all else _remote_note(remote)
+    if merge_all:
+        records = sorted(records + remote.records, key=lambda r: r.timestamp)
+
     if not records:
         print("No usage records found.", file=sys.stderr)
         sys.exit(1)
@@ -2524,29 +3057,45 @@ def main() -> None:
         print("⚠ Some dates lack exchange rate data; NOK values are partial.", file=sys.stderr)
 
     if wants_json:
-        report_json(records, nok=nok)
+        # This machine's records alone, whatever -A says: an entry here is one
+        # API call, and a pulled row is a day of somebody else's.
+        report_json(local, nok=nok)
         return
 
     command = args.command
 
+    def _note() -> None:
+        """The gap note, under a table -A could have merged."""
+        if note:
+            console.print(note)
+
     if command == "daily":
         # args.models covers `ccreport -m daily`, where -m lands on the top-level parser.
         report_daily(records, breakdown=args.breakdown or args.models, nok=nok)
+        _note()
     elif command == "monthly":
         report_monthly(records, nok=nok)
+        _note()
     elif command == "project":
         lim = args.limit if args.limit != 0 else None
         report_project(records, limit=lim, nok=nok)
+        _note()
     elif command == "session":
         lim = args.limit if args.limit != 0 else None
-        report_session(records, limit=lim, nok=nok)
+        report_session(local, limit=lim, nok=nok)
+        _session_note(merge_all, remote)
     elif command == "account":
         report_account(records, nok=nok)
+        _note()
     else:
         report_daily(records, breakdown=args.models, nok=nok)
+        _note()
         report_monthly(records, nok=nok)
+        _note()
         report_project(records, nok=nok)
-        report_session(records, nok=nok)
+        _note()
+        report_session(local, nok=nok)
+        _session_note(merge_all, remote)
         # Trails the rest, and only once there is a split to show. Decided from
         # the records already in hand, so a single-account machine — which is
         # most of them — pays nothing for the check.

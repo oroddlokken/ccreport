@@ -1204,10 +1204,15 @@ def _orphan_alltime_fingerprint(orphan_paths: set[str]) -> str:
     # holds the module's import cost to what every render actually needs.
     from hashlib import sha256
 
-    from ccreport.cache_db import orphan_alltime_stamp
+    from ccreport.cache_db import archive_stamp, orphan_alltime_stamp
 
     h = sha256()
     h.update(orphan_alltime_stamp(orphan_paths).encode())
+    h.update(b"\n")
+    # The archive is a second source of the same total, and one an orphan path
+    # set cannot see: a file it folded away is still in ccreport_files with the
+    # fingerprint it always had.
+    h.update(archive_stamp().encode())
     h.update(b"\n")
     try:
         h.update(Path(__file__).read_bytes())
@@ -1232,7 +1237,7 @@ def _build_orphan_alltime(
     a message id belongs to one session log — and a stored total cannot depend
     on which files happened to be on disk the day it was built.
     """
-    from ccreport.cache_db import load_ccreport_records_for_paths
+    from ccreport.cache_db import load_ccreport_archive, load_ccreport_records_for_paths
 
     buckets: dict[tuple[str, str, str, str], float] = {}
     seen_keys: set[str] = set()
@@ -1247,6 +1252,17 @@ def _build_orphan_alltime(
             key = (prefix, rec.get("project") or "",
                    rec.get("cwd") or "", rec.get("repo") or "")
             buckets[key] = buckets.get(key, 0.0) + cost
+    # The archive holds the same kind of history one fold coarser: purged files
+    # whose records are gone. Its rows are already deduped and already priced,
+    # and they carry the bucket key outright, so they are added rather than
+    # walked. Without this an archive run reads as a machine that never spent.
+    for row in load_ccreport_archive():
+        _day, _oslo, _sid, project, _model, cwd, repo, prefix = row[:8]
+        cost = row[14]
+        if not cost:
+            continue
+        key = (prefix, project, cwd, repo)
+        buckets[key] = buckets.get(key, 0.0) + cost
     return [(*key, cost) for key, cost in buckets.items()]
 
 

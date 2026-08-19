@@ -135,7 +135,7 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   read-only connection rather than `cache_db.get_connection`, whose bootstrap and
   daily snapshot do not belong before every tool call
 - The update line comes from `update_check.py`, spawned detached on slow renders
-  when the stored stamp is older than `UPDATE_CHECK_INTERVAL_S` (12 h). The child
+  when the stored stamp is older than `UPDATE_CHECK_INTERVAL_S` (36 h). The child
   writes that stamp on every outcome, failures included, so an unreachable API
   cannot become a spawn per render. A stored count is rendered only while
   `update_local_sha` still equals HEAD, so a pull silences the line instead of
@@ -151,6 +151,74 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   project or a session — so a restricted machine sends the rows an open one
   does. The server keys them on (machine, window, ts) and REPLACEs, so a
   re-offered sample is a no-op
+- `ccreport server disconnect <url>` is the other end of `connect`. It removes
+  the entry from push.toml through `push.remove_server` and clears every local
+  row keyed on that URL through `cache_db.forget_server`: `push_state`, the
+  per-server meta keys enumerated in `_PUSH_META_NAMES`, and both remote cost
+  tables. Those last are the ones that matter — left behind, `-A` and the status
+  line's merged windows go on adding a server nobody pushes to. It previews
+  what will go and confirms first (`--yes` skips), because the token's plaintext
+  is nowhere else and reconnecting needs one minted afresh. Nothing on the
+  server is touched, and the `.restricted` marker survives: it claims this
+  machine has pushed under a restriction, not that one server did
+- What the client and the server agree on over the wire is
+  `protocol.PROTOCOL_VERSION`, one integer bumped by hand when the bytes change:
+  a new payload section, a renamed or retyped field, a response key a client
+  reads. Not the package version, which is `0.1.0` and has never moved, and not
+  a commit sha, which differs on every commit and so can only ever be advisory.
+  A refactor that moves no bytes needs no bump, and neither does a schema change
+  the payload does not expose — the two `MIGRATION_CHAIN`s are the versions for
+  those. `protocol.py` imports nothing, because `push.py` must stay clear of
+  rich and `server/ingest.py` is on the other side of that line. Every ingest
+  request carries it and every response returns it, `/health` included. A client
+  *ahead* of the server is refused with 409 before the machine row is written
+  and treats it as terminal the way it treats a 401 — a half-read payload
+  answered 200 is the failure this exists to catch, so `post_batch` also refuses
+  a reply whose `protocol` is below its own, which is the only thing that
+  catches a server predating the field. A client *behind* pushes normally;
+  that direction is a line in `ccreport server status`, never a refusal.
+  `ccreport server connect` checks it at setup and writes no push.toml on a
+  mismatch
+- `ccreport server pull` and `server sync` bring back what the account's *other*
+  machines spent, so the status line's cost windows and `ccreport -A` are the
+  account's total rather than this machine's. The transport is the ingest
+  response, not `/v1/report`: that endpoint sits inside the network allowlist
+  and would answer nothing when the laptop is away from home, which is when the
+  other machine's spend is most missing. The exclusion is by dedup identity, not
+  by machine id — `server/pull.py` drops the asking machine's rows and then any
+  remaining record whose dedup key that machine also pushed, because the server
+  dedups across the set it folds and a client adding its local total to that
+  set's leftovers cannot see the overlap. Two grains, since neither derives the
+  other: per-minute cost buckets bounded to the longest `pricing.ROLLING_WINDOWS`
+  span, which the client sums into windows so that list stays out of the
+  protocol, and one row per (machine, day, project) which keeps every day.
+  `remote_window_costs` and `remote_day_costs` are their own tables and are
+  never mixed into the corpus — `scan.py` stays the only writer of
+  `ccreport_records`, and a per-machine row is what makes the staleness marker
+  per contributor possible. Both are scoped to `read_latest_account()` on the
+  read side as well as the write side, so a login switch cannot add a previous
+  account's spend to this one's windows; those rows stay rather than being
+  deleted, and the read filter is what makes that safe. `ccreport` never opens a
+  socket, `-A` included: only `server push`, `server pull`, `server sync` and
+  the status line's detached spawn talk to a server. The spawn is the existing
+  `python -m ccreport.push`, whose `run_once` pulls by default — one round trip
+  rather than the separate `pull_next_at` gate the epic first sketched. The
+  session table is the one `-A` cannot merge and says so; `--json` is this
+  machine's records whatever `-A` says, since an entry there is one API call
+- The Extra column is the only real money in a window report; everything else
+  there is an API-price valuation. Its series is `extra_usage_snapshots`,
+  cumulative dollars within a billing month, written by slow status-line renders
+  and pruned to 31 days by `cache_db.write_usage_cache`. `push.build_extra`
+  sends it behind its own watermark (`read_push_extra_at`, cleared by `--full`
+  and a policy change with the other two) into the server's
+  `extra_usage_samples`, which is never pruned — past 31 days the server's copy
+  is the only one, the same answer `ccreport_archive` gives on the client. The
+  reading is the *account's* cumulative spend, so two machines on one account
+  report the same dollars rather than halves of them: `limits._instance_extra`
+  answers a window from one machine's series alone, whichever has the most
+  readings inside the span. Merging them would let a lagging reading land below
+  a fresher one, and a drop in this series is what `windows.ExtraIndex` reads as
+  the billing month rolling over
 - A quota belongs to an account, not to a machine, so `server/limits.py` groups
   samples on (account, window, model, reset) and two laptops signed into one
   account draw one fill curve. It prices each window against `reports.load` —
@@ -361,6 +429,25 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   transaction, and it hashes `pricing.py` even though `_script_hash()`
   deliberately does not — a rollup freezes each record's cost and nothing
   recomputes a frozen sum
+- `ccreport archive` folds the purged half of `ccreport_records` into
+  `ccreport_archive` at day grain and deletes the rows. That table is a store,
+  not a cache: nothing rebuilds it, and it carries the identity raw —
+  `project`, `cwd`, `repo`, `dir_prefix` — plus `min_ts`, so `ccreport merge`
+  and `ccreport adopt` still re-attribute an archived day. A file is only ever
+  folded whole, only when its JSONL is gone from disk, only behind a cutoff that
+  is the older of `ARCHIVE_MIN_AGE_DAYS` and the oldest `rate_limit_snapshots`
+  reading minus a window span (`ccreport limits` prices a window against the
+  records covering its fill span), and never when a change-log event falls
+  inside its span — a row that straddled one could not be split by a later
+  adoption. Every path that would read a folded file as a file with no spend
+  reads the archive instead: `_load_full` adds it as synthetic records outside
+  the dedup, `pricing._build_orphan_alltime` adds its costs,
+  `load_ccreport_file_identities` returns its directory, `_ccr_totals` counts
+  its calls so the sanity guard stays quiet, and `push.changed_files` skips the
+  file outright — the server keys a file on (machine, path) and replaces what it
+  holds, so offering an emptied one would erase history it is the only copy of.
+  `ccreport server push --full` therefore stops being a way to rebuild a server
+  from this machine
 - The week bucket alone is also split by model family (`week_model_costs`), for
   the `weekly_scoped` quota's segment. `pricing.model_family()` keys both ends —
   the record's model ID when accumulating, the quota's display name when

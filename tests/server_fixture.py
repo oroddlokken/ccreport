@@ -96,5 +96,17 @@ def sample_batch(samples, *, label="Laptop") -> dict:
     return {"label": label, "client_version": "0.1.0", "files": [], "samples": samples}
 
 
+def extra(**over) -> dict:
+    """One Extra-usage reading, as a push sends it."""
+    e = {
+        "ts": 1_770_000_000.0,
+        "spent": 0.0,
+        "account_uuid": "acct-1",
+        "account_label": "me@example.net",
+    }
+    e.update(over)
+    return e
+
+
 def stored(app, machine_id: str, path: str = "/p/a.jsonl") -> list[dict]:
     return db.load_file_records(app.state.db.connect(), machine_id, path)

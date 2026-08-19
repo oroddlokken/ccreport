@@ -17,8 +17,8 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from ccreport import exchange, pricing
-from ccreport.server import db, tokens
+from ccreport import exchange, pricing, protocol
+from ccreport.server import db, pull, tokens
 
 router = APIRouter(prefix="/v1", tags=["ingest"])
 
@@ -96,7 +96,56 @@ class IngestSample(BaseModel):
     account_label: str | None = None
 
 
+class IngestExtra(BaseModel):
+    """One Extra-usage reading: cumulative credits billed within a billing month.
+
+    Real dollars, unlike everything else a window report shows, and the account
+    pair is resolved on the client for the same reason a sample's is.
+    """
+
+    ts: float
+    spent: float
+    account_uuid: str
+    account_label: str | None = None
+
+
+class PullRequest(BaseModel):
+    """Ask for the spend on *account_uuid* that this machine does not have.
+
+    Rides the ingest response rather than a report endpoint of its own: /v1/report
+    sits inside the network allowlist, so a pull through it answers nothing when
+    the laptop is away from home — which is exactly when the other machine's
+    spend is most missing. Ingest is token-authed and outside that gate.
+    """
+
+    account_uuid: str
+
+
+class RemainderMachine(BaseModel):
+    """One contributing machine's spend, at the two grains the client needs."""
+
+    machine_id: str
+    label: str
+    last_seen: float
+    buckets: list[tuple[float, float]] = Field(default_factory=list)
+    days: list[tuple[str, str, float, int, int, int, int, int]] = Field(
+        default_factory=list,
+    )
+
+
+class PullResponse(BaseModel):
+    """The remainder, per contributing machine. Never the asking machine's own."""
+
+    account_uuid: str
+    bucket_s: int
+    machines: list[RemainderMachine] = Field(default_factory=list)
+
+
 class IngestBatch(BaseModel):
+    protocol: int = protocol.PRE_VERSIONING
+    """What the client speaks. Absent from a build older than the constant, and
+    the default is what says so — the comparison below then decides for it
+    exactly as it does for a version that was sent."""
     label: str
     """The machine's hostname. Shown only until the machine is named in the web
     UI, which is where the label a person reads comes from."""
@@ -107,6 +156,13 @@ class IngestBatch(BaseModel):
     a file: they come from a different table, are keyed on the window rather
     than on a log, and a machine whose logs have not changed still has new ones
     to send."""
+    extra: list[IngestExtra] = Field(default_factory=list)
+    """Extra-usage readings, on the same reasoning and behind a watermark of
+    their own. The client prunes its copy at 31 days, so a machine that has not
+    pushed in a month has already lost what it did not send."""
+    pull: PullRequest | None = None
+    """Set by `ccreport server pull` and `ccreport server sync`. A plain push
+    leaves it out and the response carries no remainder."""
 
 
 class FileResult(BaseModel):
@@ -117,14 +173,24 @@ class FileResult(BaseModel):
 
 
 class IngestResponse(BaseModel):
+    protocol: int = protocol.PROTOCOL_VERSION
+    """What this server speaks. On every response, not only on /health: a client
+    ahead of a server too old to refuse it has to learn that from the reply to
+    the push it just sent."""
     machine_id: str
     files: list[FileResult]
     samples: int = 0
     """Rate-limit samples stored. The client moves its own watermark off having
     sent them rather than off this count, which is what it reports."""
+    extra: int = 0
+    """Extra-usage readings stored, reported on the same terms."""
+    pull: PullResponse | None = None
+    """The remainder, when the batch asked for one. Computed after the files in
+    the same request are stored, so a sync sees its own push."""
 
 
 class HealthResponse(BaseModel):
+    protocol: int = protocol.PROTOCOL_VERSION
     version: str
     machine_id: str
     label: str
@@ -288,6 +354,34 @@ def _warm_rates(conn, files: list[IngestFile]) -> None:
     conn.commit()
 
 
+def _check_protocol(theirs: int) -> None:
+    """Refuse a client this server is too old to read, and store nothing for it.
+
+    Before the machine row, before the files: a batch this server cannot parse
+    whole must leave no trace, or a stale server collects half-payloads once per
+    interval and reports success for each.
+
+    A client *behind* this server is fine and is not checked here. It sends a
+    subset of what this build understands, so nothing it sends is lost; that
+    direction is a line in `ccreport server status`, not a refusal.
+
+    Raises:
+        HTTPException: 409, naming both numbers. The client treats it as
+            terminal the way it treats a 401 — neither fixes itself on the next
+            interval.
+    """
+    if theirs <= protocol.PROTOCOL_VERSION:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"this server speaks protocol {protocol.PROTOCOL_VERSION} and the "
+            f"client speaks {theirs}; update the server, or the sections it "
+            "cannot read would be dropped without being stored"
+        ),
+    )
+
+
 @router.post("/ingest", response_model=IngestResponse,
              dependencies=[Depends(enforce_body_limit)])
 def ingest(
@@ -298,6 +392,7 @@ def ingest(
     A file that fails does not take the rest of the batch with it: each is
     reported on its own, and the client resends only what it has to.
     """
+    _check_protocol(batch.protocol)
     conn = request.app.state.db.connect()
     now = time.time()
     db.upsert_machine(conn, auth.machine_id, batch.label, now)
@@ -308,7 +403,40 @@ def ingest(
     stored = db.store_rate_limit_samples(
         conn, auth.machine_id, [sample.model_dump() for sample in batch.samples],
     )
-    return IngestResponse(machine_id=auth.machine_id, files=results, samples=stored)
+    extra = db.store_extra_samples(
+        conn, auth.machine_id, [reading.model_dump() for reading in batch.extra],
+    )
+    return IngestResponse(
+        machine_id=auth.machine_id, files=results, samples=stored, extra=extra,
+        pull=_remainder(conn, auth.machine_id, batch.pull),
+    )
+
+
+def _remainder(
+    conn, machine_id: str, request: PullRequest | None,
+) -> PullResponse | None:
+    """The remainder for *request*, or None where the batch asked for none.
+
+    Last in the handler, after the files this same request carried are stored,
+    so `ccreport server sync` reads a server that already holds what it just
+    sent — and the memo the fold sits behind is keyed on a content stamp that
+    has already moved.
+    """
+    if request is None:
+        return None
+    return PullResponse(
+        account_uuid=request.account_uuid,
+        bucket_s=pull.BUCKET_S,
+        machines=[
+            RemainderMachine(
+                machine_id=item.machine_id, label=item.label,
+                last_seen=item.last_seen, buckets=item.buckets, days=item.days,
+            )
+            for item in pull.cached_remainder(
+                conn, request.account_uuid, machine_id, time.time(),
+            )
+        ],
+    )
 
 
 @router.get("/health", response_model=HealthResponse)

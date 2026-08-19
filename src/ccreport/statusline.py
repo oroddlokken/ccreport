@@ -148,11 +148,11 @@ COST_SUMMARY_MAX_AGE = 900  # seconds the cached compute_costs() result stays us
 # render shows the machine-wide total alone rather than an hour-old split.
 COST_SUMMARY_FALLBACK_MAX_AGE = 3600
 FAST_TTL_S = 15            # seconds a render may reuse the previous render's fetch results
-# Twice a day, which is what the update line is worth: master moves in commits,
-# not releases, and nobody pulls on the hour. The stamp behind this is written
-# by the child on every outcome, so an unreachable API waits the same interval
-# as an answered one instead of spawning a process per render.
-UPDATE_CHECK_INTERVAL_S = 43_200
+# Every 36 hours, which is what the update line is worth: master moves in
+# commits, not releases, and nobody pulls on the hour. The stamp behind this is
+# written by the child on every outcome, so an unreachable API waits the same
+# interval as an answered one instead of spawning a process per render.
+UPDATE_CHECK_INTERVAL_S = 129_600
 EXTRA_ACCRUAL_PCT = 90     # session % from which extra credits could start accruing
 LAYOUT_WIDE_COLS = 150     # terminal columns threshold for 2-line layout
 SESSION_WINDOW_MS = 900_000  # 15 min — active sessions lookback
@@ -1905,6 +1905,57 @@ _COST_WINDOW_TOGGLES = {
 }
 
 
+# How stale the oldest contributing push may be before the merged cost line says
+# so. Twice the default push interval, so an ordinary machine that pushed one
+# interval ago is not marked while one that stopped a day ago is. A machine that
+# stopped pushing is not a machine that stopped spending.
+REMOTE_STALE_S = 2 * 30 * 60
+
+
+def _merge_remote_costs(usage: dict | None, now: float) -> None:
+    """Add every other machine's spend on this account to *usage*'s cost windows.
+
+    In place, on the `<window>_cost` keys alone. The `*_project_cost` split
+    stays local: a restricted machine pushes a null project, so the remote half
+    cannot come back split, and a merged machine-wide total over a local project
+    cost is the honest pair.
+
+    The two halves are disjoint by construction — the server sends back only
+    what this machine did not push, excluded by dedup identity rather than by
+    machine id — so they add rather than overlap.
+
+    Scoped to the account signed in right now, on the read side as much as on
+    the write side: rows for a previous login stay in the table and nothing here
+    selects them.
+
+    Best-effort. A busy database costs the merge, never the render.
+    """
+    if not usage:
+        return
+    try:
+        from ccreport import cache_db
+
+        account = cache_db.read_latest_account()
+        uuid = (account or {}).get("account_uuid")
+        if not uuid:
+            return
+        totals, oldest = cache_db.load_remote_window_totals(uuid)
+    except Exception:  # noqa: BLE001
+        return
+    if not totals:
+        return
+    for window, remote in totals.items():
+        key = f"{window}_cost"
+        local = usage.get(key)
+        if local is None:
+            continue
+        try:
+            usage[key] = float(local) + remote
+        except (TypeError, ValueError):
+            continue
+    usage["remote_stale"] = bool(oldest) and (now - oldest) > REMOTE_STALE_S
+
+
 def _render_cost_windows(usage: dict) -> str:
     """Render historic cost window line (6H/12H/24H/7D/30D/AT)."""
     SEP = f"{SUBDUED} · {RST}"
@@ -1934,7 +1985,15 @@ def _render_cost_windows(usage: dict) -> str:
             except ValueError:
                 pass
 
-    return SEP.join(cost_parts) if cost_parts else ""
+    if not cost_parts:
+        return ""
+    line = SEP.join(cost_parts)
+    # One marker for the line, not one per window: the figures are merged with
+    # another machine's spend, and what has gone stale is that machine's last
+    # push rather than any one window.
+    if usage.get("remote_stale"):
+        line += f"{SUBDUED}~{RST}"
+    return line
 
 
 def _render_usage(usage: dict, now: float) -> tuple[str, str, str]:
@@ -2515,6 +2574,7 @@ def _fetch_all(
         _merge_cost_data(
             usage_data, inp.session_id, inp.cwd, native_rl, cost_summary, stale_costs,
         )
+        _merge_remote_costs(usage_data, now_epoch)
         dcat_data = _fetch_dcat(inp.cwd)
         # Nothing on the line depends on these two; they sit here to overlap the
         # subprocesses started above rather than trail them.

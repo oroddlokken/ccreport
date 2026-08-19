@@ -34,6 +34,7 @@
         <th scope="col" class="num">pp/h</th>
         <th scope="col" class="num">Spend</th>
         <th scope="col" class="num">$/pp</th>
+        <th scope="col" class="num">Extra</th>
         <th scope="col" class="num">Cache</th>
         <th scope="col">Machines</th>
       </tr>
@@ -51,6 +52,7 @@
         <td class="num">{% if inst.burn_pph is none %}—{% else %}{{ "%.2f" | format(inst.burn_pph) }}{% endif %}</td>
         <td class="num" {% if row.spend.usd is not none %}data-usd="{{ row.spend.usd }}"{% endif %}>{% if row.spend.usd is none %}—{% else %}{{ "${:,.2f}".format(row.spend.usd) }}{% endif %}</td>
         <td class="num">{% if row.spend.per_pp is none %}—{% else %}{{ "${:,.2f}".format(row.spend.per_pp) }}{% endif %}</td>
+        <td class="num" {% if row.spend.extra_usd is not none %}data-usd="{{ row.spend.extra_usd }}"{% endif %}>{% if row.spend.extra_usd is none %}—{% else %}{{ "${:,.2f}".format(row.spend.extra_usd) }}{% endif %}</td>
         <td class="num">{% if row.spend.cache_hit is none %}—{% else %}{{ (row.spend.cache_hit * 100) | round | int }}%{% endif %}</td>
         <td class="dim">{{ row.machines | join(", ") }}</td>
       </tr>
@@ -65,4 +67,12 @@
   status line writes them as it renders, and a push carries them.</p>
 </section>
 {% endfor %}
+
+<section>
+  <p class="dim">Spend and $/pp value a window at API prices. Extra is the only
+  real money here: credits Anthropic billed while the window ran, read off one
+  machine&#39;s status line. A dash means no reading bounds the window, not a
+  window that cost nothing — a machine that stopped pushing for a month lost
+  those readings before it could send them.</p>
+</section>
 {% endblock %}
