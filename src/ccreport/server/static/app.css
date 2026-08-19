@@ -298,6 +298,10 @@ main a.toggle:hover { text-decoration: none; }
    tiles and breakdown do not jump when the script lands. */
 #chart { margin-top: .5rem; min-height: 264px; }
 
+/* A window that ran out. Beside the peak rather than replacing it: 100.4% and
+   99.6% are both "it ran out", and the reading is still what was measured. */
+.hit { color: var(--off); font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
+
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: .75rem; margin: 1rem 0; }
 .tile { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: .6rem .8rem; }
 .tile-label { font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }

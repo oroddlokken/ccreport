@@ -20,7 +20,7 @@ from fastapi import APIRouter, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from ccreport.server import dashboard, db, tokens
+from ccreport.server import dashboard, db, limits, tokens
 
 router = APIRouter(tags=["pages"])
 
@@ -288,8 +288,8 @@ def delete_token(request: Request, token_hash: str):
     return RedirectResponse(url=request.headers.get("referer") or "/", status_code=303)
 
 
-def _chart_payload(view: dashboard.Dashboard) -> str:
-    """The detail page's charts as the JSON its script reads."""
+def _chart_payload(charts: list[dashboard.Chart]) -> str:
+    """A page's charts as the JSON its script reads."""
     return _json_for_script([
         {
             "key": chart.key,
@@ -298,8 +298,53 @@ def _chart_payload(view: dashboard.Dashboard) -> str:
             "axis": chart.axis,
             "traces": [{"label": t.label, "values": t.values} for t in chart.traces],
         }
-        for chart in view.charts
+        for chart in charts
     ])
+
+
+@router.get("/limits", response_class=HTMLResponse)
+def limit_windows(request: Request, days: int = Query(default=dashboard.DEFAULT_RANGE)):
+    """Every rate-limit window the machines pushed a reading of, merged.
+
+    Named above the catch-all below, which would otherwise answer this path
+    with a 404 for a dimension called "limits".
+
+    Not cached. A window list is a page someone clicked into, and its records
+    are loaded over the window spans rather than over the whole range.
+    """
+    view = limits.build(request.app.state.db.connect(), days)
+    return templates.TemplateResponse(request, "limits.html", {
+        "view": view,
+        "ranges": dashboard.RANGES,
+        "range_labels": dashboard.RANGE_LABELS,
+    })
+
+
+@router.get("/limits/{window}/{resets_at}", response_class=HTMLResponse)
+def limit_window(request: Request, window: str, resets_at: float,
+                 model: str = Query(default=""), account: str = Query(default="")):
+    """One window instance: its fill curve, and the work that drew it.
+
+    The model and the account ride in the query string rather than the path.
+    Both can carry a slash — an account renamed on the /settings page is
+    whatever someone typed — and the reset time is what identifies the window
+    within them.
+
+    A window nothing was pushed a reading of is a 404, for the reason a mistyped
+    period key is: an empty page reads as a window nobody used.
+    """
+    try:
+        view = limits.build_window(
+            request.app.state.db.connect(), window, resets_at, model or None, account,
+        )
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"No {window} window stored for that reset.",
+        ) from exc
+    return templates.TemplateResponse(request, "limit.html", {
+        "view": view,
+        "charts": _chart_payload(view.charts),
+    })
 
 
 @router.post("/settings/machines/{machine_id}/delete")
@@ -355,5 +400,5 @@ def detail(request: Request, dimension: str, key: str,
         "ranges": dashboard.RANGES,
         "range_labels": dashboard.RANGE_LABELS,
         "dimensions": [name for name in dashboard.SCOPES if name != dimension],
-        "charts": _chart_payload(view),
+        "charts": _chart_payload(view.charts),
     })

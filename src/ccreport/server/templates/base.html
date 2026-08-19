@@ -13,7 +13,8 @@
 </head>
 <body>
   {% set p = request.url.path %}
-  {% set section = "machines" if p.startswith("/settings/machines") or p.startswith("/machine/")
+  {% set section = "limits" if p.startswith("/limits")
+     else "machines" if p.startswith("/settings/machines") or p.startswith("/machine/")
      else "accounts" if p.startswith("/settings/accounts") or p.startswith("/account/")
      else "projects" if p.startswith("/settings/projects") or p.startswith("/project/")
      else "dashboard" %}
@@ -22,6 +23,7 @@
       <a class="brand" href="/">ccreport</a>
       <nav>
         <a href="/" {% if section == "dashboard" %}aria-current="page"{% endif %}>Dashboard</a>
+        <a href="/limits" {% if section == "limits" %}aria-current="page"{% endif %}>Limits</a>
         <a href="/settings/machines" {% if section == "machines" %}aria-current="page"{% endif %}>Machines</a>
         <a href="/settings/accounts" {% if section == "accounts" %}aria-current="page"{% endif %}>Accounts</a>
         <a href="/settings/projects" {% if section == "projects" %}aria-current="page"{% endif %}>Projects</a>

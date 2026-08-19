@@ -62,6 +62,14 @@ app over its own SQLite file, run by Granian (`just serve`), configured by
 by `ccreport server push` (or its older spelling `ccreport push`) or by a
 detached spawn from the status line.
 
+`windows.py` is the rate-limit window: one instance's peak, fill span and burn
+rate, the `SpendIndex` that prices a span and counts its cache reads, and the
+`WindowSpend` those produce. It imports no rich and no cache_db, because
+`ccreport limits` renders these as tables and `server/limits.py` renders the
+merged ones as pages — and because cache_db reads `rl_window_key` from it, so
+the identity a sample is stored under and the identity a report groups on stay
+one rule.
+
 `forecast.py` projects spend to a ceiling. It is pure and stdlib-light, because
 `ccu` and the status line read it.
 
@@ -135,6 +143,21 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   master is the release and the unit is a commit. `ccreport update` asks the
   same question inline, with no spawn and no interval, and writes its answer
   through the same keys
+- A rate-limit sample is pushed like a record: `push.build_samples` resolves the
+  account off `account_events` and sends everything newer than a per-server
+  watermark (`cache_db.read_push_samples_at`), which `--full` and a policy
+  change clear with the file one. Nothing is redacted — a sample carries a
+  window name, a percentage, a reset time and a model, none of which is a
+  project or a session — so a restricted machine sends the rows an open one
+  does. The server keys them on (machine, window, ts) and REPLACEs, so a
+  re-offered sample is a no-op
+- A quota belongs to an account, not to a machine, so `server/limits.py` groups
+  samples on (account, window, model, reset) and two laptops signed into one
+  account draw one fill curve. It prices each window against `reports.load` —
+  the full record path, bounded to the window spans — because a 5-hour window is
+  priced over hours and a grouped row has folded the hour away. `/limits` is
+  registered before the `/{dimension}/{key}` catch-all, and one window's page
+  carries the model and the account in the query string: both can hold a slash
 - Which rows a report has is `aggregate.py`; what they look like is
   `ccreport.py`. The row builders there are the one place the rollup path and
   the full record path meet, and the server folds records through the same

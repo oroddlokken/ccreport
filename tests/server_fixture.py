@@ -75,5 +75,26 @@ def batch(records=None, *, path="/p/a.jsonl", mtime_ns=1, size=100, label="Lapto
     }
 
 
+def sample(**over) -> dict:
+    """One rate-limit reading, as a push sends it."""
+    s = {
+        "ts": 1_770_000_000.0,
+        "window": "session",
+        "used_pct": 12.0,
+        "resets_at": 1_770_018_000.0,
+        "model": None,
+        "source": "stdin",
+        "account_uuid": "acct-1",
+        "account_label": "me@example.net",
+    }
+    s.update(over)
+    return s
+
+
+def sample_batch(samples, *, label="Laptop") -> dict:
+    """A push carrying samples and no file, which is the ordinary shape."""
+    return {"label": label, "client_version": "0.1.0", "files": [], "samples": samples}
+
+
 def stored(app, machine_id: str, path: str = "/p/a.jsonl") -> list[dict]:
     return db.load_file_records(app.state.db.connect(), machine_id, path)

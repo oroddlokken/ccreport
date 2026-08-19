@@ -17,7 +17,7 @@ import pytest
 from _narrow import present
 from rich.console import Console
 
-from ccreport import aggregate, cache_db, scan
+from ccreport import aggregate, cache_db, scan, windows
 from ccreport import ccreport as ccr
 
 UTC = dt.UTC
@@ -2165,8 +2165,8 @@ def _seed_extra(points):
 
 def _instances():
     return sorted(
-        ccr._window_instances(cache_db.load_rate_limit_snapshots()),
-        key=ccr._instance_order,
+        ccr.window_instances(cache_db.load_rate_limit_snapshots()),
+        key=ccr.instance_order,
     )
 
 
@@ -2342,7 +2342,7 @@ class TestSpendIndex:
     """Range sums over the record corpus, by model family."""
 
     def _index(self):
-        return ccr._SpendIndex(
+        return ccr.SpendIndex(
             [
                 _spend_rec("2026-06-15T08:00", usd=1.0),
                 _spend_rec("2026-06-15T09:00", usd=2.0, model="claude-fable-5"),
@@ -2367,8 +2367,23 @@ class TestSpendIndex:
         assert self._total("2026-06-15T08:00", "2026-06-15T10:00", "haiku") == 0.0
 
     def test_an_index_with_no_corpus_behind_it_says_so(self):
-        assert ccr._SpendIndex([]).empty is True
+        assert ccr.SpendIndex([]).empty is True
         assert self._index().empty is False
+
+    def _tokens(self, start, end, family=None):
+        return self._index().cache_tokens(_local_epoch(start), _local_epoch(end), family)
+
+    def test_the_token_counts_cover_the_same_span_the_cost_does(self):
+        """Three records at 10 input, 30 written and 40 read each."""
+        assert self._tokens("2026-06-15T08:00", "2026-06-15T10:00") == (120, 240)
+
+    def test_the_token_counts_follow_the_family_filter(self):
+        assert self._tokens("2026-06-15T08:00", "2026-06-15T10:00", "fable") == (40, 80)
+
+    def test_output_is_not_observed_input(self):
+        """A window is not charged context for the model\'s own answer."""
+        read, observed = self._tokens("2026-06-15T09:00", "2026-06-15T09:00")
+        assert (read, observed) == (40, 80)
 
 
 class TestWindowFamily:
@@ -2391,14 +2406,14 @@ class TestWindowFamily:
         )
 
     def test_the_scoped_window_follows_the_model_it_names(self):
-        assert ccr._window_family(self._inst("scoped", "claude-fable-5")) == "fable"
+        assert windows.window_family(self._inst("scoped", "claude-fable-5")) == "fable"
 
     def test_the_sonnet_window_is_scoped_without_naming_a_model(self):
-        assert ccr._window_family(self._inst("sonnet")) == "sonnet"
+        assert windows.window_family(self._inst("sonnet")) == "sonnet"
 
     @pytest.mark.parametrize("window", ["session", "week"])
     def test_the_unscoped_windows_count_every_model(self, window):
-        assert ccr._window_family(self._inst(window)) is None
+        assert windows.window_family(self._inst(window)) is None
 
 
 class TestInstanceSpend:
@@ -2406,7 +2421,7 @@ class TestInstanceSpend:
 
     def _priced(self, pcts, *, now_iso="2026-06-15T10:00", records=None, extra=()):
         _seed_samples("session", _W1_RESET, _W1_START, pcts)
-        index = ccr._SpendIndex(
+        index = ccr.SpendIndex(
             records
             if records is not None
             else [
@@ -2445,6 +2460,45 @@ class TestInstanceSpend:
 
     def test_a_missing_corpus_prices_as_nothing_at_all(self):
         assert self._priced([10.0, 30.0], records=[]) == ccr.WindowSpend(None, None, None)
+
+    def test_the_cache_hit_share_is_reads_over_observed_input(self):
+        """One record in the fill span: 40 read of 10 + 30 + 40 shown."""
+        spend = self._priced([10.0, 30.0, 30.0])
+        assert (spend.cache_read, spend.observed_input) == (40, 80)
+        assert spend.cache_hit == 0.5
+
+    def test_a_window_with_no_priced_records_has_no_share(self):
+        """0% would read as a window that cached nothing, which is not known."""
+        assert self._priced([10.0, 30.0], records=[]).cache_hit is None
+
+    def test_a_span_that_showed_no_input_has_no_share(self):
+        spend = ccr.WindowSpend(1.0, 1.0, None, None, 0, 0)
+        assert spend.cache_hit is None
+
+
+class TestGroupCacheHit:
+    """A table footer\'s share is the group\'s totals, not the mean of its rows."""
+
+    def _spend(self, read, observed):
+        return ccr.WindowSpend(1.0, 1.0, None, None, read, observed)
+
+    def _group(self, *pairs):
+        instances = [
+            ccr.WindowInstance("session", None, float(i), [
+                {"ts": 0.0, "used_pct": 1.0, "resets_at": float(i),
+                 "model": None, "source": "stdin"},
+            ])
+            for i, _pair in enumerate(pairs)
+        ]
+        spends = {inst.key: self._spend(*pair) for inst, pair in zip(instances, pairs, strict=True)}
+        return ccr.group_cache_hit(instances, spends)
+
+    def test_the_big_window_carries_the_share(self):
+        """A one-call window would otherwise weigh as much as a whole week."""
+        assert self._group((0, 100), (900, 1000)) == 900 / 1100
+
+    def test_a_group_that_priced_nothing_has_no_share(self):
+        assert self._group((None, None), (None, None)) is None
 
 
 class TestExtraIndex:
@@ -2687,6 +2741,9 @@ class TestCmdLimits:
                 "usd_per_pp": 8.0 / 97.7,
                 "headroom_usd": None,
                 "extra_usd": None,
+                "cache_read_tokens": 40,
+                "observed_input_tokens": 80,
+                "cache_hit_share": 0.5,
                 "hit_limit": True,
                 "partial": False,
                 "window_start": _W1_START,
@@ -2873,7 +2930,7 @@ class TestLimitsRendering:
         )
         instances = _instances()
         stamp = _local_epoch(now) if now else _W1_START
-        index, extras = ccr._SpendIndex(list(records)), ccr._ExtraIndex(list(extra))
+        index, extras = ccr.SpendIndex(list(records)), ccr._ExtraIndex(list(extra))
         spends = {
             i.key: ccr._instance_spend(i, index, extras, stamp) for i in instances
         }
@@ -2920,12 +2977,28 @@ class TestLimitsRendering:
         _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
         assert "*" not in self._render(monkeypatch, now="2026-06-15T13:01")
 
+    def test_the_cache_column_prints_the_share_of_the_fill_span(self, monkeypatch):
+        _seed_samples("session", _W1_RESET, _W1_START, [10.0, 30.0])
+        out = self._reflowed(
+            monkeypatch, records=[_spend_rec("2026-06-15T08:30", usd=10.0)],
+        )
+        assert "Cache" in out
+        assert "50%" in out
+
+    def test_a_window_with_no_corpus_shows_the_absent_marker(self, monkeypatch):
+        """The same distinction Spend draws: unknown, not nothing cached."""
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 30.0])
+        out = self._reflowed(monkeypatch, records=[])
+        # The peak, in the row and again in the footer. A share would be two more.
+        assert out.count("%") == 2
+        assert ccr._fmt_share(None) == "—"
+
     def test_a_narrow_terminal_drops_the_named_columns_in_order(self, monkeypatch):
         _seed_samples("session", _W1_RESET, _W1_START, [10.0, 30.0])
         wide = self._render(monkeypatch, width=200)
         for header in ("Tier", "Account", "Samples"):
             assert header in wide
-        narrow = self._render(monkeypatch, width=88)
+        narrow = self._render(monkeypatch, width=96)
         assert "Tier" not in narrow
         assert "Account" not in narrow
         assert "Samples" in narrow

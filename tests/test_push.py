@@ -504,6 +504,57 @@ class TestAgainstAServer:
         assert result.accepted == ["/p/a.jsonl"]
         assert cache_db.load_push_state(config.url) == {"/p/a.jsonl": (1, 100)}
 
+    def _seed_samples(self, *readings):
+        """Write utilization samples the way a status line render would."""
+        for i, (pct, resets) in enumerate(readings):
+            cache_db.record_rate_limit_snapshots(
+                [cache_db.RateLimitSample("session", pct, resets, None, "stdin")],
+                now=TS + i * 3600,
+            )
+
+    def test_a_push_carries_the_utilization_samples(self, wired):
+        from ccreport.server import db
+
+        app, _client, config = wired
+        self._seed_samples((5.0, TS + 18000), (40.0, TS + 18000))
+        result = push.push_to(config)
+        assert result.samples == 2
+        rows = db.load_rate_limit_samples(app.state.db.connect())
+        assert [row["used_pct"] for row in rows] == [5.0, 40.0]
+
+    def test_a_machine_with_no_changed_log_still_sends_its_samples(self, wired):
+        """A quiet machine still renders, and its windows still moved."""
+        _app, _client, config = wired
+        _cached_file()
+        push.push_to(config)
+        self._seed_samples((5.0, TS + 18000))
+        assert push.push_to(config).samples == 1
+
+    def test_a_sample_already_stored_is_not_offered_again(self, wired):
+        _app, _client, config = wired
+        self._seed_samples((5.0, TS + 18000))
+        push.push_to(config)
+        assert push.push_to(config).samples == 0
+
+    def test_full_offers_every_sample_again(self, wired):
+        """The recovery command repairs both halves of what the server holds."""
+        _app, _client, config = wired
+        self._seed_samples((5.0, TS + 18000))
+        push.push_to(config)
+        assert push.push_to(config, full=True).samples == 1
+
+    def test_a_restricted_machine_sends_them_unchanged(self, wired):
+        """A sample carries no project and no session; there is nothing to strip."""
+        from dataclasses import replace
+
+        app, _client, config = wired
+        self._seed_samples((5.0, TS + 18000))
+        push.push_to(replace(config, restricted=True, allow=()))
+        from ccreport.server import db
+
+        [row] = db.load_rate_limit_samples(app.state.db.connect())
+        assert (row["window"], row["used_pct"]) == ("session", 5.0)
+
     def test_a_revoked_token_is_terminal(self, wired):
         from ccreport.server import db, tokens
 

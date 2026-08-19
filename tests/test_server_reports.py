@@ -595,7 +595,7 @@ class TestAggregatedBucket:
         from ccreport.server import dashboard
 
         merged = reports.load_grouped(app.state.db.connect())
-        rows = dashboard._breakdown(merged, "project", 1.0)
+        rows = dashboard.breakdown(merged, "project", 1.0)
         assert sorted(row["key"] for row in rows) == [
             "me@home.example/aggregated", "me@work.example/aggregated", "projA",
         ]

@@ -11,6 +11,7 @@ account, with its real cost and token counts and no name of its own.
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 
@@ -169,7 +170,11 @@ class Trace:
     """One line on a chart: a label and a value per bucket on the axis."""
 
     label: str
-    values: list[float]
+    values: Sequence[float | None]
+    """None is a bucket nothing was measured in, which uPlot draws as a gap. The
+    record folds never produce one — a dense axis makes an idle hour a zero —
+    but a fill curve does: a machine that took no reading in a bucket is not a
+    machine whose quota emptied."""
 
 
 @dataclass
@@ -334,9 +339,12 @@ def _hour_axis(day: str) -> list[str]:
     return [f"{day}T{hour:02d}:00" for hour in range(24)]
 
 
-def _traced(merged: list[reports.MergedRecord], axis: list[str],
-            position_of, pairs_of) -> list[Trace]:
+def traced(merged: list[reports.MergedRecord], axis: list[str],
+           position_of, pairs_of) -> list[Trace]:
     """One trace per key, dense over *axis*, fattest first.
+
+    Public because the window pages fold the same records over an axis of their
+    own; the three helpers below it are shared for the same reason.
 
     *pairs_of* turns one record into the (label, value) pairs it contributes:
     one for a cost split by account, four for a split by token kind. Dense
@@ -356,7 +364,7 @@ def _traced(merged: list[reports.MergedRecord], axis: list[str],
     return [Trace(label=label, values=values) for label, values in ordered]
 
 
-def _token_pairs(item: reports.MergedRecord) -> list[tuple[str, float]]:
+def token_pairs(item: reports.MergedRecord) -> list[tuple[str, float]]:
     """One record's tokens as the four kinds they were billed as."""
     tokens = item.record.tokens
     return [
@@ -378,20 +386,20 @@ def _charts(merged: list[reports.MergedRecord], axis: list[str], position_of) ->
     """
     return [
         Chart(key="cost-account", title="Cost by account", unit="usd", axis=axis,
-              traces=_traced(merged, axis, position_of,
+              traces=traced(merged, axis, position_of,
                              lambda item: [(item.account, item.record.cost())])),
         Chart(key="cost-model", title="Cost by model", unit="usd", axis=axis,
-              traces=_traced(merged, axis, position_of,
+              traces=traced(merged, axis, position_of,
                              lambda item: [(item.record.model, item.record.cost())])),
         Chart(key="tokens-kind", title="Tokens by kind", unit="tokens", axis=axis,
-              traces=_traced(merged, axis, position_of, _token_pairs)),
+              traces=traced(merged, axis, position_of, token_pairs)),
         Chart(key="calls", title="Calls", unit="calls", axis=axis,
-              traces=_traced(merged, axis, position_of,
+              traces=traced(merged, axis, position_of,
                              lambda item: [("Calls", float(item.record.count))])),
     ]
 
 
-def _breakdown(merged: list[reports.MergedRecord], dimension: str,
+def breakdown(merged: list[reports.MergedRecord], dimension: str,
                total_cost: float) -> list[dict]:
     """One dimension's rows: cost, share and tokens, priciest first.
 
@@ -519,7 +527,7 @@ def build(conn, days: int, now: datetime | None = None,
         chart_days=[] if scope is not None else axis,
         series=[] if scope is not None else _chart(merged, axis, accounts),
         breakdowns={
-            dimension: _breakdown(merged, dimension, total_cost)
+            dimension: breakdown(merged, dimension, total_cost)
             for dimension in (SCOPES if scope is not None else DIMENSIONS)
         },
         machines=sorted({item.machine for item in merged}),

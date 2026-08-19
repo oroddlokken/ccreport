@@ -149,6 +149,34 @@ CREATE TABLE IF NOT EXISTS project_aliases (
     PRIMARY KEY (machine_id, project)
 ) WITHOUT ROWID;
 
+-- One machine's copy of its rate_limit_snapshots rows (cache_db.py). A window
+-- is the account's, not the machine's, so two laptops drawing on one quota push
+-- readings of the same window instance and the reports union them into one fill
+-- curve — which is the whole point of holding them here rather than per machine.
+--
+-- The account pair comes from the client, as a record's does: a sample names no
+-- account, and the change log that attributes it lives on the machine.
+--
+-- Keyed exactly as the client's table is, plus the machine: (window, ts) is
+-- what the write gate holds one instance to ~100 rows under, so a re-push of a
+-- sample already stored replaces it with itself. model is not in the key
+-- because it is nullable, and the client has the same constraint.
+CREATE TABLE IF NOT EXISTS rate_limit_samples (
+    machine_id    TEXT NOT NULL REFERENCES machines(machine_id) ON DELETE CASCADE,
+    window        TEXT NOT NULL,
+    ts            REAL NOT NULL,
+    used_pct      REAL NOT NULL,
+    resets_at     REAL NOT NULL,
+    model         TEXT,
+    source        TEXT NOT NULL,
+    account_uuid  TEXT NOT NULL,
+    account_label TEXT,
+    PRIMARY KEY (machine_id, window, ts)
+) WITHOUT ROWID;
+
+-- Every window page bounds itself in instants, the way every record page does.
+CREATE INDEX IF NOT EXISTS idx_rl_ts ON rate_limit_samples(ts);
+
 -- The same shape exchange.py already caches on every client, because the
 -- server converts to NOK for all of them and reuses that module's Norges Bank
 -- walk-back and negative cache rather than owning a second copy of either.
@@ -213,6 +241,7 @@ def _add_label_updated_at(conn: sqlite3.Connection) -> None:
 MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(4, "machines.label_updated_at", _add_label_updated_at),
     migrations.Step(5, "project_aliases"),
+    migrations.Step(6, "rate_limit_samples"),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 
@@ -598,6 +627,11 @@ def content_stamp(conn: sqlite3.Connection) -> tuple:
     the row is created and deleted by the same field, so a cleared name moves
     the count where a re-typed one moves the max.
 
+    rate_limit_samples is here because a push can carry samples and no file at
+    all — a machine whose logs have not changed still renders, and the windows
+    it watched moved. Both parts, because a machine deleted by a cascade takes
+    its samples with it and moves only the count.
+
     A rate arriving in exchange_rates is deliberately not in it: nothing here
     would notice a rate updated in place, and the NOK column it moves is
     re-derived on the next push or the next day anyway.
@@ -608,9 +642,93 @@ def content_stamp(conn: sqlite3.Connection) -> tuple:
                (SELECT COALESCE(MAX(updated_at), 0) FROM account_aliases),
                (SELECT COALESCE(MAX(label_updated_at), 0) FROM machines),
                (SELECT COUNT(*) FROM project_aliases),
-               (SELECT COALESCE(MAX(updated_at), 0) FROM project_aliases)
+               (SELECT COALESCE(MAX(updated_at), 0) FROM project_aliases),
+               (SELECT COUNT(*) FROM rate_limit_samples),
+               (SELECT COALESCE(MAX(ts), 0) FROM rate_limit_samples)
           FROM ingest_files
     """).fetchone()
+
+
+RL_SAMPLE_COLS = (
+    "machine_id", "window", "ts", "used_pct", "resets_at", "model", "source",
+    "account_uuid", "account_label",
+)
+"""Every rate_limit_samples column, in CREATE TABLE order. One tuple drives the
+INSERT, the SELECT and the row mapping, for the reason REC_COLS does."""
+
+_RL_SELECT = ", ".join(RL_SAMPLE_COLS)
+_RL_PLACEHOLDERS = ", ".join("?" * len(RL_SAMPLE_COLS))
+
+
+def store_rate_limit_samples(
+    conn: sqlite3.Connection, machine_id: str, samples: list[dict],
+) -> int:
+    """Store one machine's utilization samples, and say how many landed.
+
+    REPLACE rather than IGNORE: a sample the client re-sends after a --full is
+    the same reading of the same window at the same instant, and the newer copy
+    carries whatever account the machine has since learned to attribute it to.
+
+    No file to key on and nothing to delete first — a sample is a row of its
+    own, written once and never edited, so there is no wholesale replace to make
+    atomic the way a file's records need.
+    """
+    if not samples:
+        return 0
+    rows = [
+        tuple(sample.get(name) for name in RL_SAMPLE_COLS[1:])
+        for sample in samples
+    ]
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.executemany(
+            f"INSERT OR REPLACE INTO rate_limit_samples ({_RL_SELECT}) "  # noqa: S608
+            f"VALUES ({_RL_PLACEHOLDERS})",
+            [(machine_id, *row) for row in rows],
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    return len(rows)
+
+
+def load_rate_limit_samples(
+    conn: sqlite3.Connection, since: float | None = None, until: float | None = None,
+) -> list[dict]:
+    """Every stored sample the bounds admit, oldest first, machine label attached.
+
+    Ordered by ts then window, as the client's reader is, so the samples of one
+    window instance arrive in fill order however many machines reported them.
+    The machine's label rides along because a merged fill curve draws a trace
+    per machine and a machine_id is not a name anyone typed.
+    """
+    clauses, params = [], []
+    if since is not None:
+        clauses.append("s.ts >= ?")
+        params.append(since)
+    if until is not None:
+        clauses.append("s.ts < ?")
+        params.append(until)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    cols = ", ".join(f"s.{name}" for name in RL_SAMPLE_COLS)
+    rows = conn.execute(
+        f"SELECT {cols}, COALESCE(m.label, s.machine_id) FROM rate_limit_samples s "  # noqa: S608
+        f"LEFT JOIN machines m ON m.machine_id = s.machine_id{where} "
+        "ORDER BY s.ts, s.window",
+        params,
+    ).fetchall()
+    samples: list[dict] = []
+    for row in rows:
+        sample: dict = dict(zip(RL_SAMPLE_COLS, row[:len(RL_SAMPLE_COLS)], strict=True))
+        sample["machine"] = row[-1]
+        samples.append(sample)
+    return samples
+
+
+def oldest_sample_ts(conn: sqlite3.Connection) -> float | None:
+    """When the oldest stored sample was taken, or None where there are none."""
+    return conn.execute("SELECT MIN(ts) FROM rate_limit_samples").fetchone()[0]
 
 
 def machine_label(conn: sqlite3.Connection, machine_id: str) -> str | None:

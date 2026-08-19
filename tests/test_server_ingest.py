@@ -244,3 +244,70 @@ class TestHealth:
 
     def test_a_bad_token_fails_at_setup_rather_than_at_the_first_push(self, client):
         assert client.get("/v1/health", headers=sf.auth("never-minted")).status_code == 401
+
+
+class TestRateLimitSamples:
+    """The other half of a push: how full each window got, merged per account."""
+
+    def _push(self, client, token, samples):
+        return client.post(
+            "/v1/ingest", json=sf.sample_batch(samples), headers=sf.auth(token),
+        )
+
+    def test_a_batch_of_samples_is_stored_and_counted(self, app, client, token):
+        resp = self._push(client, token, [sf.sample(), sf.sample(ts=1_770_000_300.0)])
+        assert resp.json()["samples"] == 2
+        rows = db.load_rate_limit_samples(app.state.db.connect())
+        assert [row["ts"] for row in rows] == [1_770_000_000.0, 1_770_000_300.0]
+
+    def test_a_sample_carries_the_account_the_client_resolved(self, app, client, token):
+        self._push(client, token, [sf.sample()])
+        [row] = db.load_rate_limit_samples(app.state.db.connect())
+        assert (row["account_uuid"], row["account_label"]) == ("acct-1", "me@example.net")
+
+    def test_the_machine_label_rides_back_out_with_the_row(self, app, client, token):
+        self._push(client, token, [sf.sample()])
+        [row] = db.load_rate_limit_samples(app.state.db.connect())
+        assert row["machine"] == "Laptop"
+
+    def test_a_re_pushed_sample_replaces_itself(self, app, client, token):
+        """A --full offers the whole history again; it must not double the rows."""
+        self._push(client, token, [sf.sample(used_pct=12.0)])
+        self._push(client, token, [sf.sample(used_pct=13.0)])
+        rows = db.load_rate_limit_samples(app.state.db.connect())
+        assert [row["used_pct"] for row in rows] == [13.0]
+
+    def test_a_batch_with_no_samples_stores_none(self, app, client, token):
+        resp = client.post("/v1/ingest", json=sf.batch(), headers=sf.auth(token))
+        assert resp.json()["samples"] == 0
+        assert db.load_rate_limit_samples(app.state.db.connect()) == []
+
+    def test_a_push_can_carry_records_and_samples_together(self, app, client, token):
+        batch = {**sf.batch(), "samples": [sf.sample()]}
+        resp = client.post("/v1/ingest", json=batch, headers=sf.auth(token))
+        assert resp.json()["samples"] == 1
+        assert len(sf.stored(app, "laptop-1")) == 1
+
+    def test_the_bounds_select_by_instant(self, app, client, token):
+        self._push(client, token, [sf.sample(), sf.sample(ts=1_770_000_300.0)])
+        conn = app.state.db.connect()
+        rows = db.load_rate_limit_samples(conn, 1_770_000_100.0, 1_770_000_400.0)
+        assert [row["ts"] for row in rows] == [1_770_000_300.0]
+
+    def test_deleting_a_machine_takes_its_samples(self, app, client, token):
+        self._push(client, token, [sf.sample()])
+        conn = app.state.db.connect()
+        db.delete_machine(conn, "laptop-1")
+        conn.commit()
+        assert db.load_rate_limit_samples(conn) == []
+
+    def test_samples_move_the_content_stamp(self, app, client, token):
+        """A push can carry samples and no file, and the window pages read them."""
+        conn = app.state.db.connect()
+        before = db.content_stamp(conn)
+        self._push(client, token, [sf.sample()])
+        assert db.content_stamp(conn) != before
+
+    def test_an_unauthenticated_sample_push_is_refused(self, client):
+        resp = client.post("/v1/ingest", json=sf.sample_batch([sf.sample()]))
+        assert resp.status_code == 401

@@ -31,12 +31,15 @@
   function tick(unit) {
     if (unit === "usd") return (u, values) => values.map((v) => "$" + compact(v));
     if (unit === "tokens") return (u, values) => values.map((v) => compact(v));
+    if (unit === "percent") return (u, values) => values.map((v) => v + "%");
     return (u, values) => values.map((v) => v);
   }
 
   function draw(spec, box) {
     const xs = spec.axis.map(stamp);
-    const bars = spec.traces.length === 1;
+    // A lone series is drawn as bars, except a fill curve: a quota rising over
+    // hours is a line, and one machine reporting it is the ordinary case.
+    const bars = spec.traces.length === 1 && spec.unit !== "percent";
     const when = spec.axis.some((v) => v.length > 10) ? hourFmt : dayFmt;
     const opts = {
       width: box.clientWidth || 480,

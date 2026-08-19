@@ -1214,6 +1214,13 @@ Rules the implementation holds to:
 
 ### 9.6 Rate-Limit Utilization History
 
+`windows.py` holds every calculation in this section: the window instance, its
+peak and fill span, the `SpendIndex` that prices a span and counts its tokens,
+and the `WindowSpend` those produce. Nothing there renders, because the merged
+server reports the same windows over the records it holds and cannot import a
+module that draws rich tables — `ccreport.py` turns them into tables and
+`server/limits.py` into pages.
+
 `ccreport limits` reads `rate_limit_snapshots` and `account_events` for how full
 each window got and who was drawing on it, plus the records covering the sampled
 span for what the filling cost — a sample carries a percentage and no tokens, so
@@ -1260,6 +1267,7 @@ Per instance:
 | pp/h | the rise (peak − **first reading taken**) over the fill span. Wall-clock, so an overnight gap between two renders counts as time the window took to fill — the rate to project a reset with, and the wrong one for "how fast does a working hour spend the quota". `None` (rendered `—`) for one sample or a window that never rose while it was watched, never 0, which would read as "not filling" |
 | Spend | deduplicated record cost over the **fill span**, so it describes the same stretch of time the rise and the rate do. Filtered to one model family for a scoped window (the model the sample names) and for the Sonnet window (scoped by definition); session and week count every model |
 | $/pp | Spend ÷ rise — an exchange rate, not an identity. The rate limit meters something Anthropic does not publish; this prices the points in the only unit this tool has. The footer's is the group's total spend over its total rise, not the mean of the rows: a window that rose one point would otherwise weigh as much as a week that rose forty |
+| Cache | `cache_read ÷ (input + cache_create + cache_read)` over the **fill span**, on the same model family the Spend column is filtered to. Cache reads are the cheapest tokens on the corpus, so the column answers "how much of this window's context was already paid for" and says why two windows with the same peak cost different amounts of quota. Output is left out of the denominator: it is the model's answer, not context that was or was not paid for again. `—` where no record priced the span, for the same reason Spend is — a window with no corpus behind it cached an unknown share, not 0%. The footer's is the group's total reads over its total observed input, not the mean of the rows (`windows.group_cache_hit`). `--json` carries the two counts as `cache_read_tokens` and `observed_input_tokens`, plus the ratio as `cache_hit_share` |
 | Extra | real dollars billed as Extra usage while the window ran, from `extra_usage_snapshots`. Not gated on Hit, and measured over the window's whole span rather than over the fill — see below. `—` where no reading bounds the span, which is unknown and not $0.00; `$0.00` where readings bound it and it did not move. `--json` carries it as `extra_usd` |
 | Hit | `round(peak) >= 100`. Rounded to match the write gate, which only passes a whole-percent move — 99.6 is the last sample a full window can leave behind |
 | Account / Tier | attributed at the instance's **first** sample, via `AccountTimeline.label_at()` / `.tier_at()` — one bisect over the same events, so both answers come off the event in force when the window opened. A window with no tier there is not in the table at all (below) |
@@ -1314,6 +1322,23 @@ reset read 1595%, and even a sound one answered a question nobody reading the
 table had asked. `--json` carries it as `projected_used_pct`, uncapped and
 extrapolated from the last sample (`WindowInstance.projected_pct`), for a caller
 that wants it.
+
+**On the server.** A push carries the same samples (`push.build_samples`,
+`server/ingest.py`), stored in `rate_limit_samples` keyed on (machine, window,
+ts). Nothing is redacted on the way: a sample is a window name, a percentage, a
+reset time and a model, and none of those is a project or a session, so a
+restricted machine sends what an open one does.
+
+The merge is what the client cannot do. A quota belongs to an **account**, so
+`server/limits.py` groups on (account, window, model, reset) rather than on the
+machine, and two laptops signed into one account contribute readings to one fill
+curve — each drawn as its own trace, with a bucket that machine took no reading
+in left as null rather than 0. Spend, `$/pp` and Cache are the same
+`windows.py` functions the CLI's columns read, over `reports.load` bounded to
+the window spans: the full record path, because a 5-hour window is priced over
+hours and a grouped row has folded the hour away. There is no Extra column —
+that series is a reading of one machine's status line and nothing pushes it —
+and no Tier column, since the account log stays on the machine.
 
 A window whose first sample resolves to no tier — an event that predates the tier
 columns, or no event at all — is left out of the tables, silently, like the

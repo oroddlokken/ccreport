@@ -74,12 +74,39 @@ class IngestFile(BaseModel):
     logs under new names, and their fingerprints are the same as ever."""
 
 
+class IngestSample(BaseModel):
+    """One rate-limit reading, as the machine's snapshot table holds it.
+
+    Nothing here is redacted and nothing needs to be: a window name, a
+    percentage, a reset time and a model are not a project and not a session,
+    so a restricted machine sends the same rows an open one does.
+
+    The account pair is resolved on the client, as a record's is — a sample
+    names no account, and the change log that attributes it by timestamp lives
+    on the machine that took it.
+    """
+
+    ts: float
+    window: str
+    used_pct: float
+    resets_at: float
+    model: str | None = None
+    source: str
+    account_uuid: str
+    account_label: str | None = None
+
+
 class IngestBatch(BaseModel):
     label: str
     """The machine's hostname. Shown only until the machine is named in the web
     UI, which is where the label a person reads comes from."""
     client_version: str = ""
     files: list[IngestFile] = Field(default_factory=list)
+    samples: list[IngestSample] = Field(default_factory=list)
+    """Rate-limit utilization samples. Their own section rather than a field on
+    a file: they come from a different table, are keyed on the window rather
+    than on a log, and a machine whose logs have not changed still has new ones
+    to send."""
 
 
 class FileResult(BaseModel):
@@ -92,6 +119,9 @@ class FileResult(BaseModel):
 class IngestResponse(BaseModel):
     machine_id: str
     files: list[FileResult]
+    samples: int = 0
+    """Rate-limit samples stored. The client moves its own watermark off having
+    sent them rather than off this count, which is what it reports."""
 
 
 class HealthResponse(BaseModel):
@@ -273,7 +303,12 @@ def ingest(
     db.upsert_machine(conn, auth.machine_id, batch.label, now)
     _warm_rates(conn, batch.files)
     results = [_ingest_file(conn, auth.machine_id, item, now) for item in batch.files]
-    return IngestResponse(machine_id=auth.machine_id, files=results)
+    # After the files, so a batch carrying both leaves the more expensive half
+    # committed before this one opens a write transaction of its own.
+    stored = db.store_rate_limit_samples(
+        conn, auth.machine_id, [sample.model_dump() for sample in batch.samples],
+    )
+    return IngestResponse(machine_id=auth.machine_id, files=results, samples=stored)
 
 
 @router.get("/health", response_model=HealthResponse)

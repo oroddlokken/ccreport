@@ -27,6 +27,8 @@ from ccreport import migrations
 
 # pricing.py imports cache_db only inside functions, so this direction is safe.
 from ccreport.pricing import project_key, rolling_cost_keys
+from ccreport.windows import RL_MAX_LOOKAHEAD_S as _RL_MAX_LOOKAHEAD_S
+from ccreport.windows import rl_window_key as _rl_window_key
 
 _CACHE_DIR = Path.home() / ".cache" / "ccreport"
 DB_PATH = _CACHE_DIR / "cache.db"
@@ -3105,38 +3107,11 @@ def clear_adopted_account() -> bool:
 # fills over hours; nothing worth plotting happens inside five minutes.
 _RL_SNAPSHOT_MIN_INTERVAL_S = 300
 
-# How far ahead a reset time can plausibly sit. The longest window here is the
-# 7-day one, so a reading claiming more than this is not describing a window:
-# Claude Code has been seen sending resets_at = 9999999999 on stdin (a year-2286
-# placeholder), and rows written before this check carry it permanently. The
-# day of slack over seven is for a span quoted generously, not for a placeholder.
-#
-# Both ends read it from here: statusline._rl_sample refuses to store one, and
-# `ccreport limits` drops the ones already stored. A reader that tolerated what
-# the writer rejects would render a window resetting in 2286.
-RL_MAX_LOOKAHEAD_S = 8 * 86_400
-
-
-def rl_window_key(resets_at: float) -> float:
-    """*resets_at* rounded to the whole minute — one window instance's identity.
-
-    The usage API returns a float that drifts by up to a second between fetches
-    of the same window (observed: 80 scoped rows spanning 1786305599.03 to
-    1786305600.95, all of one reset at 1786305600). Both ends of this table
-    treat resets_at as the window's identity — the write gate to decide whether
-    a reading belongs to the window it already stored, `ccreport limits` to
-    group samples into one fill curve — so that drift made every render look
-    like a fresh window: the whole-percent gate never applied, and one week of
-    scoped history became 80 single-sample instances.
-
-    A minute because real resets land on one; anything finer is fetch latency.
-    Rounded rather than truncated, else a reset at :00 splits across two buckets
-    depending on which side of it the jitter fell.
-
-    The writer normalizes before storing. The reader applies it again on read,
-    because the rows written before this existed keep their jitter forever.
-    """
-    return round(resets_at / 60.0) * 60.0
+# Both live in windows.py, with the window instances that read them: the
+# identity a sample is stored under and the identity a report groups on are one
+# rule, and this table's write gate is the other end of it.
+RL_MAX_LOOKAHEAD_S = _RL_MAX_LOOKAHEAD_S
+rl_window_key = _rl_window_key
 
 
 # The stored column order, which is also the order the INSERT below spells out.
@@ -3218,12 +3193,17 @@ def record_rate_limit_snapshots(
         conn.commit()
 
 
-def load_rate_limit_snapshots() -> list[dict[str, Any]]:
+def load_rate_limit_snapshots(since: float | None = None) -> list[dict[str, Any]]:
     """Every utilization sample ever taken, oldest first.
 
-    Unbounded on purpose, and affordable: the write gate holds one window
+    Unbounded by default, and affordable: the write gate holds one window
     instance to ~100 rows, and `ccreport limits` groups by instance, so a LIMIT
     here would silently truncate the oldest instance rather than the report.
+
+    *since* is exclusive and is the push watermark's bound, so a machine that
+    has already sent a sample does not send it again. Exclusive because the
+    watermark is the newest ts the server acknowledged, and (window, ts) is the
+    primary key — every window sampled in that render is already there.
 
     Ordering by ts leaves the samples of one instance already in fill order.
     Window breaks the tie, which makes the order total — (window, ts) is the
@@ -3232,10 +3212,12 @@ def load_rate_limit_snapshots() -> list[dict[str, Any]]:
     """
     conn = get_connection()
     cols = ", ".join(_RL_SNAPSHOT_COLS)
+    clause = " WHERE ts > ?" if since is not None else ""
     return [
         dict(zip(_RL_SNAPSHOT_COLS, row, strict=True))
         for row in conn.execute(
-            f"SELECT {cols} FROM rate_limit_snapshots ORDER BY ts, window"  # noqa: S608
+            f"SELECT {cols} FROM rate_limit_snapshots{clause} ORDER BY ts, window",  # noqa: S608
+            () if since is None else (since,),
         )
     ]
 
@@ -3438,6 +3420,7 @@ def clear_push_state(server_url: str) -> None:
     """
     conn = get_connection()
     conn.execute("DELETE FROM push_state WHERE server_url = ?", (server_url,))
+    _set_meta(conn, _push_meta_key("samples_at", server_url), "0.0")
     conn.commit()
 
 
@@ -3465,6 +3448,29 @@ def write_push_next_attempt(when: float) -> None:
     """Set when the next push may start. Written on every outcome, failures too."""
     conn = get_connection()
     _set_meta(conn, _PUSH_NEXT_KEY, repr(when))
+    conn.commit()
+
+
+def read_push_samples_at(server_url: str) -> float:
+    """The newest rate-limit sample *server_url* has acknowledged, or 0.0.
+
+    A meta key rather than a row per sample: the samples of one window are
+    written in ts order and never edited, so one epoch says what the server
+    holds. A server whose database was restored from a backup is repaired by
+    `ccreport server push --full`, which clears this with the rest.
+    """
+    conn = get_connection()
+    raw = _get_meta(conn, _push_meta_key("samples_at", server_url))
+    try:
+        return float(raw) if raw else 0.0
+    except ValueError:
+        return 0.0
+
+
+def write_push_samples_at(server_url: str, when: float) -> None:
+    """Record the newest sample a completed push sent."""
+    conn = get_connection()
+    _set_meta(conn, _push_meta_key("samples_at", server_url), repr(when))
     conn.commit()
 
 

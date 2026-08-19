@@ -104,6 +104,10 @@ class PushResult:
     skipped: list[str] = field(default_factory=list)
     rejected: list[tuple[str, str]] = field(default_factory=list)
     records: int = 0
+    samples: int = 0
+    """Rate-limit utilization samples stored. Counted apart from records: they
+    come from a different table and answer a different question, and a run that
+    sent nothing but samples has not sent no data."""
     blocked_by: tuple[str, ...] = ()
     """The CIDRs a blocked push wanted and could not find an address inside.
 
@@ -477,6 +481,56 @@ def build_files(
     return files
 
 
+SAMPLES_PER_BATCH = 2000
+"""Rate-limit samples per request. Each is under a hundred bytes, so this is
+well inside the smallest configured body limit and still one request for a year
+of a quiet machine's history."""
+
+
+def build_samples(conn: sqlite3.Connection, timeline, since: float) -> list[dict]:
+    """The utilization samples newer than the watermark, as the ingest accepts.
+
+    The account is resolved here, the way a record's is: a sample names none —
+    it is attributed by its ts against this machine's account log — and the
+    server holds no copy of that log to attribute it with.
+
+    Nothing is redacted. A sample carries a window name, a percentage, a reset
+    time and a model, and none of those is a project or a session, so a
+    restricted machine sends the same rows an open one does. The quota is the
+    account's, and how full it got is what the merged page is for.
+    """
+    from ccreport.cache_db import _RL_SNAPSHOT_COLS
+
+    cols = ", ".join(_RL_SNAPSHOT_COLS)
+    rows = conn.execute(
+        f"SELECT {cols} FROM rate_limit_snapshots WHERE ts > ? ORDER BY ts, window",  # noqa: S608
+        (since,),
+    ).fetchall()
+    samples = []
+    for row in rows:
+        sample = dict(zip(_RL_SNAPSHOT_COLS, row, strict=True))
+        when = datetime.fromtimestamp(sample["ts"], tz=UTC)
+        samples.append({
+            **sample,
+            "account_uuid": timeline.uuid_at(when) or "unknown",
+            "account_label": timeline.label_at(when),
+        })
+    return samples
+
+
+def pack_samples(samples: list[dict], label: str) -> list[dict]:
+    """The sample-only requests a batch of them travels in.
+
+    Their own requests rather than a field on the file batches: a machine whose
+    logs have not changed still has new samples to send, and there are no file
+    batches on that run to attach them to.
+    """
+    return [
+        {"label": label, "files": [], "samples": samples[at:at + SAMPLES_PER_BATCH]}
+        for at in range(0, len(samples), SAMPLES_PER_BATCH)
+    ]
+
+
 def pack_batches(files: list[dict], label: str, max_body: int) -> list[dict]:
     """Split the files into requests that fit *max_body*, never splitting one.
 
@@ -569,10 +623,14 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
     watermark = cache_db.load_push_state(server.url)
     timeline = AccountTimeline(cache_db.load_account_events())
 
+    # Cleared with the file watermark by --full and by a policy change, so a
+    # repaired server is offered the whole history of both tables.
+    samples_at = cache_db.read_push_samples_at(server.url)
     conn = _read_only(db_path or cache_db.DB_PATH)
     try:
         pending = changed_files(conn, watermark)
         files = build_files(conn, pending, timeline, override)
+        samples = build_samples(conn, timeline, samples_at)
     finally:
         conn.close()
     for item in files:
@@ -582,8 +640,19 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
 
     result = PushResult(server=server.url)
     acknowledged: list[tuple[str, int, int]] = []
-    for batch in pack_batches(files, server.label, server.max_body):
+    sent_samples_at = samples_at
+    batches = pack_batches(files, server.label, server.max_body) + pack_samples(
+        samples, server.label,
+    )
+    for batch in batches:
         reply = post_batch(server, batch)
+        result.samples += reply.get("samples") or 0
+        # Accumulated across the run and written once at the end, so a batch
+        # that raises leaves the watermark where it was and the earlier ones are
+        # offered again. Re-sending a stored sample is a no-op: the server keys
+        # them on (machine, window, ts).
+        for sample in batch.get("samples", ()):
+            sent_samples_at = max(sent_samples_at, sample["ts"])
         prints = _fingerprints(batch["files"])
         for entry in reply.get("files", ()):
             path = entry["path"]
@@ -599,6 +668,7 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
     # The only writes, and only for what the server said it stored. A rejected
     # file stays unrecorded on purpose, so the next run offers it again.
     cache_db.save_push_state(server.url, acknowledged, time.time())
+    cache_db.write_push_samples_at(server.url, sent_samples_at)
     cache_db.write_push_policy(server.url, policy)
     return result
 

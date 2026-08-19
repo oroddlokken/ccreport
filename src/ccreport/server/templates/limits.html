@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="range">
+  <span class="dim span">rate-limit windows ·
+    <a href="/day/{{ view.start }}" data-day="{{ view.start }}">{{ view.start }}</a> —
+    <a href="/day/{{ view.end }}" data-day="{{ view.end }}">{{ view.end }}</a>
+  </span>
+  <span class="toggles">
+    {% for days in ranges %}
+    <a class="toggle {% if days == view.days %}on{% endif %}"
+       {% if days == view.days %}aria-current="true"{% endif %}
+       href="/limits?days={{ days }}">{{ range_labels[days] }}</a>
+    {% endfor %}
+  </span>
+</div>
+
+{% for group in view.groups %}
+<section>
+  <div class="chart-head">
+    <h2>{{ group.label }}</h2>
+    <span class="dim">{{ group.rows | length }} window(s), {{ group.hits }} hit</span>
+  </div>
+  <div class="table-clip">
+  <table class="breakdown">
+    <thead>
+      <tr>
+        <th scope="col">Reset</th>
+        {% if group.scoped %}<th scope="col">Model</th>{% endif %}
+        <th scope="col">Account</th>
+        <th scope="col" class="num">Peak</th>
+        <th scope="col" class="num">Samples</th>
+        <th scope="col" class="num">Fill</th>
+        <th scope="col" class="num">pp/h</th>
+        <th scope="col" class="num">Spend</th>
+        <th scope="col" class="num">$/pp</th>
+        <th scope="col" class="num">Cache</th>
+        <th scope="col">Machines</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in group.rows %}
+      {% set inst = row.instance %}
+      <tr>
+        <td><a href="/limits/{{ group.window | urlencode }}/{{ row.key }}?model={{ (inst.model or '') | urlencode }}&amp;account={{ row.account | urlencode }}">{{ inst.resets_at | when }}</a></td>
+        {% if group.scoped %}<td>{{ inst.model or "—" }}</td>{% endif %}
+        <td>{{ row.account }}</td>
+        <td class="num">{{ "%.1f" | format(inst.peak) }}%{% if inst.hit_limit %} <span class="hit">hit</span>{% endif %}</td>
+        <td class="num" data-int="{{ inst.samples | length }}">{{ inst.samples | length }}</td>
+        <td class="num">{{ "%.1f" | format(inst.fill_s / 3600) }}h</td>
+        <td class="num">{% if inst.burn_pph is none %}—{% else %}{{ "%.2f" | format(inst.burn_pph) }}{% endif %}</td>
+        <td class="num" {% if row.spend.usd is not none %}data-usd="{{ row.spend.usd }}"{% endif %}>{% if row.spend.usd is none %}—{% else %}{{ "${:,.2f}".format(row.spend.usd) }}{% endif %}</td>
+        <td class="num">{% if row.spend.per_pp is none %}—{% else %}{{ "${:,.2f}".format(row.spend.per_pp) }}{% endif %}</td>
+        <td class="num">{% if row.spend.cache_hit is none %}—{% else %}{{ (row.spend.cache_hit * 100) | round | int }}%{% endif %}</td>
+        <td class="dim">{{ row.machines | join(", ") }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% else %}
+<section>
+  <p class="dim">No machine has pushed a rate-limit reading in this range. The
+  status line writes them as it renders, and a push carries them.</p>
+</section>
+{% endfor %}
+{% endblock %}
