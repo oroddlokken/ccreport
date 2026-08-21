@@ -1335,8 +1335,15 @@ priced that way. `TierTimeline.stretches` cuts a span at every declared change
 and hands back `(from, to, tiers)` — contiguous, gapless, and carrying all
 three tier fields rather than the resolved one, because the field that prices a
 stretch is not the field that groups it. `pricing.prorated_plan_cost` then
-weights each stretch's monthly rate by its share of the span, pricing each at
-its own start so a span crossing a price rise pays the old rate up to it.
+weights each stretch's monthly rate by its share of the calendar month it falls
+in, splitting a stretch at any month boundary it crosses so each part is
+measured against its own month's length. Each is priced at its own start, so a
+span crossing a price rise pays the old rate up to it.
+
+Against the month and never against the caller's span. Over the span, a
+seven-day range would charge a full month's rate for seven days and half a year
+would charge one month's rate for six — the month case is the one where the two
+agree, which is why the whole-server tile is what exposed the difference.
 
 The split is two functions because neither module may gain the other's imports:
 `tier_timeline` holds nothing but the stdlib, and prices live in `pricing.py`.
@@ -1346,13 +1353,34 @@ before the first declared entry, 1 day of Pro at $20 and 25 days of Max 5x at
 $100, over a 28-day span — $90.53. The unpriced opening contributes nothing and
 does not void the month.
 
-**On the dashboard.** `dashboard._plan_costs` sums it across the accounts a
-page shows and attaches it to the `month` breakdown rows as `plan_usd`, after
-the fold rather than inside it: a plan cost is not a property of any record, and
-`breakdown()` sees neither the connection the timeline is read from nor which
-account a folded row belongs to. Only that dimension gets it — a model has no
-subscription behind it, and a day or a week is shorter than the thing a plan is
-billed by.
+**On the dashboard.** `dashboard._Plans` reads the timeline once per render and
+prices any span the page shows, summing across the accounts that page covers.
+The `month` breakdown rows get `plan_usd`, `plan_multiple` and `plan_saved`,
+attached after the fold rather than inside it: a plan cost is not a property of
+any record, and `breakdown()` sees neither the connection the timeline is read
+from nor which account a folded row belongs to. Only that dimension gets them —
+a model has no subscription behind it, and a day or a week is shorter than the
+thing a plan is billed by.
+
+A sixth stat tile, "Value vs plan", sets the page's valuation against the plan
+cost over the page's own span: a multiple as the number, the gap in USD and NOK
+as the subline. It shows on every page a plan is declared for.
+
+On a model, project or machine page — `dashboard.SLICE_SCOPES` — the numerator
+is one part of what the subscription bought while the denominator is all of it,
+so the subline ends "— this project alone". That case is worth showing: one
+project outrunning the whole plan by itself is the interesting number. What it
+must not do is read identically to the whole-server page, which is what the
+qualifier prevents.
+
+Proportional attribution was the alternative and is useless here: giving each
+project its share of the plan makes every slice show the dashboard's multiple,
+so the tile would say nothing about the slice.
+
+Two things the wording carries deliberately. A quiet span is worth *less* than
+its plan, and the subline says "less than" rather than printing a minus sign
+where a word belongs. And every figure in it is an API-list valuation, not
+money anybody was charged, which is why the line ends by saying so.
 
 ### 9.7 Rate-Limit Utilization History
 

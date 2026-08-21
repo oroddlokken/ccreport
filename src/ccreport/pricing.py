@@ -462,36 +462,78 @@ def tier_from(tiers: Mapping[str, str | None]) -> str | None:
     return tiers.get("user_rate_limit_tier") or tiers.get("organization_rate_limit_tier")
 
 
+def _next_month(when: datetime) -> datetime:
+    """Midnight UTC on the first of the month after *when*'s."""
+    year, month = when.year + (when.month == 12), (when.month % 12) + 1
+    return datetime(year, month, 1, tzinfo=UTC)
+
+
+def _month_shares(from_ts: float, to_ts: float) -> Iterator[float]:
+    """One stretch's share of each calendar month it touches, as fractions.
+
+    A subscription is billed by the calendar month, so a stretch is worth its
+    length over the length of the month it falls in — not over the length of
+    whatever span a caller happens to be asking about. Two weeks of a 31-day
+    month is 14/31 of a monthly rate whether the question was about that month,
+    that quarter or the whole year.
+
+    A stretch crossing a boundary is split at it, so each part is measured
+    against its own month. February and August are different lengths, and a
+    fortnight is a larger share of one than of the other.
+    """
+    at = datetime.fromtimestamp(from_ts, tz=UTC)
+    while at.timestamp() < to_ts:
+        opens = at.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        closes = _next_month(opens)
+        part = min(to_ts, closes.timestamp()) - at.timestamp()
+        yield part / (closes.timestamp() - opens.timestamp())
+        at = closes
+
+
+def months_in_span(start: datetime, end: datetime) -> float:
+    """How many calendar months *start*..*end* is worth, as a fraction.
+
+    The same measure prorated_plan_cost bills against, so a figure it produced
+    and the month count printed beside it cannot disagree about how long the
+    span was. February and August contribute differently: a fortnight is half
+    of one and under half of the other.
+    """
+    if end <= start:
+        return 0.0
+    return sum(_month_shares(start.timestamp(), end.timestamp()))
+
+
 def prorated_plan_cost(
     stretches: Sequence[tuple[float, float, Mapping[str, str | None] | None]],
-    start: datetime, end: datetime,
 ) -> float | None:
-    """What the plans in *stretches* cost over *start*..*end*, by time in force.
+    """What the plans in *stretches* cost, prorated by calendar month.
 
-    A month that changed plan mid-cycle is billed prorated, so pricing it as
-    whichever plan happened to be running on the 1st would misprice five of the
-    seven months a year of receipts can hold. Each stretch pays its share of a
-    monthly rate: its own length over the span's.
+    A plan changed mid-cycle is billed prorated, so pricing a month as whichever
+    plan happened to be running on the 1st would misprice five of the seven
+    months a year of receipts can hold. Each stretch pays its share of a monthly
+    rate, measured against the month it falls in.
 
-    None when nothing in the span has a price. Not zero — an unpriced month and
-    a free one are different answers, and a zero in a column beside real money
-    reads as the second.
+    Against the month and never against the caller's span, which is the one
+    thing this must not do: a week priced over a week would charge a full
+    month's rate for seven days, and half a year priced over half a year would
+    charge one month's rate for six.
 
-    Priced at each stretch's own start, so a span that crosses a price rise
-    pays the old rate up to it and the new one after.
+    None when nothing has a price. Not zero — an unpriced span and a free one
+    are different answers, and a zero in a column beside real money reads as
+    the second.
+
+    Priced at each stretch's own start, so a stretch that begins after a price
+    rise pays the new rate and one before it pays the old.
     """
-    span = end.timestamp() - start.timestamp()
-    if span <= 0:
-        return None
     total, priced = 0.0, False
     for from_ts, to_ts, tiers in stretches:
-        if tiers is None:
+        if tiers is None or to_ts <= from_ts:
             continue
         rate = tier_set_price(tiers, datetime.fromtimestamp(from_ts, tz=UTC))
         if rate is None:
             continue
         priced = True
-        total += rate * (to_ts - from_ts) / span
+        total += rate * sum(_month_shares(from_ts, to_ts))
     return total if priced else None
 
 

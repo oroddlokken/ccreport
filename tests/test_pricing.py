@@ -2668,16 +2668,16 @@ class TestPlanPrice:
 
 
 class TestProratedPlanCost:
-    """A month that changed plan mid-cycle is billed by time in force."""
+    """A subscription is billed by the calendar month, so a span is priced by it."""
 
-    FEB = (datetime(2026, 2, 1, tzinfo=UTC), datetime(2026, 3, 1, tzinfo=UTC))
+    FEB = datetime(2026, 2, 1, tzinfo=UTC)
 
-    def _spans(self, *pairs):
-        """(days, tier) pairs laid end to end from the span's start.
+    def _spans(self, *pairs, opening=None):
+        """(days, tier) pairs laid end to end from *opening*, default 1 February.
 
         The tier is the org pool field, which is where a personal plan's lands.
         """
-        at = self.FEB[0].timestamp()
+        at = (opening or self.FEB).timestamp()
         out = []
         for days, tier in pairs:
             tiers = None if tier is None else {"organization_rate_limit_tier": tier}
@@ -2685,58 +2685,81 @@ class TestProratedPlanCost:
             at += days * 86400
         return out
 
-    def _seat(self, days, seat, when=None):
-        at = (when or self.FEB[0]).timestamp()
-        return [(at, at + days * 86400, {"seat_tier": seat, **self.SEAT_BUCKET})]
-
     SEAT_BUCKET = {"user_rate_limit_tier": "default_claude_max_5x"}
 
+    def _seat(self, days, seat):
+        at = self.FEB.timestamp()
+        return [(at, at + days * 86400, {"seat_tier": seat, **self.SEAT_BUCKET})]
+
     def test_a_whole_month_on_one_plan_costs_its_monthly_rate(self):
-        cost = pricing.prorated_plan_cost(
-            self._spans((28, "default_claude_max_5x")), *self.FEB,
-        )
+        cost = pricing.prorated_plan_cost(self._spans((28, "default_claude_max_5x")))
         assert cost == pytest.approx(100.0)
 
     def test_a_split_month_weights_the_two_rates_by_days(self):
-        """14 days of each: half of $20 plus half of $100."""
+        """14 days of each in a 28-day month: half of $20 plus half of $100."""
         cost = pricing.prorated_plan_cost(
             self._spans((14, "default_claude_pro"), (14, "default_claude_max_20x")),
-            *self.FEB,
         )
         assert cost == pytest.approx(110.0)
 
-    def test_an_unpriced_stretch_contributes_nothing_but_does_not_void_the_month(self):
+    def test_a_week_costs_a_week_not_a_month(self):
+        """Over the span rather than over the month is the defect this catches."""
+        cost = pricing.prorated_plan_cost(self._spans((7, "default_claude_max_5x")))
+        assert cost == pytest.approx(100.0 * 7 / 28)
+
+    def test_half_a_year_costs_six_months_not_one(self):
         cost = pricing.prorated_plan_cost(
-            self._spans((14, None), (14, "default_claude_max_20x")), *self.FEB,
+            self._spans((181, "default_claude_max_5x"), opening=datetime(2026, 1, 1, tzinfo=UTC)),
+        )
+        assert cost == pytest.approx(600.0)
+
+    def test_a_fortnight_is_a_bigger_share_of_february_than_of_august(self):
+        """Each part is measured against its own month's length."""
+        feb = pricing.prorated_plan_cost(self._spans((14, "default_claude_max_5x")))
+        aug = pricing.prorated_plan_cost(self._spans(
+            (14, "default_claude_max_5x"), opening=datetime(2026, 8, 1, tzinfo=UTC),
+        ))
+        assert present(feb) > present(aug)
+        assert feb == pytest.approx(100.0 * 14 / 28)
+        assert aug == pytest.approx(100.0 * 14 / 31)
+
+    def test_a_stretch_crossing_a_month_boundary_is_split_at_it(self):
+        """The last week of February plus the first of March, each on its own."""
+        cost = pricing.prorated_plan_cost(self._spans(
+            (14, "default_claude_max_5x"), opening=datetime(2026, 2, 22, tzinfo=UTC),
+        ))
+        assert cost == pytest.approx(100.0 * 7 / 28 + 100.0 * 7 / 31)
+
+    def test_an_unpriced_stretch_contributes_nothing_but_does_not_void_the_span(self):
+        cost = pricing.prorated_plan_cost(
+            self._spans((14, None), (14, "default_claude_max_20x")),
         )
         assert cost == pytest.approx(100.0)
 
-    def test_a_month_with_nothing_priced_is_none_not_zero(self):
-        """A zero beside real spend reads as a month that was free."""
-        assert pricing.prorated_plan_cost(self._spans((28, None)), *self.FEB) is None
-        assert pricing.prorated_plan_cost([], *self.FEB) is None
+    def test_nothing_priced_is_none_not_zero(self):
+        """A zero beside real spend reads as a span that was free."""
+        assert pricing.prorated_plan_cost(self._spans((28, None))) is None
+        assert pricing.prorated_plan_cost([]) is None
 
-    def test_an_unpriced_tier_does_not_make_a_month_free(self):
-        assert pricing.prorated_plan_cost(
-            self._spans((28, "default_raven")), *self.FEB,
-        ) is None
+    def test_an_unpriced_tier_does_not_make_a_span_free(self):
+        assert pricing.prorated_plan_cost(self._spans((28, "default_raven"))) is None
 
     def test_a_team_seat_prices_as_the_seat_not_its_limit_bucket(self):
         """The seat carries a personal plan's bucket and costs its own money."""
         assert pricing.prorated_plan_cost(
-            self._seat(28, "team_tier_1"), *self.FEB,
+            self._seat(28, "team_tier_1"),
         ) == pytest.approx(100.0)
 
     def test_a_seat_nothing_prices_falls_back_to_its_bucket(self):
         """Better the limit bucket's price than no figure at all."""
         assert pricing.prorated_plan_cost(
-            self._seat(28, "team_tier_9"), *self.FEB,
+            self._seat(28, "team_tier_9"),
         ) == pytest.approx(100.0)
 
-    def test_an_empty_span_is_none(self):
-        assert pricing.prorated_plan_cost(
-            self._spans((28, "default_claude_pro")), self.FEB[1], self.FEB[0],
-        ) is None
+    def test_a_backwards_stretch_contributes_nothing(self):
+        at = self.FEB.timestamp()
+        tiers = {"organization_rate_limit_tier": "default_claude_pro"}
+        assert pricing.prorated_plan_cost([(at + 86400, at, tiers)]) is None
 
     def test_each_stretch_pays_the_rate_in_force_when_it_started(self, monkeypatch):
         """A span crossing a price rise pays the old rate up to it."""
@@ -2745,7 +2768,7 @@ class TestProratedPlanCost:
             {"effective": "2026-02-15", "plans": {"p": 40.0}},
         ])
         monkeypatch.setattr(pricing, "_PLAN_INDEX", None)
-        cost = pricing.prorated_plan_cost(self._spans((14, "p"), (14, "p")), *self.FEB)
+        cost = pricing.prorated_plan_cost(self._spans((14, "p"), (14, "p")))
         assert cost == pytest.approx(30.0)
 
 
@@ -2801,3 +2824,40 @@ class TestTierFrom:
         row = {"user_rate_limit_tier": None, "organization_rate_limit_tier": "o"}
         assert pricing.tier_from(row) == cache_db.effective_limit_tier(row)
         assert pricing.tier_from(row) == tier_timeline.effective_tier(row)
+
+
+class TestMonthsInSpan:
+    """How long a span is, in the unit the subscription is billed by."""
+
+    def test_a_whole_month_is_one(self):
+        assert pricing.months_in_span(
+            datetime(2026, 2, 1, tzinfo=UTC), datetime(2026, 3, 1, tzinfo=UTC),
+        ) == pytest.approx(1.0)
+
+    def test_a_fortnight_is_a_bigger_fraction_of_february_than_of_august(self):
+        feb = pricing.months_in_span(
+            datetime(2026, 2, 1, tzinfo=UTC), datetime(2026, 2, 15, tzinfo=UTC),
+        )
+        aug = pricing.months_in_span(
+            datetime(2026, 8, 1, tzinfo=UTC), datetime(2026, 8, 15, tzinfo=UTC),
+        )
+        assert feb == pytest.approx(14 / 28)
+        assert aug == pytest.approx(14 / 31)
+
+    def test_it_sums_across_a_boundary(self):
+        assert pricing.months_in_span(
+            datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 3, 1, tzinfo=UTC),
+        ) == pytest.approx(2.0)
+
+    def test_an_empty_or_backwards_span_is_zero(self):
+        one = datetime(2026, 2, 1, tzinfo=UTC)
+        assert pricing.months_in_span(one, one) == 0.0
+        assert pricing.months_in_span(datetime(2026, 3, 1, tzinfo=UTC), one) == 0.0
+
+    def test_it_agrees_with_what_the_pricing_bills(self):
+        """A count printed beside a cost must measure the span the same way."""
+        start, end = datetime(2026, 2, 1, tzinfo=UTC), datetime(2026, 4, 1, tzinfo=UTC)
+        spans = [(start.timestamp(), end.timestamp(),
+                  {"organization_rate_limit_tier": "default_claude_max_5x"})]
+        cost = present(pricing.prorated_plan_cost(spans))
+        assert cost == pytest.approx(100.0 * pricing.months_in_span(start, end))

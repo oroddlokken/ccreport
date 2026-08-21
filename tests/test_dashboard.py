@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 import server_fixture as sf
+from _narrow import present
 from fastapi.testclient import TestClient
 
 from ccreport import pricing
@@ -571,3 +572,161 @@ class TestPlanColumn:
     def test_the_column_is_absent_from_the_other_tables(self, app, client):
         body = client.get("/?days=90&by=model").text
         assert body.count(">Plan</th>") == 1
+
+
+class TestPlanTile:
+    """What the spend was worth against the subscription that bought it."""
+
+    def _declare(self, app, account="work", tier="default_claude_max_5x"):
+        from ccreport import tier_timeline
+        from ccreport.server import db
+
+        conn = app.state.db.connect()
+        db.set_account_tiers(conn, account, [tier_timeline.Entry(
+            ts=datetime(2020, 1, 1, tzinfo=UTC).timestamp(), account=account,
+            organization_rate_limit_tier=tier,
+        )], 1.0)
+        conn.commit()
+
+    def _tile(self, view):
+        return next((t for t in view.tiles if t.label == "Value vs plan"), None)
+
+    def test_no_declared_plan_shows_no_tile(self, app):
+        """Not a zero and not an infinite multiple: there is nothing to divide by."""
+        assert self._tile(_view(app)) is None
+
+    def test_it_shows_the_multiple_over_the_plan(self, app):
+        self._declare(app)
+        view = _view(app)
+        tile = present(self._tile(view))
+        plan = dashboard._Plans(
+            app.state.db.connect(), {row.account for row in view.accounts},
+        ).cost(*dashboard.range_bounds(30, NOW))
+        assert tile.value == f"{view.total_cost / present(plan):.1f}x"
+
+    def test_the_subline_names_a_quantity_of_subscription_not_a_price(self, app):
+        """"the $140 plan" reads as a plan costing $140; it is a share of months."""
+        self._declare(app)
+        tile = present(self._tile(_view(app)))
+        assert "of subscription across" in tile.subline
+        assert "valued at API rates" in tile.subline
+        assert "30 days" in tile.subline
+
+    def test_a_span_worth_more_than_its_plan_says_more(self, app, monkeypatch):
+        """The fixture corpus is cents, so the plan has to be cheaper still."""
+        monkeypatch.setattr(pricing, "PLAN_PRICES", [
+            {"effective": "2020-01-01", "plans": {"default_claude_pro": 0.01}},
+        ])
+        monkeypatch.setattr(pricing, "_PLAN_INDEX", None)
+        self._declare(app, tier="default_claude_pro")
+        assert "more than the" in present(self._tile(_view(app))).subline
+
+    def test_it_sits_after_the_five_that_were_there(self, app):
+        self._declare(app)
+        assert [t.label for t in _view(app).tiles][-1] == "Value vs plan"
+
+    @pytest.mark.parametrize("dimension", ["day", "week", "month", "account"])
+    def test_a_page_about_a_whole_span_or_one_account_says_nothing_extra(
+        self, app, dimension,
+    ):
+        """Both sides cover the same ground, so no qualifier is needed."""
+        self._declare(app)
+        assert dimension not in dashboard.SLICE_SCOPES
+        base = _view(app)
+        # The whole-server page has no account table; accounts are a column.
+        key = (base.accounts[0].account if dimension == "account"
+               else base.breakdowns[dimension][0]["key"])
+        view = dashboard.build(
+            app.state.db.connect(), 30, NOW, dashboard.Scope(dimension, key),
+        )
+        tile = self._tile(view)
+        if tile is not None:
+            assert " alone" not in tile.subline
+
+    @pytest.mark.parametrize("dimension", ["model", "project", "machine"])
+    def test_a_slice_of_spend_shows_it_and_says_it_is_a_slice(self, app, dimension):
+        """One project outrunning the plan by itself is the interesting case."""
+        self._declare(app)
+        assert dimension in dashboard.SLICE_SCOPES
+        view = dashboard.build(
+            app.state.db.connect(), 30, NOW,
+            dashboard.Scope(dimension, _view(app).breakdowns[dimension][0]["key"]),
+        )
+        tile = present(self._tile(view))
+        assert f"this {dimension} alone" in tile.subline
+
+    def test_an_account_page_prices_that_accounts_plan_alone(self, app):
+        self._declare(app, "work")
+        self._declare(app, "home", "default_claude_pro")
+        whole = present(dashboard._Plans(
+            app.state.db.connect(), {"work@example.net", "home@example.net"},
+        ).cost(*dashboard.range_bounds(30, NOW)))
+        just_work = present(dashboard._Plans(
+            app.state.db.connect(), {"work@example.net"},
+        ).cost(*dashboard.range_bounds(30, NOW)))
+        assert just_work < whole
+
+    def test_the_page_draws_it(self, app, client):
+        self._declare(app)
+        assert "Value vs plan" in client.get("/?days=30").text
+
+    def test_a_month_row_carries_the_multiple_and_what_it_saved(self, app):
+        self._declare(app)
+        rows = _view(app, 90).breakdowns["month"]
+        for row in rows:
+            assert row["plan_multiple"] == pytest.approx(row["cost"] / row["plan_usd"])
+            assert row["plan_saved"] == pytest.approx(row["cost"] - row["plan_usd"])
+
+    def test_the_month_table_heads_the_column(self, app, client):
+        self._declare(app)
+        assert ">vs plan</th>" in client.get("/?days=90&by=month").text
+
+    def test_the_saved_amount_converts_to_nok(self, app, monkeypatch):
+        """At the span's own Oslo date, under the page's MVA setting."""
+        from ccreport import exchange
+
+        monkeypatch.setattr(
+            exchange, "read_rates_since",
+            lambda since: {NOW.date().isoformat(): 10.0},
+        )
+        self._declare(app)
+        tile = present(self._tile(_view(app)))
+        assert "kr " in tile.subline
+
+    def test_no_rate_leaves_the_nok_out_rather_than_guessing(self, app):
+        self._declare(app)
+        assert "kr " not in present(self._tile(_view(app))).subline
+
+    def test_a_span_worth_less_than_its_plan_says_less(self, app):
+        """Not "-$99.93 more than", which prints a sign where a word belongs."""
+        self._declare(app)
+        tile = present(self._tile(_view(app)))
+        assert "less than the" in tile.subline
+        assert "-$" not in tile.subline
+
+    def test_a_month_row_carries_its_saved_amount_in_kroner(self, app, monkeypatch):
+        """At the month's own last day, not at today's rate."""
+        from ccreport import exchange
+
+        monkeypatch.setattr(
+            exchange, "read_rates_since", lambda since: {NOW.date().isoformat(): 10.0},
+        )
+        self._declare(app)
+        rows = [r for r in _view(app, 90).breakdowns["month"] if r.get("plan_saved_nok")]
+        assert rows
+        for row in rows:
+            assert row["plan_saved_nok"] == pytest.approx(row["plan_saved"] * 10.0 * 1.25)
+
+    def test_no_rate_leaves_a_month_row_without_kroner(self, app):
+        rows = _view(app, 90).breakdowns["month"]
+        assert rows
+        assert all(row.get("plan_saved_nok") is None for row in rows)
+
+    @pytest.mark.parametrize(
+        ("months", "days", "expected"),
+        [(6.7, 203, "6.7 months"), (1.05, 32, "1.1 months"),
+         (1.0, 31, "31 days"), (0.26, 8, "8 days")],
+    )
+    def test_the_span_reads_in_whichever_unit_is_a_quantity(self, months, days, expected):
+        """"0.3 months" is a fraction to convert; "8 days" is already converted."""
+        assert dashboard._fmt_span(months, days) == expected

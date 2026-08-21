@@ -1,8 +1,11 @@
-"""What the merged spend page shows: a headline, five tiles, a chart, a table.
+"""What the merged spend page shows: a headline, the tiles, a chart, a table.
 
 Folds the same records `ccreport --server` renders, through the same
-`aggregate.py`. What the page adds is the five stat tiles and the shapes uPlot
-wants.
+`aggregate.py`. What the page adds is the stat tiles and the shapes uPlot
+wants. Five of those tiles are about the records themselves; the sixth sets
+what they were worth against what the subscription behind them cost, and shows
+only where a plan is declared and the page is about the whole of what it
+bought.
 
 Everything a restricted machine did not opt in to appears as one row per
 account, with its real cost and token counts and no name of its own.
@@ -271,6 +274,78 @@ def _tiles(merged: list[reports.MergedRecord], total_cost: float) -> list[Tile]:
     ]
 
 
+SLICE_SCOPES = ("model", "project", "machine")
+"""Pages whose spend is one part of what the subscription bought.
+
+The multiple is worth showing there — one project outrunning the whole plan by
+itself is the interesting case — but the denominator is still the entire
+subscription, so the subline has to say the numerator is a slice. Everything
+else (the server-wide page, one account, one span of time) compares two things
+that cover the same ground and needs no such qualifier.
+"""
+
+
+def _in_nok(usd: float, nok: aggregate.NokCtx, on: date) -> float | None:
+    """*usd* in kroner at *on*'s rate, or None where this server has none.
+
+    Under the page's own MVA setting, so a figure derived here agrees with
+    every converted figure drawn beside it.
+    """
+    rate, _ = nok.rate_for(on)
+    if rate is None:
+        return None
+    return usd * rate * (1.25 if nok.mva else 1.0)
+
+
+def _fmt_span(months: float, days: int) -> str:
+    """How long a span is, in whichever unit reads as a quantity at that scale.
+
+    "0.3 months" is a fraction a reader has to convert; "8 days" is the same
+    span already converted. The cut is just above one month, so a span of
+    roughly a month is called one rather than 31 days.
+    """
+    return f"{months:.1f} months" if months >= 1.05 else f"{days} days"
+
+
+def _plan_tile(total_cost: float, plan_usd: float, nok: aggregate.NokCtx,
+               on: date, slice_of: str | None = None, span: str = "") -> Tile:
+    """The valuation set against what the subscription cost over the same span.
+
+    A multiple as the number, because "44x" is the answer and a dollar figure
+    is the evidence. The subline says what is being compared: the valuation
+    prices every call at API list rates, so it is what this work would have
+    cost through the API and not money anyone was charged.
+
+    *span* is how long the page covers, so a figure that sums several months of
+    subscription cannot be read as one month's price — which is what "$934
+    plan" was doing. *slice_of* names the dimension when the page is about one
+    part of that spend, and the subline then says so. Without it the same sentence would
+    read identically on a page about one model and a page about everything,
+    which is the reading that turns a true number into a false claim.
+
+    NOK converts the saved amount alone, at the span's own Oslo date and under
+    the page's own MVA setting, so it agrees with every other NOK figure drawn
+    beside it.
+    """
+    multiple = (total_cost / plan_usd) if plan_usd > 0 else 0.0
+    saved = total_cost - plan_usd
+    # A quiet span is worth less than the plan it ran on, and the sentence has
+    # to say so: "-$99.93 more than" is a sign printed where a word belongs.
+    direction = "more" if saved >= 0 else "less"
+    amount = _in_nok(abs(saved), nok, on)
+    in_nok = "" if amount is None else f" (kr {amount:,.0f})"
+    # "the $140 plan" reads as a plan that costs $140. It is the share of each
+    # month's subscription this span covers, prorated by days, so the sentence
+    # has to name it as a quantity of subscription rather than as a price.
+    alone = f" — this {slice_of} alone" if slice_of else ""
+    over = f" across {span}" if span else ""
+    return Tile(
+        "Value vs plan", f"{multiple:.1f}x",
+        f"{_fmt_usd(abs(saved))}{in_nok} {direction} than the {_fmt_usd(plan_usd)} "
+        f"of subscription{over}{alone}, valued at API rates",
+    )
+
+
 def _account_rows(report, total_cost: float) -> list[AccountRow]:
     return [
         AccountRow(
@@ -439,35 +514,48 @@ def _month_bounds(key: str) -> tuple[datetime, datetime]:
     return start, end
 
 
-def _plan_costs(conn, months: list[str], accounts: set[str]) -> dict[str, float]:
-    """What the plans behind *accounts* cost in each of *months*, in USD.
+class _Plans:
+    """One page's declared timelines, ready to price any span the page shows.
 
-    Summed across the accounts present, so the whole-server page sets one
-    figure against one valuation and an account page sets that account's.
-    *accounts* is display names, which is what a breakdown row groups on and
-    all a folded record carries.
-
-    A month no account has a declared plan for is absent rather than zero: a
-    column showing $0.00 beside real spend reads as a month that was free.
+    Built once per render: the timeline is one query however many spans are
+    priced against it, and a page prices one per month plus one for its own
+    range.
     """
-    aliases = db.account_aliases(conn)
-    entries = db.account_tiers(conn)
-    if not entries:
-        return {}
-    timeline = tier_timeline.TierTimeline(entries)
-    wanted = [
-        row["account_uuid"] for row in reports.account_overview(conn)
-        if reports.account_display(row["account_uuid"], row["label"], aliases) in accounts
-    ]
-    costs: dict[str, float] = {}
-    for key in months:
-        start, end = _month_bounds(key)
-        for uuid in wanted:
-            spans = timeline.stretches(uuid, start.timestamp(), end.timestamp())
-            usd = pricing.prorated_plan_cost(spans, start, end)
+
+    def __init__(self, conn, accounts: set[str]) -> None:
+        entries = db.account_tiers(conn)
+        self._timeline = tier_timeline.TierTimeline(entries)
+        aliases = db.account_aliases(conn)
+        # Display names, because that is what a folded record carries and what
+        # a breakdown row groups on. The timeline is keyed by uuid, so the two
+        # meet here and nowhere else.
+        self._uuids = [
+            row["account_uuid"] for row in reports.account_overview(conn)
+            if reports.account_display(row["account_uuid"], row["label"], aliases) in accounts
+        ] if entries else []
+
+    def cost(self, start: datetime, end: datetime) -> float | None:
+        """What the plans behind this page's accounts cost over *start*..*end*.
+
+        Summed across them, so the whole-server page sets one figure against
+        one valuation and an account page sets that account's.
+
+        Prorated by calendar month rather than over the span, so a seven-day
+        range costs a quarter of a month and half a year costs six of them.
+
+        None where no account has a declared plan covering the span, which a
+        caller must not turn into zero: $0.00 beside real spend reads as a span
+        that was free, and a multiple over it reads as infinite.
+        """
+        if end <= start:
+            return None
+        total, priced = 0.0, False
+        for uuid in self._uuids:
+            spans = self._timeline.stretches(uuid, start.timestamp(), end.timestamp())
+            usd = pricing.prorated_plan_cost(spans)
             if usd is not None:
-                costs[key] = costs.get(key, 0.0) + usd
-    return costs
+                total, priced = total + usd, True
+        return total if priced else None
 
 
 _CACHE: dict[tuple, tuple[tuple, Dashboard]] = {}
@@ -565,14 +653,29 @@ def build(conn, days: int, now: datetime | None = None,
     }
     # Attached after the fold rather than inside it: a plan cost is not a
     # property of any record, and breakdown() sees neither the connection the
-    # timeline is read from nor which account a folded row belongs to. One call
-    # for every month on the page, because the timeline is one query however
-    # many months are priced against it.
-    month_rows = breakdowns.get("month", [])
-    plan_costs = _plan_costs(conn, [row["key"] for row in month_rows], set(accounts))
-    for row in month_rows:
-        if row["key"] in plan_costs:
-            row["plan_usd"] = plan_costs[row["key"]]
+    # timeline is read from nor which account a folded row belongs to.
+    plans = _Plans(conn, set(accounts))
+    for row in breakdowns.get("month", []):
+        opens, closes = _month_bounds(row["key"])
+        usd = plans.cost(opens, closes)
+        if usd is not None:
+            row["plan_usd"] = usd
+            row["plan_multiple"] = (row["cost"] / usd) if usd > 0 else 0.0
+            row["plan_saved"] = row["cost"] - usd
+            # The month's own last day, as its records converted at their own
+            # Oslo dates: a row's kroner must not be read off today's rate.
+            row["plan_saved_nok"] = _in_nok(
+                row["plan_saved"], nok, (closes - timedelta(days=1)).date(),
+            )
+
+    tiles = _tiles(merged, total_cost)
+    plan_usd = plans.cost(start, end)
+    if plan_usd is not None:
+        tiles.append(_plan_tile(
+            total_cost, plan_usd, nok, (end - timedelta(days=1)).date(),
+            scope.dimension if scope and scope.dimension in SLICE_SCOPES else None,
+            _fmt_span(pricing.months_in_span(start, end), (end - start).days),
+        ))
 
     return Dashboard(
         days=days,
@@ -582,7 +685,7 @@ def build(conn, days: int, now: datetime | None = None,
         total_cost_nok=account_report.total.cost_nok,
         nok_enabled=nok.enabled,
         accounts=_account_rows(account_report, total_cost),
-        tiles=_tiles(merged, total_cost),
+        tiles=tiles,
         chart_days=[] if scope is not None else axis,
         series=[] if scope is not None else _chart(merged, axis, accounts),
         breakdowns=breakdowns,

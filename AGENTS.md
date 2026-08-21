@@ -230,6 +230,13 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   priced over hours and a grouped row has folded the hour away. `/limits` is
   registered before the `/{dimension}/{key}` catch-all, and one window's page
   carries the model and the account in the query string: both can hold a slash
+- The month breakdown and the "Value vs plan" tile both price a span through
+  `dashboard._Plans`, which reads the declared timeline once per render. The
+  tile shows wherever a plan is declared; on the `SLICE_SCOPES` pages — model,
+  project, machine — the numerator is one part of what the subscription bought
+  and the denominator is all of it, so the subline says "this project alone".
+  Without that qualifier the sentence reads identically on a page about one
+  model and a page about everything
 - Which rows a report has is `aggregate.py`; what they look like is
   `ccreport.py`. The row builders there are the one place the rollup path and
   the full record path meet, and the server folds records through the same
@@ -425,7 +432,8 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
 - A month that changed plan mid-cycle is billed prorated, so it is priced that
   way: `tier_timeline.TierTimeline.stretches` cuts a span at every declared
   change and `pricing.prorated_plan_cost` weights each stretch's monthly rate by
-  its share of the span. The split is two functions because neither module may
+  its share of the calendar month it falls in — never by its share of the
+  caller's span, which would charge a week a full month and half a year one. The split is two functions because neither module may
   gain the other's imports — `tier_timeline` holds nothing but the stdlib, and
   the prices belong in `pricing.py`. A stretch carries all three tier fields
   rather than the resolved one: the field that prices a stretch is not the field
