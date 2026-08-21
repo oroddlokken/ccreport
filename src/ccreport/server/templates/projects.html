@@ -19,7 +19,9 @@ field to go back to them.</p>
     {% for p in projects %}
     <tr>
       <td>{{ p.machine }}</td>
-      <td class="mono">{{ p.project }}</td>
+      {# The displayed name, not the pushed one: /{dimension}/{key} matches what
+         the breakdown shows, so an aliased row linked by its pushed name 404s. #}
+      <td class="mono"><a href="/project/{{ (p.alias or p.project) | urlencode }}">{{ p.project }}</a></td>
       <td class="num" data-int="{{ p.records }}">{{ "{:,}".format(p.records) }}</td>
       <td class="num" data-usd="{{ p.cost }}">{{ "${:,.2f}".format(p.cost) }}</td>
       <td>

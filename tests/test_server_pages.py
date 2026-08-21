@@ -578,6 +578,41 @@ class TestProjectsPage:
     def test_the_nav_reaches_it(self, client):
         assert 'href="/settings/projects"' in client.get("/settings/machines").text
 
+    def test_each_row_links_to_that_projects_page(self, client):
+        self._both(client)
+        body = client.get("/settings/projects").text
+        assert 'href="/project/project1"' in body
+        assert 'href="/project/project2"' in body
+
+    def test_an_aliased_row_links_by_the_name_the_page_draws(self, client):
+        """The catch-all matches the displayed name; the pushed one 404s."""
+        self._both(client)
+        self._rename(client, "neo", "project1", "shared")
+        body = client.get("/settings/projects").text
+        assert 'href="/project/shared"' in body
+        assert 'href="/project/project1"' not in body
+
+    def test_the_link_reaches_a_page_with_that_projects_rows(self, client):
+        self._both(client)
+        self._rename(client, "neo", "project1", "shared")
+        resp = client.get("/project/shared")
+        assert resp.status_code == 200
+        assert "shared" in resp.text
+
+    def test_a_slashed_name_produces_a_link_that_resolves(self, client):
+        """The filter leaves the slash alone and the route takes a path, so it works."""
+        self._push(client, "neo", "org/repo")
+        assert 'href="/project/org/repo"' in client.get("/settings/projects").text
+        resp = client.get("/project/org/repo")
+        assert resp.status_code == 200
+        assert "org/repo" in resp.text
+
+    def test_the_cell_still_shows_the_pushed_name(self, client):
+        """The column is headed "Pushed as"; the link is where it goes, not what it is."""
+        self._both(client)
+        self._rename(client, "neo", "project1", "shared")
+        assert ">project1</a>" in client.get("/settings/projects").text
+
     def test_one_name_on_both_rows_draws_one_project(self, client):
         self._both(client)
         self._rename(client, "neo", "project1", "shared")
