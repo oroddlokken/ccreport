@@ -11,7 +11,7 @@ they arrived with. Save an empty field to go back to it.</p>
     <tr>
       <th scope="col">Account</th><th scope="col">Pushed as</th>
       <th scope="col" class="num">Records</th><th scope="col" class="num">Cost</th>
-      <th scope="col">Name</th>
+      <th scope="col">Plan</th><th scope="col">Name</th>
     </tr>
   </thead>
   <tbody>
@@ -21,6 +21,10 @@ they arrived with. Save an empty field to go back to it.</p>
       <td>{{ a.label or "—" }}</td>
       <td class="num" data-int="{{ a.records }}">{{ "{:,}".format(a.records) }}</td>
       <td class="num" data-usd="{{ a.cost }}">{{ "${:,.2f}".format(a.cost) }}</td>
+      <td>
+        <a href="/settings/accounts/{{ a.account_uuid | urlencode }}/tiers">{{ a.tier or "Declare" }}</a>
+        {% if a.declared %}<span class="dim">({{ a.declared }})</span>{% endif %}
+      </td>
       <td>
         <form method="post" action="/settings/accounts/{{ a.account_uuid | urlencode }}/alias" class="rename">
           <input name="alias" value="{{ a.alias or '' }}" autocomplete="off"

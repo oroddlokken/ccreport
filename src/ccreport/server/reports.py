@@ -9,10 +9,11 @@ which account each row came from.
 from __future__ import annotations
 
 import sqlite3
+import time
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 
-from ccreport import aggregate, exchange
+from ccreport import aggregate, exchange, tier_timeline
 from ccreport.aggregate import NokCtx, ReportRows, Row, UsageRecord
 from ccreport.server import db
 from ccreport.server.db import REC_COLS
@@ -31,11 +32,18 @@ class Filters:
 
 @dataclass
 class MergedRecord:
-    """A record with the two things a local one has no room for."""
+    """A record with the three things a local one has no room for.
+
+    tier is the plan the account was on when the record was written, declared
+    off its billing receipts rather than pushed. None where nothing declares
+    one — which is every account until someone types a timeline in, and every
+    moment older than the first receipt after they do.
+    """
 
     record: UsageRecord
     machine: str
     account: str
+    tier: str | None = None
 
 
 _SELECT = ", ".join(REC_COLS)
@@ -154,6 +162,7 @@ def load(conn: sqlite3.Connection, filters: Filters | None = None) -> list[Merge
     filters = filters or Filters()
     aliases = db.account_aliases(conn)
     proj_aliases = db.project_aliases(conn)
+    tiers = tier_timeline.TierTimeline(db.account_tiers(conn))
     clause, params = _where(
         filters, db.accounts_with_alias(conn, filters.account),
         db.projects_with_alias(conn, filters.project),
@@ -172,7 +181,9 @@ def load(conn: sqlite3.Connection, filters: Filters | None = None) -> list[Merge
         if rec["dk"] and key in seen:
             continue
         seen.add(key)
-        merged.append(_as_merged(rec, labels.get(machine_id, machine_id), aliases, proj_aliases))
+        merged.append(
+            _as_merged(rec, labels.get(machine_id, machine_id), aliases, proj_aliases, tiers)
+        )
     merged.sort(key=lambda m: m.record.timestamp)
     return merged
 
@@ -180,6 +191,7 @@ def load(conn: sqlite3.Connection, filters: Filters | None = None) -> list[Merge
 def _as_merged(
     rec: dict, machine_label: str, aliases: dict[str, str],
     proj_aliases: dict[tuple[str, str], str],
+    tiers: tier_timeline.TierTimeline | None = None,
 ) -> MergedRecord:
     """One stored row as the record the aggregation understands.
 
@@ -213,7 +225,10 @@ def _as_merged(
     # makes the daily and monthly reports bucket by it rather than by the
     # server's midnight.
     record._day = rec["day"]  # noqa: SLF001 - the memo is the point
-    return MergedRecord(record=record, machine=machine_label, account=account)
+    return MergedRecord(
+        record=record, machine=machine_label, account=account,
+        tier=tiers.at(rec["account_uuid"], rec["ts"]) if tiers else None,
+    )
 
 
 GROUP_COLS = ("machine_id", "account_uuid", "account_label", "project", "model", "day", "oslo_date")
@@ -276,6 +291,7 @@ def load_grouped(conn: sqlite3.Connection, filters: Filters | None = None) -> li
     filters = filters or Filters()
     aliases = db.account_aliases(conn)
     proj_aliases = db.project_aliases(conn)
+    tiers = tier_timeline.TierTimeline(db.account_tiers(conn))
     aliased = db.accounts_with_alias(conn, filters.account)
     pairs = db.projects_with_alias(conn, filters.project)
     dedup, dedup_params = _dedup_clause(filters, aliased, pairs)
@@ -285,7 +301,7 @@ def load_grouped(conn: sqlite3.Connection, filters: Filters | None = None) -> li
     ).fetchall()
 
     labels = dict(conn.execute("SELECT machine_id, label FROM machines").fetchall())
-    merged = [_as_grouped(row, labels, aliases, proj_aliases) for row in rows]
+    merged = [_as_grouped(row, labels, aliases, proj_aliases, tiers) for row in rows]
     merged.sort(key=lambda m: m.record.timestamp)
     return merged
 
@@ -293,8 +309,15 @@ def load_grouped(conn: sqlite3.Connection, filters: Filters | None = None) -> li
 def _as_grouped(
     row: tuple, labels: dict, aliases: dict[str, str],
     proj_aliases: dict[tuple[str, str], str],
+    tiers: tier_timeline.TierTimeline | None = None,
 ) -> MergedRecord:
-    """One grouped row as the record the aggregation understands."""
+    """One grouped row as the record the aggregation understands.
+
+    The tier comes off the group's earliest instant, as its price does. Every
+    row in a group shares a day, and a plan change inside one leaves the whole
+    day reading as the plan it started on — the grain a declared timeline can
+    be read at, not a rounding this builder chose.
+    """
     machine_id: str = row[0]
     account_uuid, account_label, project, model, day, oslo_date = row[1:len(GROUP_COLS)]
     first_ts, cost, calls, tokens_in, tokens_out, cache_create, cache_read = row[len(GROUP_COLS):]
@@ -319,7 +342,10 @@ def _as_grouped(
         oslo_date=date.fromisoformat(oslo_date),
     )
     record._day = day  # noqa: SLF001 - the memo is the point; see _as_merged
-    return MergedRecord(record=record, machine=labels.get(machine_id, machine_id), account=account)
+    return MergedRecord(
+        record=record, machine=labels.get(machine_id, machine_id), account=account,
+        tier=tiers.at(account_uuid, first_ts) if tiers else None,
+    )
 
 
 def account_overview(conn: sqlite3.Connection) -> list[dict]:
@@ -345,8 +371,21 @@ def account_overview(conn: sqlite3.Connection) -> list[dict]:
       GROUP BY a.account_uuid
       ORDER BY SUM(a.cost) DESC
     """, params).fetchall()  # noqa: S608 - dedup is a literal clause; its filters bind parameters
+    # The plan in force now, and how many changes are declared behind it. Off
+    # the same timeline the row builders resolve against, so the column and the
+    # charts cannot disagree about which plan an account is on.
+    entries = db.account_tiers(conn)
+    tiers = tier_timeline.TierTimeline(entries)
+    declared: dict[str, int] = {}
+    for e in entries:
+        declared[e.account] = declared.get(e.account, 0) + 1
+    now = time.time()
     return [
-        {"account_uuid": row[0], "records": row[1], "cost": row[2], "label": row[3], "alias": row[4]}
+        {
+            "account_uuid": row[0], "records": row[1], "cost": row[2],
+            "label": row[3], "alias": row[4],
+            "tier": tiers.at(row[0], now), "declared": declared.get(row[0], 0),
+        }
         for row in rows
     ]
 

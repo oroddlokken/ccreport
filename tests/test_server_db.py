@@ -309,7 +309,7 @@ class TestContentStamp:
         db.replace_file_records(conn, "m1", path, mtime_ns, size, rows, now)
 
     def test_an_empty_database_stamps_without_raising(self, conn):
-        assert db.content_stamp(conn) == (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        assert db.content_stamp(conn) == (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
     def test_naming_a_project_moves_it(self, conn):
         """A project name is a rename with no push behind it, like the other two."""

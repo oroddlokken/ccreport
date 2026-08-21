@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Plans — ccreport{% endblock %}
+{% block content %}
+<h1>Plans</h1>
+<p class="hint">Which plan {{ account.alias or account.label or account.account_uuid }} was on,
+and from when. A record carries no plan, so this is where one comes from: every stored record
+resolves against the entry in force at its timestamp. The dates come off the billing receipts —
+an upgrade bills a prorated line the day it takes effect, and a downgrade shows up as the line
+item on the next renewal.</p>
+
+<p class="hint">Saving replaces this account's whole history with what the box holds, so an empty
+box clears it. An entry naming some other account is passed over rather than filed here: paste
+one file into every account's page and each keeps its own. This account answers to
+{% for n in names %}<span class="mono">{{ n }}</span>{% if not loop.last %}, {% endif %}{% endfor %}.</p>
+
+{% if error %}
+<p class="off">{{ error }} — nothing was saved.</p>
+{% elif saved is not none %}
+<p class="notice">Saved {{ saved }} plan change{{ "" if saved == 1 else "s" }}.</p>
+{% endif %}
+{% if skipped %}
+<p class="hint">Passed over {% for n in skipped %}<span class="mono">{{ n }}</span>{% if not loop.last %}, {% endif %}{% endfor %} —
+{{ "that name is" if skipped|length == 1 else "those names are" }} not this account.</p>
+{% endif %}
+
+<form method="post" class="timeline" action="/settings/accounts/{{ account.account_uuid | urlencode }}/tiers">
+  <textarea name="timeline" rows="20" class="mono" spellcheck="false"
+            aria-label="Plan history as TOML"
+            placeholder="[[tier]]&#10;at = 2026-02-03T21:03:33Z&#10;account = &quot;{{ names[0] }}&quot;&#10;organization_rate_limit_tier = &quot;default_claude_max_5x&quot;">{{ text }}</textarea>
+  <p><button type="submit">Save</button>
+     <a class="ghost" href="/settings/accounts">Back to accounts</a></p>
+</form>
+{% endblock %}

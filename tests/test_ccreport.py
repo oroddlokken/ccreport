@@ -948,6 +948,55 @@ class TestAccountTimelineTiers:
     def test_an_empty_log_has_no_tier(self):
         assert self._at(self._tl(), 1500.0) is None
 
+    def test_a_later_event_with_no_tier_does_not_clear_the_one_before_it(self):
+        """Silence, not an observation that the account has no tier."""
+        tl = self._tl(
+            (1000.0, None, "default_claude_max_20x"),
+            (2000.0, None, None),
+        )
+        assert self._at(tl, 2500.0) == "default_claude_max_20x"
+
+    def test_a_reading_still_replaces_the_one_carried(self):
+        tl = self._tl(
+            (1000.0, None, "default_claude_max_20x"),
+            (2000.0, None, None),
+            (3000.0, None, "default_claude_max_5x"),
+        )
+        assert self._at(tl, 2500.0) == "default_claude_max_20x"
+        assert self._at(tl, 3500.0) == "default_claude_max_5x"
+
+    def test_a_tier_is_never_carried_across_a_login(self):
+        """Two logins are two entitlements; one says nothing about the other."""
+        tl = ccr.AccountTimeline([
+            {
+                "ts": ts, "account_uuid": uuid, "email": f"{uuid}@example.net",
+                "organization_uuid": None, "organization_name": None,
+                "seat_tier": None, "user_rate_limit_tier": None,
+                "organization_rate_limit_tier": org,
+            }
+            for ts, uuid, org in [
+                (1000.0, "u-work", "default_raven"),
+                (2000.0, "u-home", None),
+            ]
+        ])
+        assert self._at(tl, 2500.0) is None
+
+    def test_a_login_switched_back_finds_its_own_tier_again(self):
+        tl = ccr.AccountTimeline([
+            {
+                "ts": ts, "account_uuid": uuid, "email": f"{uuid}@example.net",
+                "organization_uuid": None, "organization_name": None,
+                "seat_tier": None, "user_rate_limit_tier": None,
+                "organization_rate_limit_tier": org,
+            }
+            for ts, uuid, org in [
+                (1000.0, "u-work", "default_raven"),
+                (2000.0, "u-home", "default_claude_max_5x"),
+                (3000.0, "u-work", None),
+            ]
+        ])
+        assert self._at(tl, 3500.0) == "default_raven"
+
 
 class TestKeepAttributesAccounts:
     """The stamp and the --account filter share _keep with every other filter."""
@@ -1376,10 +1425,16 @@ class TestAdopt:
 class TestPreCaptureRecords:
     """The preview's record set, independent of whether an adoption exists."""
 
-    def _events(self, *ts):
+    def _events(self, *ts, declared=()):
+        """Captures at *ts*; anything in *declared* is a claim, not a reading."""
         return [
             {
                 "ts": t,
+                "source": (
+                    cache_db.SOURCE_ADOPT if t == cache_db.ADOPTED_TS
+                    else cache_db.SOURCE_BACKFILL if t in declared
+                    else cache_db.SOURCE_CAPTURE
+                ),
                 "account_uuid": "u",
                 "email": "e",
                 "organization_uuid": None,
@@ -1394,18 +1449,224 @@ class TestPreCaptureRecords:
     def test_no_capture_covers_nothing(self):
         """With only an adoption row there is no boundary to be older than."""
         recs = [self._at(500.0)]
-        assert ccr._pre_capture_records(recs, self._events(ccr.ADOPTED_TS)) == []
+        assert ccr._pre_capture_records(recs, self._events(cache_db.ADOPTED_TS)) == []
         assert ccr._pre_capture_records(recs, []) == []
 
     def test_the_boundary_is_the_first_capture_not_the_adoption(self):
         recs = [self._at(500.0), self._at(1500.0)]
-        events = self._events(ccr.ADOPTED_TS, 1000.0, 2000.0)
+        events = self._events(cache_db.ADOPTED_TS, 1000.0, 2000.0)
         covered = ccr._pre_capture_records(recs, events)
         assert [r.timestamp.timestamp() for r in covered] == [500.0]
 
     def test_a_record_at_the_capture_belongs_to_the_capture(self):
         recs = [self._at(1000.0)]
         assert ccr._pre_capture_records(recs, self._events(1000.0)) == []
+
+    def test_a_declared_plan_change_is_not_the_boundary(self):
+        """It claims the same pre-capture stretch the adoption covers."""
+        recs = [self._at(500.0), self._at(1500.0)]
+        events = self._events(200.0, 1000.0, declared=(200.0,))
+        covered = ccr._pre_capture_records(recs, events)
+        assert [r.timestamp.timestamp() for r in covered] == [500.0]
+
+
+class TestTiers:
+    """Plan changes declared off a receipt, for a stretch no render watched."""
+
+    TOML = """
+        [[tier]]
+        at = 2026-02-03T21:03:33Z
+        account = "me@work.example"
+        organization_rate_limit_tier = "default_claude_max_5x"
+
+        [[tier]]
+        at = 2026-04-02T00:00:00Z
+        account = "u-work"
+        organization_rate_limit_tier = "default_claude_max_20x"
+    """
+
+    @pytest.fixture(autouse=True)
+    def _never_prompts_by_accident(self, monkeypatch):
+        """A test that reaches the prompt is a test that would hang in CI."""
+
+        def _boom(_p):
+            msg = "cmd_tiers asked for confirmation unexpectedly"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr("builtins.input", _boom)
+
+    def _args(self, **kw):
+        return types.SimpleNamespace(
+            **{"file": None, "remove": False, "yes": True, **kw}
+        )
+
+    def _epoch(self, iso: str) -> float:
+        return dt.datetime.fromisoformat(iso).timestamp()
+
+    def _file(self, tmp_path, text=None):
+        path = tmp_path / "plans.toml"
+        path.write_text(self.TOML if text is None else text)
+        return str(path)
+
+    def _capture(self, uuid="u-work", email="me@work.example", ts=1000.0):
+        cache_db.record_account_event(
+            {"accountUuid": uuid, "emailAddress": email, "organizationName": "Work AS"},
+            now=ts,
+        )
+
+    def _declared(self):
+        return [
+            (e["ts"], e["account_uuid"], e["organization_rate_limit_tier"])
+            for e in cache_db.load_account_events()
+            if e["source"] == cache_db.SOURCE_BACKFILL
+        ]
+
+    def test_it_writes_a_row_per_entry(self, tmp_path, capsys):
+        self._capture()
+        ccr.cmd_tiers(self._args(file=self._file(tmp_path)))
+        assert self._declared() == [
+            (self._epoch("2026-02-03T21:03:33+00:00"), "u-work", "default_claude_max_5x"),
+            (self._epoch("2026-04-02T00:00:00+00:00"), "u-work", "default_claude_max_20x"),
+        ]
+        assert "Declare 2 plan change(s)" in capsys.readouterr().out
+
+    def test_an_email_and_a_uuid_reach_the_same_account(self, tmp_path, capsys):
+        self._capture()
+        ccr.cmd_tiers(self._args(file=self._file(tmp_path)))
+        capsys.readouterr()
+        assert {row[1] for row in self._declared()} == {"u-work"}
+
+    def test_the_identity_comes_from_the_log_not_the_file(self, tmp_path, capsys):
+        """A timeline that could introduce an identity could introduce a typo of one."""
+        self._capture()
+        ccr.cmd_tiers(self._args(file=self._file(tmp_path)))
+        capsys.readouterr()
+        declared = [
+            e for e in cache_db.load_account_events()
+            if e["source"] == cache_db.SOURCE_BACKFILL
+        ]
+        assert {e["organization_name"] for e in declared} == {"Work AS"}
+        assert {e["email"] for e in declared} == {"me@work.example"}
+
+    def test_an_account_this_machine_never_saw_is_skipped_out_loud(self, tmp_path, capsys,
+    ):
+        """One timeline covers every account; each machine has seen some."""
+        self._capture()
+        text = self.TOML + """
+            [[tier]]
+            at = 2026-05-01T00:00:00Z
+            account = "me@home.example"
+            organization_rate_limit_tier = "default_claude_pro"
+        """
+        ccr.cmd_tiers(self._args(file=self._file(tmp_path, text)))
+        out = capsys.readouterr().out
+        assert "Skipping 'me@home.example'" in out
+        assert len(self._declared()) == 2
+
+    def test_a_file_this_machine_can_place_nothing_from_writes_nothing(self, tmp_path, capsys,
+    ):
+        ccr.cmd_tiers(self._args(file=self._file(tmp_path)))
+        assert "declares nothing this machine can place" in capsys.readouterr().out
+        assert self._declared() == []
+
+    def test_re_running_the_same_file_is_a_no_op(self, tmp_path, capsys):
+        self._capture()
+        ccr.cmd_tiers(self._args(file=self._file(tmp_path)))
+        ccr.cmd_tiers(self._args(file=self._file(tmp_path)))
+        capsys.readouterr()
+        assert len(self._declared()) == 2
+
+    def test_declaring_does_not_change_who_the_machine_is(self, tmp_path, capsys):
+        self._capture()
+        ccr.cmd_tiers(self._args(file=self._file(tmp_path)))
+        capsys.readouterr()
+        assert present(cache_db.read_latest_account())["ts"] == 1000.0
+
+    def test_listing_prints_what_is_declared(self, tmp_path, capsys):
+        self._capture()
+        ccr.cmd_tiers(self._args(file=self._file(tmp_path)))
+        capsys.readouterr()
+        ccr.cmd_tiers(self._args())
+        out = capsys.readouterr().out
+        assert "2 declared plan change(s)" in out
+        assert "default_claude_max_20x" in out
+
+    def test_listing_an_empty_log_says_so(self, capsys):
+        ccr.cmd_tiers(self._args())
+        assert "No plan changes are declared" in capsys.readouterr().out
+
+    def test_remove_drops_declarations_and_keeps_captures(self, tmp_path, capsys):
+        self._capture()
+        ccr.cmd_tiers(self._args(file=self._file(tmp_path)))
+        capsys.readouterr()
+        ccr.cmd_tiers(self._args(remove=True))
+        assert "Removed 2 declared plan change(s)" in capsys.readouterr().out
+        assert self._declared() == []
+        assert present(cache_db.read_latest_account())["account_uuid"] == "u-work"
+
+    def test_remove_with_nothing_declared_says_so(self, capsys):
+        ccr.cmd_tiers(self._args(remove=True))
+        assert "Nothing to remove" in capsys.readouterr().out
+
+    def test_an_unreadable_file_exits_one(self, tmp_path, capsys):
+        with pytest.raises(SystemExit) as exc:
+            ccr.cmd_tiers(self._args(file=str(tmp_path / "absent.toml")))
+        assert exc.value.code == 1
+        assert "absent.toml" in capsys.readouterr().err
+
+    def test_a_malformed_file_exits_one_naming_the_entry(self, tmp_path, capsys):
+        with pytest.raises(SystemExit) as exc:
+            ccr.cmd_tiers(self._args(
+                file=self._file(tmp_path, '[[tier]]\naccount = "u-work"\n'),
+            ))
+        assert exc.value.code == 1
+        assert "missing 'at'" in capsys.readouterr().err
+
+    def test_declining_the_prompt_writes_nothing(self, tmp_path, monkeypatch, capsys):
+        self._capture()
+        monkeypatch.setattr("builtins.input", lambda _p: "n")
+        ccr.cmd_tiers(self._args(file=self._file(tmp_path), yes=False))
+        assert "Aborted." in capsys.readouterr().out
+        assert self._declared() == []
+
+    def test_accepting_the_prompt_writes(self, tmp_path, monkeypatch, capsys):
+        self._capture()
+        monkeypatch.setattr("builtins.input", lambda _p: "y")
+        ccr.cmd_tiers(self._args(file=self._file(tmp_path), yes=False))
+        capsys.readouterr()
+        assert len(self._declared()) == 2
+
+
+class TestKnownAccounts:
+    """Which names a timeline may use to reach an account this machine has seen."""
+
+    def _event(self, uuid, email, org="Org"):
+        return {
+            "ts": 1.0, "source": cache_db.SOURCE_CAPTURE, "account_uuid": uuid,
+            "email": email, "organization_uuid": None, "organization_name": org,
+        }
+
+    def test_a_uuid_and_an_email_both_reach_it(self):
+        known = ccr._known_accounts([self._event("u1", "me@example.net")])
+        assert set(known) == {"u1", "me@example.net"}
+
+    def test_an_address_two_accounts_share_reaches_neither(self):
+        """The case the organization fields exist to separate."""
+        known = ccr._known_accounts([
+            self._event("u1", "me@example.net", "Work AS"),
+            self._event("u2", "me@example.net", "Personal"),
+        ])
+        assert set(known) == {"u1", "u2"}
+
+    def test_an_account_with_no_email_is_still_reachable_by_uuid(self):
+        assert set(ccr._known_accounts([self._event("u1", None)])) == {"u1"}
+
+    def test_the_newest_row_supplies_the_identity(self):
+        """A login that changed address is the address it changed to."""
+        known = ccr._known_accounts([
+            self._event("u1", "old@example.net"), self._event("u1", "new@example.net"),
+        ])
+        assert known["u1"]["email"] == "new@example.net"
 
 
 class TestSameAccount:

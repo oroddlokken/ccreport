@@ -372,10 +372,10 @@ new `CREATE TABLE` there gets a row here.
 | `ccreport_orphan_costs` | All-time cost of records whose JSONL is gone, pre-summed per `(dir_prefix, project, cwd, repo)`. Orphans are most of `ccreport_records` and none can ever change, but `all_time` has no window to bound the walk. Override rules are resolved at read time, so a `ccreport merge` re-groups with no rebuild. Valid only against `meta.ccreport_orphan_fp` | pricing.py |
 | `project_overrides` | Manual project-grouping rules (`name` / `remote` / `cwd_prefix` → target), applied by every reader | ccreport.py (write), project_identity.py (read) |
 | `project_scopes` | The resolved `(name, prefixes)` scope per cwd (§5.6). No fingerprint of its own — every writer of its two inputs clears it in the same transaction | pricing.py |
-| `extra_usage_snapshots` | `(ts, spent)` history of Extra usage spend, pruned at 31 days | usage_api.py (write), statusline.py (read), ccreport.py (read, §9.6) |
+| `extra_usage_snapshots` | `(ts, spent)` history of Extra usage spend, pruned at 31 days | usage_api.py (write), statusline.py (read), ccreport.py (read, §9.7) |
 | `exchange_rates` | Norges Bank USD→NOK daily spot rates, keyed by Oslo date | exchange.py |
-| `account_events` | Append-on-change log of the signed-in Claude account and its tiers (§9) | statusline.py (write), ccreport.py (read) |
-| `rate_limit_snapshots` | Utilization samples per rate-limit window, keyed by window instance (`resets_at`); a row only when the whole-percent reading moves. Never pruned (§9.6) | statusline.py (write), ccreport.py (read) |
+| `account_events` | Append-on-change log of the signed-in Claude account and its tiers, each row marked `capture` / `backfill` / `adopt` by its `source` (§9) | statusline.py (write), ccreport.py (write §9.5–9.6, read) |
+| `rate_limit_snapshots` | Utilization samples per rate-limit window, keyed by window instance (`resets_at`); a row only when the whole-percent reading moves. Never pruned (§9.7) | statusline.py (write), ccreport.py (read) |
 
 `project_overrides` is local data by design: merges and renames live in the DB,
 not in code, so they are never committed.
@@ -1214,9 +1214,10 @@ invalidated, and `CACHE_VERSION` stays put.
 
 Rules the implementation holds to:
 
-- **The row is a claim, not a capture.** `read_latest_account()` filters
-  `ts > ADOPTED_TS`, so an adoption can never be copied into a fresh adoption,
-  and a log holding nothing but an adoption still reports as never captured
+- **The row is a claim, not a capture.** It is stored with
+  `source = 'adopt'` and `read_latest_account()` selects `source = 'capture'`,
+  so an adoption can never be copied into a fresh adoption, and a log holding
+  nothing but an adoption still reports as never captured
 - **An empty capture log is refused** (exit 1). There is no identity to adopt
   under until the status line has seen one
 - **It never overrides a real event.** The row is oldest, so every capture keeps
@@ -1240,7 +1241,73 @@ Rules the implementation holds to:
   be asked, and a copied tier would read as a reading and date a tier change to
   the wrong side of itself
 
-### 9.6 Rate-Limit Utilization History
+### 9.6 Declaring a Plan History
+
+`account_events` records a tier only where a render caught one, so a machine
+whose capture started after its first record has no entitlement behind most of
+its history and `ccreport limits` prints a fill rate with nothing to set it
+beside. The billing receipts have it: each names the line item in force for the
+period it covers, an upgrade bills a prorated line the day it takes effect, and
+a downgrade appears as the line item on the next renewal — so the receipt date
+is the change and the line item is the plan.
+
+`ccreport tiers <file.toml>` writes those dates in. The format is
+`tier_timeline.py`: one `[[tier]]` table per change, carrying `at`, `account`,
+and whichever of `seat_tier` / `user_rate_limit_tier` /
+`organization_rate_limit_tier` the plan fills. `docs/plans.example.toml` is a
+worked file.
+
+| Command | Effect |
+|---------|--------|
+| `ccreport tiers <file>` | Preview, confirm, then write one row per entry |
+| `ccreport tiers <file> --yes` | Same, without the y/N prompt |
+| `ccreport tiers` | List what is declared |
+| `ccreport tiers --remove` | Delete every declared row; captures are untouched |
+
+Rules the implementation holds to:
+
+- **A declared row is a claim, like an adoption.** It carries
+  `source = 'backfill'`, which `read_latest_account()` and
+  `_pre_capture_records` both exclude — a receipt says nothing about who was
+  signed in, and a declaration dated after the last render must not become what
+  `ccreport adopt` copies
+- **`record_account_event` cannot write these.** It compares against the newest
+  row alone, which is the right test for a render watching the present and the
+  wrong one for a change dated months back. `cache_db.backfill_account_events`
+  is the writer, keyed on `ts` through `INSERT OR REPLACE`, so re-running a
+  file is a no-op and re-declaring one moment replaces what it said
+- **Identity is copied from the log**, never taken from the file: a timeline
+  that could introduce an identity could introduce a typo of one, which reads
+  as a second account for as long as the rows stand. `account` may name an
+  account by uuid or by login email; an address two accounts have used reaches
+  neither
+- **An account this machine never signed in to is skipped**, by name and out
+  loud, so one file covering a person's accounts is copied to every machine
+  unedited
+- **Nothing validates a tier string.** The names come from Anthropic and change
+  without notice; a list here would refuse the plan the file was written to
+  record
+- **A tier is a state, not an event.** `accounts._carried_tiers` carries an
+  account's last reading forward across an event that recorded none, and never
+  across a login — an empty tier column is silence, and letting one clear the
+  tier would end every declared stretch at the next render that caught nothing
+- **The rollups rebuild once.** `_rollup_fingerprint` hashes the log whole, and
+  `_plan_archive` holds back a purged file whose span straddles any event, so a
+  declared change is a boundary there too
+
+The server has the same gap and cannot be fixed by pushing a tier per record:
+`push.changed_files` offers only a file whose `(mtime_ns, size)` moved and skips
+archived files outright, so a corpus whose older logs have rotated away would
+keep NULL whatever `--full` does. It stores the same document instead, in
+`account_tiers`, typed on `/settings/accounts/{uuid}/tiers`, and resolves every
+folded row's tier at read time through `tier_timeline.TierTimeline`. That
+reaches every record ever pushed. `db.set_account_tiers` replaces one account's
+rows wholesale — the timeline is a document, and merging a paste into what was
+there would leave a change the person deleted still standing — and
+`db.content_stamp` reads the table so the dashboard's cache notices a
+declaration that arrived with no push behind it.
+
+### 9.7 Rate-Limit Utilization History
 
 `windows.py` holds every calculation in this section: the window instance, its
 peak and fill span, the `SpendIndex` that prices a span and counts its tokens,

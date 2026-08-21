@@ -16,7 +16,7 @@ import server_fixture as sf
 from fastapi.testclient import TestClient
 from rich.console import Console
 
-from ccreport import aggregate
+from ccreport import aggregate, tier_timeline
 from ccreport import ccreport as ccr
 from ccreport.server import db, reports
 from ccreport.server.factory import create_app
@@ -439,6 +439,75 @@ class TestRemoteFetch:
         monkeypatch.setattr(remote.urllib.request, "urlopen", fail)
         with pytest.raises(remote.RemoteError, match="403"):
             remote.fetch_report("https://ccr.example.net", "day")
+
+
+class TestDeclaredTiers:
+    """Which plan an account was on, resolved onto records nobody can re-push."""
+
+    def _declare(self, app, *entries, account="u-work"):
+        conn = app.state.db.connect()
+        db.set_account_tiers(conn, account, [
+            tier_timeline.Entry(ts=ts, account=account, organization_rate_limit_tier=tier)
+            for ts, tier in entries
+        ], 1.0)
+        conn.commit()
+        return conn
+
+    def _tiers(self, merged):
+        return {m.record.message_id or m.record._day: m.tier for m in merged}
+
+    def test_nothing_declared_leaves_every_record_without_one(self, app):
+        assert {m.tier for m in reports.load(app.state.db.connect())} == {None}
+
+    def test_a_record_takes_the_entry_in_force_at_its_instant(self, app):
+        conn = self._declare(app, (_ts(1), "pro"), (_ts(3), "max_20x"))
+        tiers = self._tiers(reports.load(conn))
+        assert tiers["a1"] == "pro"
+        assert tiers["a2"] == "max_20x"
+
+    def test_a_record_older_than_the_first_entry_has_none(self, app):
+        """The declaration starts where the receipts do."""
+        conn = self._declare(app, (_ts(3), "max_20x"))
+        assert self._tiers(reports.load(conn))["a1"] is None
+
+    def test_another_account_is_untouched_by_this_ones_timeline(self, app):
+        conn = self._declare(app, (_ts(1), "pro"))
+        assert {m.tier for m in reports.load(conn, reports.Filters(account="me@home.example"))} == {
+            None
+        }
+
+    def test_a_grouped_row_carries_it_too(self, app):
+        """The dashboard folds these, never records."""
+        conn = self._declare(app, (_ts(1), "pro"))
+        grouped = reports.load_grouped(conn, reports.Filters(account="me@work.example"))
+        assert {m.tier for m in grouped} == {"pro"}
+
+    def test_re_declaring_replaces_only_that_account(self, app):
+        conn = self._declare(app, (_ts(1), "pro"))
+        self._declare(app, (_ts(1), "home_plan"), account="u-home")
+        self._declare(app, (_ts(1), "max_20x"))
+        by_account = {(e.account, e.organization_rate_limit_tier) for e in db.account_tiers(conn)}
+        assert by_account == {("u-work", "max_20x"), ("u-home", "home_plan")}
+
+    def test_the_overview_carries_the_plan_in_force_now(self, app):
+        conn = self._declare(app, (_ts(1), "pro"), (0.0, "older"))
+        rows = {r["account_uuid"]: r for r in reports.account_overview(conn)}
+        assert (rows["u-work"]["tier"], rows["u-work"]["declared"]) == ("pro", 2)
+        assert (rows["u-home"]["tier"], rows["u-home"]["declared"]) == (None, 0)
+
+    def test_declaring_a_plan_moves_the_content_stamp(self, app):
+        """A timeline is typed in with no push behind it, like an alias."""
+        conn = app.state.db.connect()
+        before = db.content_stamp(conn)
+        self._declare(app, (_ts(1), "pro"))
+        assert db.content_stamp(conn) != before
+
+    def test_clearing_a_timeline_moves_it_too(self, app):
+        conn = self._declare(app, (_ts(1), "pro"))
+        before = db.content_stamp(conn)
+        db.set_account_tiers(conn, "u-work", [], 2.0)
+        conn.commit()
+        assert db.content_stamp(conn) != before
 
 
 class TestAccountOverview:

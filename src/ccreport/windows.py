@@ -10,7 +10,7 @@ Nothing here renders. `ccreport.py` turns these into tables and
 `server/limits.py` into pages; a formatted string in this module would be one
 of them deciding for the other.
 
-AUDIT: the maths is documented in docs/calculation-reference.md section 9.6.
+AUDIT: the maths is documented in docs/calculation-reference.md section 9.7.
 """
 
 from __future__ import annotations

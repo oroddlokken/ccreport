@@ -17,7 +17,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from ccreport import migrations
+from ccreport import migrations, tier_timeline
 
 MIGRATION_BASELINE = 3
 """The version the schema below leaves a database at, before any chain step.
@@ -134,6 +134,28 @@ CREATE TABLE IF NOT EXISTS account_aliases (
     account_uuid TEXT PRIMARY KEY,
     alias        TEXT NOT NULL,
     updated_at   REAL NOT NULL
+) WITHOUT ROWID;
+
+-- Which plan an account was on, and from when. Declared off the billing
+-- receipts rather than pushed: a record carries no tier, and a client that
+-- learned to send one could only stamp the files it still has — the logs
+-- behind the older half have rotated away, and this table is the only copy of
+-- what they spent. So the timeline is typed in here once and every record
+-- resolves against it by timestamp, which reaches the whole corpus instead of
+-- its recent end.
+--
+-- One row per change, keyed by the account and the moment: the entry in force
+-- at a record's ts is the newest at or before it, exactly as account_events is
+-- read on a client. A moment older than an account's first row has no tier,
+-- which is the truth — the declaration starts where the receipts do.
+CREATE TABLE IF NOT EXISTS account_tiers (
+    account_uuid                 TEXT NOT NULL,
+    from_ts                      REAL NOT NULL,
+    seat_tier                    TEXT,
+    user_rate_limit_tier         TEXT,
+    organization_rate_limit_tier TEXT,
+    updated_at                   REAL NOT NULL,
+    PRIMARY KEY (account_uuid, from_ts)
 ) WITHOUT ROWID;
 
 -- What this server calls a project. Two machines that checked the same repo
@@ -268,6 +290,7 @@ MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(5, "project_aliases"),
     migrations.Step(6, "rate_limit_samples"),
     migrations.Step(7, "extra_usage_samples"),
+    migrations.Step(8, "account_tiers"),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 
@@ -516,6 +539,53 @@ def set_account_alias(conn: sqlite3.Connection, account_uuid: str, alias: str, n
     )
 
 
+def account_tiers(conn: sqlite3.Connection) -> list[tier_timeline.Entry]:
+    """Every declared plan change, as the entries a TierTimeline is built from.
+
+    Read once per report and handed to the row builders, for the reason
+    account_aliases is: a merged corpus is one query's worth of plan changes
+    and hundreds of thousands of records.
+    """
+    rows = conn.execute(
+        "SELECT account_uuid, from_ts, seat_tier, user_rate_limit_tier, "
+        "organization_rate_limit_tier FROM account_tiers ORDER BY account_uuid, from_ts"
+    ).fetchall()
+    return [
+        tier_timeline.Entry(
+            ts=row[1], account=row[0], seat_tier=row[2],
+            user_rate_limit_tier=row[3], organization_rate_limit_tier=row[4],
+        )
+        for row in rows
+    ]
+
+
+def set_account_tiers(
+    conn: sqlite3.Connection, account_uuid: str,
+    entries: list[tier_timeline.Entry], now: float,
+) -> None:
+    """Replace *account_uuid*'s declared timeline with *entries*.
+
+    Wholesale, not row by row. The timeline is one document a person reads off
+    their receipts and re-pastes when they find a receipt they had missed, and
+    merging the new text into the old would leave a change they deleted still
+    standing — with nothing on the page to show it was there.
+
+    Only this account's rows are touched, so one account's paste cannot drop
+    another's.
+    """
+    conn.execute("DELETE FROM account_tiers WHERE account_uuid = ?", (account_uuid,))
+    conn.executemany(
+        "INSERT INTO account_tiers (account_uuid, from_ts, seat_tier, "
+        "user_rate_limit_tier, organization_rate_limit_tier, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            (account_uuid, e.ts, e.seat_tier, e.user_rate_limit_tier,
+             e.organization_rate_limit_tier, now)
+            for e in entries
+        ],
+    )
+
+
 def project_aliases(conn: sqlite3.Connection) -> dict[tuple[str, str], str]:
     """Every project alias set, keyed by the (machine, pushed name) pair.
 
@@ -642,6 +712,10 @@ def content_stamp(conn: sqlite3.Connection) -> tuple:
     its samples with it and moves only the count. extra_usage_samples arrives
     the same way and prices the Extra column beside them.
 
+    account_tiers is account_aliases' case a third time: a timeline is typed in
+    with no push behind it, and it changes the tier every folded row carries.
+    Both parts, because re-pasting a shorter document moves only the count.
+
     A rate arriving in exchange_rates is deliberately not in it: nothing here
     would notice a rate updated in place, and the NOK column it moves is
     re-derived on the next push or the next day anyway.
@@ -656,7 +730,9 @@ def content_stamp(conn: sqlite3.Connection) -> tuple:
                (SELECT COUNT(*) FROM rate_limit_samples),
                (SELECT COALESCE(MAX(ts), 0) FROM rate_limit_samples),
                (SELECT COUNT(*) FROM extra_usage_samples),
-               (SELECT COALESCE(MAX(ts), 0) FROM extra_usage_samples)
+               (SELECT COALESCE(MAX(ts), 0) FROM extra_usage_samples),
+               (SELECT COUNT(*) FROM account_tiers),
+               (SELECT COALESCE(MAX(updated_at), 0) FROM account_tiers)
           FROM ingest_files
     """).fetchone()
 

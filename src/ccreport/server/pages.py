@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from ipaddress import ip_network
 from pathlib import Path
@@ -20,6 +21,7 @@ from fastapi import APIRouter, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from ccreport import tier_timeline
 from ccreport.server import dashboard, db, limits, reports, tokens
 
 router = APIRouter(tags=["pages"])
@@ -177,6 +179,84 @@ def set_alias(request: Request, account_uuid: str, alias: str = Form("")):
     db.set_account_alias(conn, account_uuid, alias, time.time())
     conn.commit()
     return RedirectResponse(url="/settings/accounts", status_code=303)
+
+
+def _account_names(account: dict) -> set[str]:
+    """Every string a timeline may use to name *account*.
+
+    The uuid, the login email it pushed under, and whatever this server renames
+    it to — the three things a person has in front of them when they write the
+    file, none of which they should have to look up.
+    """
+    return {v for v in (account["account_uuid"], account["label"], account["alias"]) if v}
+
+
+def _tiers_page(request: Request, account_uuid: str, text: str, **note):
+    """The timeline editor for one account, with *text* in the box.
+
+    Takes the text rather than reading it back, so a paste that was refused is
+    redisplayed as the person typed it. Re-rendering from the stored rows would
+    hand back the document they were trying to replace, with their own work
+    gone and the error pointing at a line no longer on screen.
+    """
+    conn = request.app.state.db.connect()
+    accounts = {a["account_uuid"]: a for a in reports.account_overview(conn)}
+    if account_uuid not in accounts:
+        raise HTTPException(status_code=404, detail=f"No account {account_uuid}.")
+    return templates.TemplateResponse(
+        request, "tiers.html",
+        {
+            "account": accounts[account_uuid], "text": text,
+            "names": sorted(_account_names(accounts[account_uuid])),
+            "error": None, "saved": None, "skipped": (), **note,
+        },
+        status_code=422 if note.get("error") else 200,
+    )
+
+
+@router.get("/settings/accounts/{account_uuid}/tiers", response_class=HTMLResponse)
+def tiers(request: Request, account_uuid: str):
+    """One account's declared plan history, as the TOML it was typed in."""
+    conn = request.app.state.db.connect()
+    stored = [e for e in db.account_tiers(conn) if e.account == account_uuid]
+    return _tiers_page(request, account_uuid, tier_timeline.render(stored))
+
+
+@router.post("/settings/accounts/{account_uuid}/tiers", response_class=HTMLResponse)
+def set_tiers(request: Request, account_uuid: str, timeline: str = Form("")):
+    """Replace one account's plan history with the pasted document.
+
+    A document that will not parse is refused whole and handed back with the
+    reason. Storing the entries it did manage to read would leave a timeline
+    that is neither what was there nor what was typed, and nothing on the page
+    would say which lines had been dropped.
+
+    An entry naming some other account is left alone rather than filed here, so
+    one document covering a person's accounts can be pasted into each of their
+    pages unedited. The page says which names it passed over: a typo and
+    somebody else's account look identical from here, and only the person
+    reading can tell which it was.
+
+    Renders rather than redirects, because that count is the answer and a
+    redirect has nowhere to carry it.
+    """
+    conn = request.app.state.db.connect()
+    accounts = {a["account_uuid"]: a for a in reports.account_overview(conn)}
+    if account_uuid not in accounts:
+        raise HTTPException(status_code=404, detail=f"No account {account_uuid}.")
+    try:
+        entries = tier_timeline.parse(timeline)
+    except ValueError as e:
+        return _tiers_page(request, account_uuid, timeline, error=str(e))
+
+    names = _account_names(accounts[account_uuid])
+    mine = [replace(e, account=account_uuid) for e in entries if e.account in names]
+    skipped = sorted({e.account for e in entries if e.account not in names})
+    db.set_account_tiers(conn, account_uuid, mine, time.time())
+    conn.commit()
+    return _tiers_page(
+        request, account_uuid, timeline, saved=len(mine), skipped=skipped,
+    )
 
 
 @router.get("/settings/projects", response_class=HTMLResponse)

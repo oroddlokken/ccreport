@@ -483,11 +483,45 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   `cache_db.effective_limit_tier()` picks the user tier over the org one, and
   `ccreport adopt` claims pre-capture history — the rest is
   `docs/calculation-reference.md` section 9
+- `account_events.source` says which of three things a row is, and the readers
+  turn on it rather than on `ts`: a `capture` is a reading of the config file
+  and is permanent, a `backfill` is a plan change declared off a billing
+  receipt, an `adopt` is the ts=0 claim. `read_latest_account()` selects
+  captures alone — it is what `ccreport adopt` copies, and a claim must not
+  decide who a machine is — and `_pre_capture_records` takes its boundary from
+  them for the same reason. It stays out of `_ACCOUNT_COLS`, so the identity
+  comparison and `_ACCOUNT_SELECT` never see it, and `clear_backfilled_accounts`
+  is the only delete besides the adoption's
+- A tier is a state, not an event: `accounts._carried_tiers` carries an
+  account's last reading forward across an event that recorded none, and never
+  across a login. An empty tier column is silence — the columns arrived after
+  the log did, Claude Code refreshes the blob they come from only on /login,
+  and a declared plan change records no reading at all — so letting one clear
+  the tier would end every declared stretch at the next render that caught
+  nothing
+- `tier_timeline.py` is the declared plan history: the TOML `[[tier]]` format,
+  `parse`/`render`, and the bisect that answers a moment with a tier. Both ends
+  read it — `ccreport tiers <file>` writes `account_events` rows from it, the
+  server stores it per account in `account_tiers` and resolves every folded
+  row's tier at read time — so it imports nothing but the stdlib, like
+  `protocol.py`. Nothing validates a tier string against a list: the names come
+  from Anthropic, and a backfill that refused an unrecognized one would fail on
+  the plan it was written to record
+- The server's tier is declared, never pushed. A record carries none, and a
+  client that learned to send one could only stamp the files it still has —
+  `push.changed_files` offers a file whose (mtime_ns, size) moved and skips
+  archived ones outright, so a corpus whose older logs have rotated away would
+  keep NULL whatever `--full` does. `account_tiers` is read once per report and
+  handed to the row builders, the way `account_aliases` is, and
+  `db.content_stamp` reads its count and max because typing one in has no push
+  behind it. `set_account_tiers` replaces one account's rows wholesale: the
+  timeline is a document, and merging a paste into what was there would leave a
+  change the person deleted still standing
 - How full each rate-limit window got over time lives in `rate_limit_snapshots`,
   appended by slow-path renders from the live percentages, so an unobserved
   window leaves no history. `ccreport limits` is the reader: it groups by
   `(window, model, resets_at)` and prices each instance's rise against the
-  records covering its fill span. `docs/calculation-reference.md` section 9.6
+  records covering its fill span. `docs/calculation-reference.md` section 9.7
   has the write gate, the account attribution and the two defects stored history
   carries
 - NOK conversion uses Norges Bank daily spot rates via `exchange.py`, cached in

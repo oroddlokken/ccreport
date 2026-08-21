@@ -44,6 +44,29 @@ def _account_labels(events: list[dict]) -> list[str]:
 
 
 
+def _carried_tiers(events: list[dict]) -> list[str | None]:
+    """Each event's effective tier, with an account's last reading carried forward.
+
+    An event whose tier columns are empty is silence, not an observation that
+    the account has no tier: the columns arrived after the log did, Claude Code
+    only refreshes the blob they come from on /login, and a plan change
+    declared off a receipt records no reading at all. Letting one clear the
+    tier would end every declared stretch at the next render that happened to
+    catch nothing.
+
+    Carried within an account and never across one. Two logins on a machine are
+    two entitlements, and the tier one of them was on says nothing about the
+    other.
+    """
+    carried: list[str | None] = []
+    last: dict[str, str | None] = {}
+    for e in events:
+        tier = effective_limit_tier(e) or last.get(e["account_uuid"])
+        last[e["account_uuid"]] = tier
+        carried.append(tier)
+    return carried
+
+
 class AccountTimeline:
     """Which Claude account was signed in at a given moment, and on which tier.
 
@@ -58,7 +81,7 @@ class AccountTimeline:
         self._labels = _account_labels(events)
         # Resolved once here rather than per lookup: both answers come off the
         # same event, so the two getters differ only in which list they index.
-        self._tiers = [effective_limit_tier(e) for e in events]
+        self._tiers = _carried_tiers(events)
         self._uuids = [e["account_uuid"] for e in events]
 
     def _index_at(self, when: datetime) -> int:
@@ -78,9 +101,11 @@ class AccountTimeline:
     def tier_at(self, when: datetime) -> str | None:
         """The effective rate-limit tier at *when*, None where it is unrecorded.
 
-        None covers both "no event yet" and "an event that predates the tier
-        columns" — neither is a tier reading, and a report has to show them as
-        absent rather than as a change to something.
+        None covers "no event yet" and "nothing has ever recorded a tier for
+        this account" — neither is a tier reading, and a report has to show
+        them as absent rather than as a change to something. An event that
+        recorded none *after* one that did is not either case; see
+        _carried_tiers.
         """
         i = self._index_at(when)
         return self._tiers[i] if i >= 0 else None

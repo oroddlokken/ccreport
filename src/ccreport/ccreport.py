@@ -30,6 +30,7 @@ from ccreport import (
     pricing,
     project_identity,
     protocol,
+    tier_timeline,
 )
 from ccreport.accounts import AccountTimeline
 from ccreport.aggregate import (
@@ -48,10 +49,13 @@ from ccreport.aggregate import (
 from ccreport.cache_db import (
     _ACCOUNT_IDENTITY_COLS,
     _ACCOUNT_TIER_COLS,
-    ADOPTED_TS,
+    SOURCE_BACKFILL,
+    SOURCE_CAPTURE,
     add_project_override,
     archived_file_paths,
+    backfill_account_events,
     clear_adopted_account,
+    clear_backfilled_accounts,
     count_ccreport_records_without_signals,
     delete_project_override,
     get_project_overrides,
@@ -2078,8 +2082,13 @@ def _pre_capture_records(
     Not "the records currently reporting as unknown", which is the same set
     only until the first adoption and reads as empty afterwards — so a preview
     built on it would tell a user re-adopting that there is nothing to adopt.
+
+    Captures only. A backfilled row is a claim about the same pre-capture
+    stretch this covers, so counting one as the boundary would shrink the
+    adoption to the records older than a row that is itself an adoption of a
+    kind.
     """
-    captures = [e["ts"] for e in events if e["ts"] > ADOPTED_TS]
+    captures = [e["ts"] for e in events if e["source"] == SOURCE_CAPTURE]
     if not captures:
         return []
     first = min(captures)
@@ -2146,6 +2155,125 @@ def cmd_adopt(args) -> None:
     set_adopted_account({**identity, **dict.fromkeys(_ACCOUNT_TIER_COLS)})
     print(f"Adopted. Those records now report as {_account_description(identity)}.")
     print("Undo with: ccreport adopt --remove")
+
+
+def _known_accounts(events: list[dict]) -> dict[str, dict]:
+    """Every account the log has seen, reachable by uuid and by login email.
+
+    Both keys, because a person writing a timeline off their receipts has the
+    email in front of them and the uuid nowhere. An email that two accounts
+    have used maps to neither — the same address billing through work and
+    personally is exactly the case the organization fields exist to separate,
+    and guessing between them would attribute a plan change to the wrong one.
+    """
+    by_uuid: dict[str, dict] = {}
+    by_email: dict[str, list[dict]] = {}
+    for e in events:
+        by_uuid[e["account_uuid"]] = e
+        if e["email"]:
+            seen = by_email.setdefault(e["email"], [])
+            if not any(s["account_uuid"] == e["account_uuid"] for s in seen):
+                seen.append(e)
+    known = dict(by_uuid)
+    for email, matches in by_email.items():
+        if len(matches) == 1 and email not in known:
+            known[email] = matches[0]
+    return known
+
+
+def _resolve_entries(entries: list, events: list[dict]) -> tuple[list[dict], list[str]]:
+    """Declared entries as account_events rows, plus the accounts skipped.
+
+    Identity is copied from the log rather than taken from the file: a plan
+    change says nothing about who the account is, and a timeline that could
+    introduce one could introduce a typo of one — which reads as a second
+    account for as long as the rows stand.
+
+    An account this machine has never signed in to is skipped rather than
+    refused, because one timeline covers a person's accounts and each of their
+    machines has seen some of them. The names skipped are returned so the
+    caller can print them: a typo and a machine that legitimately does not know
+    an account look identical here, and only the person reading can tell which
+    one it was.
+    """
+    known = _known_accounts(events)
+    rows, skipped = [], []
+    for e in entries:
+        identity = known.get(e.account)
+        if identity is None:
+            if e.account not in skipped:
+                skipped.append(e.account)
+            continue
+        rows.append({
+            "ts": e.ts,
+            **{c: identity[c] for c in _ACCOUNT_IDENTITY_COLS},
+            **e.tiers(),
+        })
+    return rows, skipped
+
+
+def _tier_line(row: dict) -> str:
+    """One resolved entry as a preview line: when, who, and what it became."""
+    when = _fmt_epoch(row["ts"])
+    tier = tier_timeline.effective_tier(row) or _ABSENT
+    seat = row.get("seat_tier")
+    return f"  {when}  {_account_description(row)}  {tier}" + (f" (seat {seat})" if seat else "")
+
+
+def cmd_tiers(args) -> None:
+    """Declare plan changes the capture log never saw, list them, or drop them.
+
+    The receipts are the source: `account_events` holds a tier only where a
+    render happened to catch one, so a machine that started reporting after its
+    first record has no entitlement behind most of its history, and
+    `ccreport limits` prints a fill rate with nothing to set it beside.
+
+    Exits 1 on an unreadable file or an account the log does not know. Every
+    other outcome, abort included, returns.
+    """
+    if args.remove:
+        gone = clear_backfilled_accounts()
+        print(f"Removed {gone} declared plan change(s)." if gone
+              else "Nothing to remove: no plan changes are declared.")
+        return
+
+    events = load_account_events()
+    if args.file is None:
+        declared = [e for e in events if e["source"] == SOURCE_BACKFILL]
+        if not declared:
+            print("No plan changes are declared. Pass a TOML file to declare some.")
+            return
+        print(f"{len(declared)} declared plan change(s):")
+        for row in declared:
+            print(_tier_line(row))
+        return
+
+    try:
+        entries = tier_timeline.parse(Path(args.file).read_text())
+        rows, skipped = _resolve_entries(entries, events)
+    except (OSError, ValueError) as e:
+        print(f"{args.file}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    for name in skipped:
+        print(f"Skipping {name!r}: this machine has never signed in to it.")
+    if not rows:
+        print(f"{args.file} declares nothing this machine can place.")
+        return
+
+    existing = sum(1 for e in events if e["source"] == SOURCE_BACKFILL)
+    print(f"Declare {len(rows)} plan change(s):")
+    for row in sorted(rows, key=lambda r: r["ts"]):
+        print(_tier_line(row))
+    if existing:
+        print(f"{existing} already declared; any at these same moments are replaced.")
+    if not args.yes and not _confirm("Proceed?"):
+        print("Aborted.")
+        return
+
+    backfill_account_events(rows)
+    print("Declared. `ccreport limits` reads these as the tier in force.")
+    print("Undo with: ccreport tiers --remove")
 
 
 # --- Rate limit utilization history ---
@@ -2778,6 +2906,7 @@ def main() -> None:
                "  ccreport account\n"
                "  ccreport monthly --account personal@example.com\n"
                "  ccreport adopt            # claim pre-capture history\n"
+               "  ccreport tiers plans.toml # declare plan changes off the receipts\n"
                "  ccreport limits -w session\n"
                "  ccreport archive --dry-run  # what the purged half folds to\n"
                "  ccreport update           # is master ahead of this checkout?\n"
@@ -2837,6 +2966,17 @@ def main() -> None:
                      help=f"Undo it; that history reads as {UNKNOWN_ACCOUNT!r} again")
     pad.add_argument("--yes", "-y", action="store_true",
                      help="Skip the confirmation prompt")
+
+    # The other half of the same problem: adopt claims who paid for pre-capture
+    # history, this declares which plan they were paying for.
+    pt = sub.add_parser(
+        "tiers", help="Declare plan changes the capture log never saw")
+    pt.add_argument("file", nargs="?",
+                    help="TOML timeline of [[tier]] entries; omit to list what is declared")
+    pt.add_argument("--remove", action="store_true",
+                    help="Drop every declared plan change; captures are untouched")
+    pt.add_argument("--yes", "-y", action="store_true",
+                    help="Skip the confirmation prompt")
 
     # One-time relocation off the paths this tooling used inside macsetup.
     pmg = sub.add_parser(
@@ -2979,6 +3119,11 @@ def main() -> None:
     # to the report path, which would want a report to print.
     if args.command == "adopt":
         cmd_adopt(args)
+        return
+
+    # Reads the account log and writes it back; no report to print either.
+    if args.command == "tiers":
+        cmd_tiers(args)
         return
     # Reads the record cache and the usage row; it prints no report table.
     if args.command == "budget":

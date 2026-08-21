@@ -1,0 +1,78 @@
+# A declared plan history, for `ccreport tiers` and the server's accounts page.
+#
+# Each entry is the moment a plan started; the one before it ran until then.
+# The dates come off the Stripe receipts: an upgrade bills a prorated line the
+# day it takes effect, and a downgrade shows up as the line item on the next
+# renewal, so the receipt date is the change and the line item is the plan.
+#
+# `at` is a TOML datetime. A bare date is read as midnight UTC, which is what a
+# PDF invoice can honestly say — it carries the day and no clock time.
+#
+# `account` is a uuid or a login email. It has to name an account the machine
+# has already signed in to; one this machine has never seen is skipped, so a
+# timeline covering several accounts can be copied to every machine as it is.
+#
+# Which tier field to fill is what Claude Code's own oauthAccount blob puts the
+# value in. A personal Max or Pro plan carries organization_rate_limit_tier
+# alone. A team seat carries all three.
+
+# --- personal ---
+
+[[tier]]
+at = 2026-02-02T18:00:26Z
+account = "me@example.net"
+organization_rate_limit_tier = "default_claude_pro"
+
+[[tier]]
+at = 2026-02-03T21:03:33Z
+account = "me@example.net"
+organization_rate_limit_tier = "default_claude_max_5x"
+
+# This one came off a PDF invoice, which carries no clock time.
+[[tier]]
+at = 2026-04-02
+account = "me@example.net"
+organization_rate_limit_tier = "default_claude_max_20x"
+
+# The May renewal billed 5x and was upgraded again the same afternoon, so the
+# account really was on 5x for those three and a half hours.
+[[tier]]
+at = 2026-05-02T13:12:45Z
+account = "me@example.net"
+organization_rate_limit_tier = "default_claude_max_5x"
+
+[[tier]]
+at = 2026-05-02T16:53:02Z
+account = "me@example.net"
+organization_rate_limit_tier = "default_claude_max_20x"
+
+[[tier]]
+at = 2026-06-02T17:55:46Z
+account = "me@example.net"
+organization_rate_limit_tier = "default_claude_max_5x"
+
+[[tier]]
+at = 2026-07-02T17:55:36Z
+account = "me@example.net"
+organization_rate_limit_tier = "default_claude_pro"
+
+[[tier]]
+at = 2026-07-04T15:46:24Z
+account = "me@example.net"
+organization_rate_limit_tier = "default_claude_max_5x"
+
+[[tier]]
+at = 2026-07-30T15:56:13Z
+account = "me@example.net"
+organization_rate_limit_tier = "default_claude_max_20x"
+
+# --- work ---
+#
+# One seat since the subscription was created, so one entry.
+
+[[tier]]
+at = 2026-02-16T12:52:43Z
+account = "me@work.example"
+seat_tier = "team_tier_1"
+user_rate_limit_tier = "default_claude_max_5x"
+organization_rate_limit_tier = "default_raven"

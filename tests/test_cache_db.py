@@ -237,6 +237,7 @@ class TestSchemaColumns:
             assert cache_db.load_account_events() == [
                 {
                     "ts": 100.0,
+                    "source": cache_db.SOURCE_CAPTURE,
                     "account_uuid": "uuid-old",
                     "email": "old@work.example",
                     "organization_uuid": "org-old",
@@ -2594,6 +2595,7 @@ class TestAccountEvents:
             "seat_tier",
             "user_rate_limit_tier",
             "organization_rate_limit_tier",
+            "source",
         }
 
     def test_a_personal_plan_stores_its_missing_tiers_as_null(self, db):
@@ -2689,6 +2691,7 @@ class TestAccountEvents:
         assert [e["ts"] for e in events] == [100.0, 300.0]
         assert events[1] == {
             "ts": 300.0,
+            "source": cache_db.SOURCE_CAPTURE,
             "account_uuid": "uuid-work",
             "email": "me@work.example",
             "organization_uuid": "org-work",
@@ -2759,7 +2762,9 @@ class TestAdoptedAccount:
     def test_the_adoption_row_lands_at_ts_zero(self, db):
         cache_db.set_adopted_account(self.ROW)
         adopted = present(cache_db.read_adopted_account())
-        assert adopted == {"ts": cache_db.ADOPTED_TS, **self.ROW}
+        assert adopted == {
+            "ts": cache_db.ADOPTED_TS, "source": cache_db.SOURCE_ADOPT, **self.ROW,
+        }
 
     def test_an_adoption_is_not_read_back_as_a_capture(self, db):
         """It is a claim about history, not a reading of who is signed in."""
@@ -2819,6 +2824,179 @@ class TestAdoptedAccount:
             (100.0, "uuid-work"),
             (300.0, "uuid-home"),
         ]
+
+
+class TestBackfilledAccounts:
+    """Plan changes declared off a receipt, for a stretch no render watched."""
+
+    ACC = {
+        "accountUuid": "uuid-work",
+        "emailAddress": "me@work.example",
+        "organizationUuid": "org-work",
+        "organizationName": "Work AS",
+    }
+
+    def _entry(self, ts, **over):
+        return {
+            "ts": ts,
+            "account_uuid": "uuid-work",
+            "email": "me@work.example",
+            "organization_uuid": "org-work",
+            "organization_name": "Work AS",
+            "seat_tier": None,
+            "user_rate_limit_tier": None,
+            "organization_rate_limit_tier": "default_claude_max_5x",
+            **over,
+        }
+
+    def _sources(self, events):
+        return [(e["ts"], e["source"]) for e in events]
+
+    def test_it_writes_a_row_per_entry_marked_as_declared(self, db):
+        assert cache_db.backfill_account_events(
+            [self._entry(100.0), self._entry(200.0)]
+        ) == 2
+        assert self._sources(cache_db.load_account_events()) == [
+            (100.0, cache_db.SOURCE_BACKFILL), (200.0, cache_db.SOURCE_BACKFILL),
+        ]
+
+    def test_nothing_to_write_writes_nothing(self, db):
+        assert cache_db.backfill_account_events([]) == 0
+        assert cache_db.load_account_events() == []
+
+    def test_the_tiers_land_where_the_entry_put_them(self, db):
+        cache_db.backfill_account_events([self._entry(100.0, seat_tier="team_tier_1")])
+        (row,) = cache_db.load_account_events()
+        assert row["seat_tier"] == "team_tier_1"
+        assert row["organization_rate_limit_tier"] == "default_claude_max_5x"
+
+    def test_re_declaring_the_same_timeline_is_a_no_op(self, db):
+        """Keyed on ts, so a person re-running a file gets one copy of it."""
+        entries = [self._entry(100.0), self._entry(200.0)]
+        cache_db.backfill_account_events(entries)
+        cache_db.backfill_account_events(entries)
+        assert len(cache_db.load_account_events()) == 2
+
+    def test_re_declaring_one_moment_replaces_what_it_said(self, db):
+        cache_db.backfill_account_events([self._entry(100.0, seat_tier="one")])
+        cache_db.backfill_account_events([self._entry(100.0, seat_tier="two")])
+        (row,) = cache_db.load_account_events()
+        assert row["seat_tier"] == "two"
+
+    def test_a_declaration_is_not_read_back_as_a_capture(self, db):
+        """It is a claim off a receipt, not a reading of who is signed in."""
+        cache_db.backfill_account_events([self._entry(100.0)])
+        assert cache_db.read_latest_account() is None
+
+    def test_a_declaration_after_the_last_capture_does_not_become_the_account(self, db):
+        """What `ccreport adopt` copies has to be something someone observed."""
+        record_account_event(self.ACC, now=100.0)
+        cache_db.backfill_account_events(
+            [self._entry(200.0, account_uuid="uuid-typo", email=None)]
+        )
+        assert present(cache_db.read_latest_account())["account_uuid"] == "uuid-work"
+
+    def test_clearing_takes_every_declaration_and_nothing_else(self, db):
+        record_account_event(self.ACC, now=100.0)
+        cache_db.set_adopted_account({
+            "account_uuid": "uuid-adopted", "email": None, "organization_uuid": None,
+            "organization_name": None, "seat_tier": None,
+            "user_rate_limit_tier": None, "organization_rate_limit_tier": None,
+        })
+        cache_db.backfill_account_events([self._entry(50.0), self._entry(75.0)])
+        assert cache_db.clear_backfilled_accounts() == 2
+        assert self._sources(cache_db.load_account_events()) == [
+            (cache_db.ADOPTED_TS, cache_db.SOURCE_ADOPT),
+            (100.0, cache_db.SOURCE_CAPTURE),
+        ]
+
+    def test_clearing_an_empty_log_removes_nothing(self, db):
+        assert cache_db.clear_backfilled_accounts() == 0
+
+    def test_a_declaration_does_not_disturb_the_capture_comparison(self, db):
+        """record_account_event weighs the newest row, declared or not.
+
+        A declaration dated after the last capture is the one case where that
+        newest row is not a reading, and the next render must still append
+        rather than mistake the claim for what it just saw.
+        """
+        record_account_event(self.ACC, now=100.0)
+        cache_db.backfill_account_events(
+            [self._entry(200.0, organization_rate_limit_tier="declared")]
+        )
+        assert record_account_event(self.ACC, now=300.0) is True
+
+
+class TestAccountSourceMigration:
+    """A log written before the column holds captures, and one claim."""
+
+    def _migrated(self, tmp_path, monkeypatch, rows_sql):
+        path = tmp_path / "old.db"
+        old = sqlite3.connect(path)
+        old.executescript(_PRE_MIGRATION_SQL)
+        old.executescript(
+            "CREATE TABLE IF NOT EXISTS account_events ("
+            " ts REAL PRIMARY KEY, account_uuid TEXT NOT NULL, email TEXT,"
+            " organization_uuid TEXT, organization_name TEXT, seat_tier TEXT,"
+            " user_rate_limit_tier TEXT, organization_rate_limit_tier TEXT)"
+            " WITHOUT ROWID;" + rows_sql
+        )
+        old.commit()
+        old.close()
+        monkeypatch.setattr(cache_db, "DB_PATH", path)
+        monkeypatch.setattr(cache_db, "_conn", None)
+        conn = cache_db.get_connection()
+        try:
+            return {e["ts"]: e["source"] for e in cache_db.load_account_events()}
+        finally:
+            conn.close()
+            cache_db._conn = None
+
+    def test_an_existing_row_reads_as_a_capture(self, tmp_path, monkeypatch):
+        """Which is the truth: nothing but a render could have written one."""
+        sources = self._migrated(tmp_path, monkeypatch, (
+            "INSERT INTO account_events VALUES"
+            " (100.0, 'u', 'e', 'o', 'O', NULL, NULL, NULL);"
+        ))
+        assert sources == {100.0: cache_db.SOURCE_CAPTURE}
+
+    def test_the_adoption_row_is_re_labelled(self, tmp_path, monkeypatch):
+        """The DEFAULT would make a claim the newest capture on this machine."""
+        sources = self._migrated(tmp_path, monkeypatch, (
+            "INSERT INTO account_events VALUES"
+            " (0.0, 'u-a', NULL, NULL, NULL, NULL, NULL, NULL),"
+            " (100.0, 'u', 'e', 'o', 'O', NULL, NULL, NULL);"
+        ))
+        assert sources == {
+            0.0: cache_db.SOURCE_ADOPT, 100.0: cache_db.SOURCE_CAPTURE,
+        }
+
+    def test_the_re_labelled_adoption_is_not_read_as_a_capture(
+        self, tmp_path, monkeypatch,
+    ):
+        path = tmp_path / "old.db"
+        old = sqlite3.connect(path)
+        old.executescript(_PRE_MIGRATION_SQL)
+        old.executescript(
+            "CREATE TABLE IF NOT EXISTS account_events ("
+            " ts REAL PRIMARY KEY, account_uuid TEXT NOT NULL, email TEXT,"
+            " organization_uuid TEXT, organization_name TEXT, seat_tier TEXT,"
+            " user_rate_limit_tier TEXT, organization_rate_limit_tier TEXT)"
+            " WITHOUT ROWID;"
+            "INSERT INTO account_events VALUES"
+            " (0.0, 'u-a', NULL, NULL, NULL, NULL, NULL, NULL);"
+        )
+        old.commit()
+        old.close()
+        monkeypatch.setattr(cache_db, "DB_PATH", path)
+        monkeypatch.setattr(cache_db, "_conn", None)
+        conn = cache_db.get_connection()
+        try:
+            assert cache_db.read_latest_account() is None
+            assert present(cache_db.read_adopted_account())["account_uuid"] == "u-a"
+        finally:
+            conn.close()
+            cache_db._conn = None
 
 
 class TestRateLimitSnapshots:

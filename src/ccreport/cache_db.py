@@ -346,6 +346,12 @@ CREATE TABLE IF NOT EXISTS exchange_rates (
 -- The tiers come out of the same cached oauthAccount blob as the rest, and
 -- Claude Code only refreshes it on /login (profileFetchedAt), so a tier that
 -- changed server-side can read stale here until the next sign-in.
+--
+-- source says where a row came from, and is the one field no reader may treat
+-- as part of the account. A capture is a reading of the config file and is
+-- permanent history. A backfill is a plan change declared from a billing
+-- receipt, for a stretch no render was watching, and is the only kind of row
+-- there is a delete for. An adoption is the ts=0 claim, which is neither.
 CREATE TABLE IF NOT EXISTS account_events (
     ts                          REAL PRIMARY KEY,
     account_uuid                TEXT NOT NULL,
@@ -354,7 +360,8 @@ CREATE TABLE IF NOT EXISTS account_events (
     organization_name           TEXT,
     seat_tier                   TEXT,  -- Team seat product, e.g. 'team_tier_1'; NULL on personal plans
     user_rate_limit_tier        TEXT,  -- per-user bucket, e.g. 'default_claude_max_5x'
-    organization_rate_limit_tier TEXT  -- org pool, e.g. 'default_raven'
+    organization_rate_limit_tier TEXT, -- org pool, e.g. 'default_raven'
+    source                      TEXT NOT NULL DEFAULT 'capture'  -- 'capture' | 'backfill' | 'adopt'
 ) WITHOUT ROWID;
 
 -- Append-only utilization samples, written by the statusline render: the live
@@ -1036,10 +1043,32 @@ def _migrate_files_archived(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_account_source(conn: sqlite3.Connection) -> None:
+    """Add account_events.source, then re-label the adoption row.
+
+    The DEFAULT is what an existing row gets, and for every row but one that is
+    the truth: a log written before this column held nothing but captures. The
+    exception is the ts=0 adoption, which the default would turn into the
+    newest capture on any machine whose real captures are all in the future —
+    read_latest_account selects on this column now, and `ccreport adopt` copies
+    what it returns.
+    """
+    if "source" in _table_columns(conn, "account_events"):
+        return
+    conn.execute(
+        "ALTER TABLE account_events ADD COLUMN source TEXT NOT NULL DEFAULT 'capture'"
+    )
+    conn.execute(
+        "UPDATE account_events SET source = ? WHERE ts = ?",
+        (SOURCE_ADOPT, ADOPTED_TS),
+    )
+
+
 MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(12, "ccreport_records_file_id", _migrate_records_file_id),
     migrations.Step(13, "ccreport_archive", _migrate_files_archived),
     migrations.Step(14, "remote_costs"),
+    migrations.Step(15, "account_events.source", _migrate_account_source),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 
@@ -3315,9 +3344,13 @@ def _clear_project_scopes(conn: sqlite3.Connection) -> None:
 # beside the schema, above.
 
 _ACCOUNT_SELECT = ", ".join(_ACCOUNT_COLS)
-# Bound as (ts, *_ACCOUNT_COLS), so the count follows the column list rather
-# than a hand-written run of question marks that a new column silently breaks.
-_ACCOUNT_PLACEHOLDERS = ", ".join("?" * (1 + len(_ACCOUNT_COLS)))
+# Bound as (ts, source, *_ACCOUNT_COLS), so the count follows the column list
+# rather than a hand-written run of question marks that a new column silently
+# breaks.
+_ACCOUNT_PLACEHOLDERS = ", ".join("?" * (2 + len(_ACCOUNT_COLS)))
+# What a reader selects, against what a writer binds: source travels with the
+# row everywhere but the identity comparison, which must not see it.
+_ACCOUNT_ROW_SELECT = f"ts, source, {_ACCOUNT_SELECT}"
 
 # Timestamp of the one row `ccreport adopt` writes, which claims the history
 # that predates capture for an account. Zero because attribution takes the
@@ -3325,6 +3358,11 @@ _ACCOUNT_PLACEHOLDERS = ", ".join("?" * (1 + len(_ACCOUNT_COLS)))
 # machine is the one every otherwise-unattributed record lands on. It is a
 # claim, not a capture, and the readers below keep the two apart.
 ADOPTED_TS = 0.0
+
+# The three values of account_events.source, described at the CREATE TABLE.
+SOURCE_CAPTURE = "capture"
+SOURCE_BACKFILL = "backfill"
+SOURCE_ADOPT = "adopt"
 
 # The oauthAccount keys behind _ACCOUNT_COLS, in the same order.
 _ACCOUNT_SOURCE_KEYS = (
@@ -3349,8 +3387,11 @@ def _account_identity(oauth: dict[str, Any]) -> tuple[str | None, ...]:
 
 
 def _account_row_to_dict(row: tuple) -> dict[str, Any]:
-    """One account_events row as a dict: ts plus every stored field."""
-    return {"ts": row[0], **dict(zip(_ACCOUNT_COLS, row[1:], strict=True))}
+    """One account_events row as a dict: ts and source plus every stored field."""
+    return {
+        "ts": row[0], "source": row[1],
+        **dict(zip(_ACCOUNT_COLS, row[2:], strict=True)),
+    }
 
 
 def effective_limit_tier(row: dict[str, Any]) -> str | None:
@@ -3395,12 +3436,56 @@ def record_account_event(
     # OR REPLACE covers only two changes landing inside one tick of time.time():
     # that is the same instant, so the later reading is the one to keep.
     conn.execute(
-        f"INSERT OR REPLACE INTO account_events (ts, {_ACCOUNT_SELECT}) "  # noqa: S608
+        f"INSERT OR REPLACE INTO account_events (ts, source, {_ACCOUNT_SELECT}) "  # noqa: S608
         f"VALUES ({_ACCOUNT_PLACEHOLDERS})",
-        (time.time() if now is None else now, *identity),
+        (time.time() if now is None else now, SOURCE_CAPTURE, *identity),
     )
     conn.commit()
     return True
+
+
+def backfill_account_events(entries: list[dict[str, Any]]) -> int:
+    """Write *entries* as backfilled rows. Returns how many landed.
+
+    The other writer compares against the newest row alone, which is the right
+    test for a render watching the present and the wrong one for a plan change
+    dated months back — it would weigh a historic row against a neighbour that
+    is not next to it. So this one writes what it is given and leaves the
+    caller to decide what belongs in the log.
+
+    Keyed on ts through OR REPLACE, which is what makes re-running a declared
+    timeline a no-op rather than a second copy of it. Each entry is a row dict
+    as the readers here hand one back, ts included, not the camelCase blob
+    record_account_event takes.
+    """
+    if not entries:
+        return 0
+    conn = get_connection()
+    conn.executemany(
+        f"INSERT OR REPLACE INTO account_events (ts, source, {_ACCOUNT_SELECT}) "  # noqa: S608
+        f"VALUES ({_ACCOUNT_PLACEHOLDERS})",
+        [
+            (e["ts"], SOURCE_BACKFILL, *(e.get(col) for col in _ACCOUNT_COLS))
+            for e in entries
+        ],
+    )
+    conn.commit()
+    return len(entries)
+
+
+def clear_backfilled_accounts() -> int:
+    """Delete every backfilled row. Returns how many went.
+
+    Safe where a capture is not: a backfill is a claim read off a receipt, and
+    re-declaring the timeline writes it again. A capture is the only record
+    that anyone was ever signed in at that moment.
+    """
+    conn = get_connection()
+    cur = conn.execute(
+        "DELETE FROM account_events WHERE source = ?", (SOURCE_BACKFILL,),
+    )
+    conn.commit()
+    return cur.rowcount
 
 
 def load_account_events() -> list[dict[str, Any]]:
@@ -3415,7 +3500,7 @@ def load_account_events() -> list[dict[str, Any]]:
     return [
         _account_row_to_dict(row)
         for row in conn.execute(
-            f"SELECT ts, {_ACCOUNT_SELECT} FROM account_events ORDER BY ts"  # noqa: S608
+            f"SELECT {_ACCOUNT_ROW_SELECT} FROM account_events ORDER BY ts"  # noqa: S608
         )
     ]
 
@@ -3423,16 +3508,18 @@ def load_account_events() -> list[dict[str, Any]]:
 def read_latest_account() -> dict[str, Any] | None:
     """The most recently captured account, or None if none was ever captured.
 
-    Skips the adoption row. That row is a claim about history rather than a
-    reading of who is signed in, and this is what `ccreport adopt` copies to
-    build it — reading it back would let an adoption re-adopt itself and would
-    report an empty capture log as if a real account had been seen.
+    Captures only. The other two kinds of row are claims about history rather
+    than readings of who is signed in, and this is what `ccreport adopt`
+    copies to build one — reading a claim back would let an adoption re-adopt
+    itself, would let a backfill dated after the last render decide who a
+    machine is, and would report an empty capture log as if a real account had
+    been seen.
     """
     conn = get_connection()
     row = conn.execute(
-        f"SELECT ts, {_ACCOUNT_SELECT} FROM account_events "  # noqa: S608
-        "WHERE ts > ? ORDER BY ts DESC LIMIT 1",
-        (ADOPTED_TS,),
+        f"SELECT {_ACCOUNT_ROW_SELECT} FROM account_events "  # noqa: S608
+        "WHERE source = ? ORDER BY ts DESC LIMIT 1",
+        (SOURCE_CAPTURE,),
     ).fetchone()
     return _account_row_to_dict(row) if row else None
 
@@ -3441,7 +3528,7 @@ def read_adopted_account() -> dict[str, Any] | None:
     """The adoption row, or None when pre-capture history is left unattributed."""
     conn = get_connection()
     row = conn.execute(
-        f"SELECT ts, {_ACCOUNT_SELECT} FROM account_events WHERE ts = ?",  # noqa: S608
+        f"SELECT {_ACCOUNT_ROW_SELECT} FROM account_events WHERE ts = ?",  # noqa: S608
         (ADOPTED_TS,),
     ).fetchone()
     return _account_row_to_dict(row) if row else None
@@ -3460,9 +3547,9 @@ def set_adopted_account(account: dict[str, Any]) -> None:
     """
     conn = get_connection()
     conn.execute(
-        f"INSERT OR REPLACE INTO account_events (ts, {_ACCOUNT_SELECT}) "  # noqa: S608
+        f"INSERT OR REPLACE INTO account_events (ts, source, {_ACCOUNT_SELECT}) "  # noqa: S608
         f"VALUES ({_ACCOUNT_PLACEHOLDERS})",
-        (ADOPTED_TS, *(account[col] for col in _ACCOUNT_COLS)),
+        (ADOPTED_TS, SOURCE_ADOPT, *(account[col] for col in _ACCOUNT_COLS)),
     )
     conn.commit()
 

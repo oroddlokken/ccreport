@@ -415,6 +415,133 @@ class TestAccountsPage:
         assert gated.post("/settings/accounts/acct-1/alias", data={"alias": "x"}).status_code == 403
 
 
+class TestTiersPage:
+    """Where the plan behind an account's spend gets typed in."""
+
+    TOML = (
+        "[[tier]]\n"
+        "at = 2026-02-03T21:03:33Z\n"
+        'account = "me@example.net"\n'
+        'organization_rate_limit_tier = "default_claude_max_5x"\n'
+    )
+
+    def _push(self, client, **over):
+        token = _token_from(_mint(client).text)
+        over.setdefault("ts", time.time())
+        return client.post(
+            "/v1/ingest", json=sf.batch([sf.record(**over)]), headers=sf.auth(token),
+        )
+
+    def _stored(self, client):
+        return client.app.state.db.connect().execute(
+            "SELECT account_uuid, from_ts, organization_rate_limit_tier FROM account_tiers"
+        ).fetchall()
+
+    def test_an_account_that_never_pushed_is_a_404(self, client):
+        """Rendering it would draw an editor for spend that is not here."""
+        assert client.get("/settings/accounts/nobody/tiers").status_code == 404
+        assert client.post(
+            "/settings/accounts/nobody/tiers", data={"timeline": ""},
+        ).status_code == 404
+
+    def test_the_accounts_page_links_to_it(self, client):
+        self._push(client)
+        assert "/settings/accounts/acct-1/tiers" in client.get("/settings/accounts").text
+
+    def test_saving_stores_the_entries_under_this_account(self, client):
+        self._push(client)
+        resp = client.post(
+            "/settings/accounts/acct-1/tiers", data={"timeline": self.TOML},
+        )
+        assert resp.status_code == 200
+        assert "Saved 1 plan change." in resp.text
+        assert self._stored(client) == [
+            ("acct-1", 1770152613.0, "default_claude_max_5x"),
+        ]
+
+    def test_the_box_comes_back_holding_what_was_saved(self, client):
+        self._push(client)
+        client.post("/settings/accounts/acct-1/tiers", data={"timeline": self.TOML})
+        body = client.get("/settings/accounts/acct-1/tiers").text
+        assert "2026-02-03T21:03:33Z" in body
+        assert "default_claude_max_5x" in body
+
+    def test_the_uuid_names_the_account_too(self, client):
+        self._push(client)
+        resp = client.post("/settings/accounts/acct-1/tiers", data={"timeline": (
+            '[[tier]]\nat = 2026-02-03T21:03:33Z\naccount = "acct-1"\n'
+            'seat_tier = "team_tier_1"\n'
+        )})
+        assert "Saved 1 plan change." in resp.text
+
+    def test_an_alias_names_the_account_too(self, client):
+        """It is what the person sees on the dashboard, so it is what they type."""
+        self._push(client)
+        client.post("/settings/accounts/acct-1/alias", data={"alias": "personal"})
+        resp = client.post("/settings/accounts/acct-1/tiers", data={"timeline": (
+            '[[tier]]\nat = 2026-02-03T21:03:33Z\naccount = "personal"\n'
+            'seat_tier = "team_tier_1"\n'
+        )})
+        assert "Saved 1 plan change." in resp.text
+
+    def test_an_entry_for_another_account_is_passed_over_and_named(self, client):
+        """One file covers a person's accounts and is pasted into each page."""
+        self._push(client)
+        resp = client.post("/settings/accounts/acct-1/tiers", data={"timeline": (
+            self.TOML + '\n[[tier]]\nat = 2026-05-01T00:00:00Z\naccount = "me@work.example"\n'
+        )})
+        assert "Saved 1 plan change." in resp.text
+        assert "me@work.example" in resp.text
+        assert len(self._stored(client)) == 1
+
+    def test_saving_replaces_the_whole_history(self, client):
+        self._push(client)
+        client.post("/settings/accounts/acct-1/tiers", data={"timeline": self.TOML})
+        client.post("/settings/accounts/acct-1/tiers", data={"timeline": (
+            '[[tier]]\nat = 2026-06-01T00:00:00Z\naccount = "me@example.net"\n'
+            'organization_rate_limit_tier = "default_claude_max_20x"\n'
+        )})
+        assert [row[2] for row in self._stored(client)] == ["default_claude_max_20x"]
+
+    def test_an_empty_box_clears_it(self, client):
+        self._push(client)
+        client.post("/settings/accounts/acct-1/tiers", data={"timeline": self.TOML})
+        client.post("/settings/accounts/acct-1/tiers", data={"timeline": ""})
+        assert self._stored(client) == []
+
+    def test_a_document_that_will_not_parse_is_refused_whole(self, client):
+        """Storing what it did read would be neither the old nor the new."""
+        self._push(client)
+        client.post("/settings/accounts/acct-1/tiers", data={"timeline": self.TOML})
+        resp = client.post("/settings/accounts/acct-1/tiers", data={"timeline": (
+            self.TOML + '\n[[tier]]\naccount = "me@example.net"\n'
+        )})
+        assert resp.status_code == 422
+        assert "missing &#39;at&#39;" in resp.text
+        assert "nothing was saved" in resp.text
+        assert len(self._stored(client)) == 1
+
+    def test_a_refused_document_comes_back_as_it_was_typed(self, client):
+        """Re-reading the stored rows would hand back the text being replaced."""
+        self._push(client)
+        resp = client.post("/settings/accounts/acct-1/tiers", data={"timeline": (
+            '[[tier]]\naccount = "typed-by-hand"\n'
+        )})
+        assert "typed-by-hand" in resp.text
+
+    def test_the_plan_shows_on_the_accounts_page(self, client):
+        self._push(client)
+        client.post("/settings/accounts/acct-1/tiers", data={"timeline": self.TOML})
+        assert "default_claude_max_5x" in client.get("/settings/accounts").text
+
+    def test_a_disallowed_address_cannot_read_or_set_one(self, tmp_path):
+        gated = TestClient(create_app(sf.config(tmp_path, networks=sf.ELSEWHERE)))
+        assert gated.get("/settings/accounts/acct-1/tiers").status_code == 403
+        assert gated.post(
+            "/settings/accounts/acct-1/tiers", data={"timeline": ""},
+        ).status_code == 403
+
+
 class TestProjectsPage:
     """Where one repo checked out under two names becomes one project."""
 
