@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from _narrow import present
 
+from ccreport import pricing
 from ccreport.pricing import (
     MODEL_ALIASES,
     OTHER_FAMILY,
@@ -2614,3 +2615,189 @@ def _iter_live(path):
     from ccreport.pricing import _iter_jsonl_costs
 
     return list(_iter_jsonl_costs(path, set()))
+
+
+class TestPlanPrice:
+    """What a subscription cost per month, by rate-limit tier."""
+
+    def _at(self, iso="2026-06-01"):
+        return datetime.fromisoformat(iso).replace(tzinfo=UTC)
+
+    @pytest.mark.parametrize(
+        ("tier", "usd"),
+        [
+            ("default_claude_pro", 20.0),
+            ("default_claude_max_5x", 100.0),
+            ("default_claude_max_20x", 200.0),
+        ],
+    )
+    def test_it_prices_each_plan_at_its_list_price(self, tier, usd):
+        assert pricing.plan_price(tier, self._at()) == usd
+
+    def test_a_tier_nothing_prices_is_none_not_zero(self):
+        """A team seat is an org's contract, not a list price."""
+        assert pricing.plan_price("default_raven", self._at()) is None
+
+    def test_no_tier_is_none(self):
+        assert pricing.plan_price(None, self._at()) is None
+        assert pricing.plan_price("", self._at()) is None
+
+    def test_an_instant_before_every_period_has_no_price(self):
+        assert pricing.plan_price("default_claude_pro", self._at("2024-01-01")) is None
+
+    def test_no_instant_takes_the_newest_period(self):
+        assert pricing.plan_price("default_claude_max_5x") == 100.0
+
+    def test_a_later_period_overrides_an_earlier_one(self, monkeypatch):
+        monkeypatch.setattr(pricing, "PLAN_PRICES", [
+            {"effective": "2025-01-01", "plans": {"p": 20.0}},
+            {"effective": "2026-05-01", "plans": {"p": 30.0}},
+        ])
+        monkeypatch.setattr(pricing, "_PLAN_INDEX", None)
+        assert pricing.plan_price("p", self._at("2026-04-01")) == 20.0
+        assert pricing.plan_price("p", self._at("2026-06-01")) == 30.0
+
+    def test_a_table_left_out_of_order_still_prices_correctly(self, monkeypatch):
+        """Bisecting an unsorted table would pick the wrong period silently."""
+        monkeypatch.setattr(pricing, "PLAN_PRICES", [
+            {"effective": "2026-05-01", "plans": {"p": 30.0}},
+            {"effective": "2025-01-01", "plans": {"p": 20.0}},
+        ])
+        monkeypatch.setattr(pricing, "_PLAN_INDEX", None)
+        assert pricing.plan_price("p", self._at("2026-04-01")) == 20.0
+
+
+class TestProratedPlanCost:
+    """A month that changed plan mid-cycle is billed by time in force."""
+
+    FEB = (datetime(2026, 2, 1, tzinfo=UTC), datetime(2026, 3, 1, tzinfo=UTC))
+
+    def _spans(self, *pairs):
+        """(days, tier) pairs laid end to end from the span's start.
+
+        The tier is the org pool field, which is where a personal plan's lands.
+        """
+        at = self.FEB[0].timestamp()
+        out = []
+        for days, tier in pairs:
+            tiers = None if tier is None else {"organization_rate_limit_tier": tier}
+            out.append((at, at + days * 86400, tiers))
+            at += days * 86400
+        return out
+
+    def _seat(self, days, seat, when=None):
+        at = (when or self.FEB[0]).timestamp()
+        return [(at, at + days * 86400, {"seat_tier": seat, **self.SEAT_BUCKET})]
+
+    SEAT_BUCKET = {"user_rate_limit_tier": "default_claude_max_5x"}
+
+    def test_a_whole_month_on_one_plan_costs_its_monthly_rate(self):
+        cost = pricing.prorated_plan_cost(
+            self._spans((28, "default_claude_max_5x")), *self.FEB,
+        )
+        assert cost == pytest.approx(100.0)
+
+    def test_a_split_month_weights_the_two_rates_by_days(self):
+        """14 days of each: half of $20 plus half of $100."""
+        cost = pricing.prorated_plan_cost(
+            self._spans((14, "default_claude_pro"), (14, "default_claude_max_20x")),
+            *self.FEB,
+        )
+        assert cost == pytest.approx(110.0)
+
+    def test_an_unpriced_stretch_contributes_nothing_but_does_not_void_the_month(self):
+        cost = pricing.prorated_plan_cost(
+            self._spans((14, None), (14, "default_claude_max_20x")), *self.FEB,
+        )
+        assert cost == pytest.approx(100.0)
+
+    def test_a_month_with_nothing_priced_is_none_not_zero(self):
+        """A zero beside real spend reads as a month that was free."""
+        assert pricing.prorated_plan_cost(self._spans((28, None)), *self.FEB) is None
+        assert pricing.prorated_plan_cost([], *self.FEB) is None
+
+    def test_an_unpriced_tier_does_not_make_a_month_free(self):
+        assert pricing.prorated_plan_cost(
+            self._spans((28, "default_raven")), *self.FEB,
+        ) is None
+
+    def test_a_team_seat_prices_as_the_seat_not_its_limit_bucket(self):
+        """The seat carries a personal plan's bucket and costs its own money."""
+        assert pricing.prorated_plan_cost(
+            self._seat(28, "team_tier_1"), *self.FEB,
+        ) == pytest.approx(100.0)
+
+    def test_a_seat_nothing_prices_falls_back_to_its_bucket(self):
+        """Better the limit bucket's price than no figure at all."""
+        assert pricing.prorated_plan_cost(
+            self._seat(28, "team_tier_9"), *self.FEB,
+        ) == pytest.approx(100.0)
+
+    def test_an_empty_span_is_none(self):
+        assert pricing.prorated_plan_cost(
+            self._spans((28, "default_claude_pro")), self.FEB[1], self.FEB[0],
+        ) is None
+
+    def test_each_stretch_pays_the_rate_in_force_when_it_started(self, monkeypatch):
+        """A span crossing a price rise pays the old rate up to it."""
+        monkeypatch.setattr(pricing, "PLAN_PRICES", [
+            {"effective": "2025-01-01", "plans": {"p": 20.0}},
+            {"effective": "2026-02-15", "plans": {"p": 40.0}},
+        ])
+        monkeypatch.setattr(pricing, "_PLAN_INDEX", None)
+        cost = pricing.prorated_plan_cost(self._spans((14, "p"), (14, "p")), *self.FEB)
+        assert cost == pytest.approx(30.0)
+
+
+class TestSeatPrice:
+    """A team seat is priced by the seat, not by the limits it happens to get."""
+
+    def _at(self):
+        return datetime(2026, 6, 1, tzinfo=UTC)
+
+    def test_the_claude_code_premium_seat_is_priced(self):
+        assert pricing.seat_price("team_tier_1", self._at()) == 100.0
+
+    def test_a_seat_nothing_names_is_none(self):
+        assert pricing.seat_price("team_tier_9", self._at()) is None
+
+    def test_no_seat_is_none(self):
+        assert pricing.seat_price(None, self._at()) is None
+
+    def test_the_seat_wins_over_the_rate_limit_tier(self):
+        assert pricing.tier_set_price({
+            "seat_tier": "team_tier_1",
+            "user_rate_limit_tier": "default_claude_max_20x",
+        }, self._at()) == 100.0
+
+    def test_a_personal_plan_has_no_seat_and_prices_by_its_tier(self):
+        assert pricing.tier_set_price({
+            "seat_tier": None,
+            "organization_rate_limit_tier": "default_claude_max_20x",
+        }, self._at()) == 200.0
+
+    def test_a_tier_set_nothing_prices_is_none(self):
+        assert pricing.tier_set_price({"organization_rate_limit_tier": "default_raven"},
+                                      self._at()) is None
+
+
+class TestTierFrom:
+    """The bucket a tier set drew against, spelled here so pricing imports neither."""
+
+    def test_the_user_tier_wins(self):
+        assert pricing.tier_from({
+            "user_rate_limit_tier": "u", "organization_rate_limit_tier": "o",
+        }) == "u"
+
+    def test_the_org_pool_answers_a_personal_plan(self):
+        assert pricing.tier_from({"organization_rate_limit_tier": "o"}) == "o"
+
+    def test_neither_is_none(self):
+        assert pricing.tier_from({"seat_tier": "team_tier_1"}) is None
+
+    def test_it_agrees_with_the_other_two_spellings(self):
+        from ccreport import cache_db, tier_timeline
+
+        row = {"user_rate_limit_tier": None, "organization_rate_limit_tier": "o"}
+        assert pricing.tier_from(row) == cache_db.effective_limit_tier(row)
+        assert pricing.tier_from(row) == tier_timeline.effective_tier(row)

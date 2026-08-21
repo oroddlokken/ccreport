@@ -1,0 +1,36 @@
+{# One breakdown table. Included by the dashboard once per dimension and by a
+   detail page once per scope, so the columns cannot drift between the two.
+   Takes: name (the dimension), rows, days.
+
+   The month table carries one column the others cannot: what the plan was
+   worth. A model or a project has no subscription behind it, and a day or a
+   week is shorter than the thing a plan is billed by. #}
+{% set planned = name == "month" %}
+<table class="breakdown">
+  <thead>
+    <tr>
+      <th scope="col">{{ name }}</th><th scope="col" class="num">Cost</th>
+      {% if planned %}<th scope="col" class="num">Plan</th>{% endif %}
+      <th scope="col" class="num">Share</th><th scope="col" class="num">Tokens</th>
+      <th scope="col" class="num">Calls</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td><a href="/{{ name }}/{{ row.key | urlencode }}?days={{ days }}">{{ row.key }}</a></td>
+      <td class="num" data-usd="{{ row.cost }}">{{ "${:,.2f}".format(row.cost) }}</td>
+      {% if planned %}
+      <td class="num" {% if row.plan_usd is defined %}data-usd="{{ row.plan_usd }}"{% endif %}>
+        {% if row.plan_usd is defined %}{{ "${:,.2f}".format(row.plan_usd) }}{% else %}<span class="dim">—</span>{% endif %}
+      </td>
+      {% endif %}
+      <td class="num">{{ (row.share * 100) | round(1) }}%</td>
+      <td class="num" data-int="{{ row.tokens }}">{{ "{:,}".format(row.tokens) }}</td>
+      <td class="num" data-int="{{ row.calls }}">{{ "{:,}".format(row.calls) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="{{ 6 if planned else 5 }}" class="dim">Nothing in this range.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>

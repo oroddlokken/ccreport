@@ -355,6 +355,146 @@ def _pricing_in_effect(resolved: str, periods: int) -> Mapping[str, float] | Non
     return None
 
 
+PLAN_PRICES: list[dict[str, Any]] = [
+    {
+        "effective": "2025-01-01",
+        "plans": {
+            "default_claude_pro": 20.0,
+            "default_claude_max_5x": 100.0,
+            "default_claude_max_20x": 200.0,
+        },
+        "seats": {
+            # The Claude Code premium seat on Team, at the annual rate. A
+            # standard seat is $20 and cannot run Claude Code at all, so a seat
+            # that shows up in a session log is this one. Billed monthly it is
+            # $125, which is a second entry here rather than a guess.
+            "team_tier_1": 100.0,
+        },
+    },
+]
+"""What a subscription costs per month, in USD, by seat and by rate-limit tier.
+
+The list price, tax excluded. That figure is the same wherever the payer lives
+and a VAT rate is not, so a report that wants the money actually charged is the
+place to apply one.
+
+Periods like PRICING_HISTORY's, for the same reason: a price rise is a new
+period, and pricing a month against the rate in force then keeps working after
+it. A tier absent from every period has no price, which is not a price of zero
+— a month priced against one has to read as unpriced.
+
+Two maps because a seat and a plan are priced by different fields. An account
+on a team seat still carries a rate-limit tier — `default_claude_max_5x` is a
+seat's bucket as readily as a personal Max plan's — so pricing off that field
+alone would charge a $100 seat at whatever the personal plan of the same limit
+costs. `seats` is checked first for that reason.
+"""
+
+_PLAN_INDEX: tuple[tuple[datetime, ...], tuple[int, ...]] | None = None
+
+
+def _plan_index() -> tuple[tuple[datetime, ...], tuple[int, ...]]:
+    """PLAN_PRICES' effective dates in order, and the periods they belong to.
+
+    `_period_index` for the plan table, sorted for the same reason: bisecting a
+    table an edit left out of order prices against the wrong period silently.
+    """
+    global _PLAN_INDEX
+    if _PLAN_INDEX is None:
+        order = sorted(
+            range(len(PLAN_PRICES)),
+            key=lambda i: _parse_effective(PLAN_PRICES[i]["effective"]),
+        )
+        starts = tuple(_parse_effective(PLAN_PRICES[i]["effective"]) for i in order)
+        _PLAN_INDEX = (starts, tuple(order))
+    return _PLAN_INDEX
+
+
+def _priced_at(kind: str, key: str | None, when: datetime | None) -> float | None:
+    """The newest price *kind* names for *key* among the periods live at *when*."""
+    if not key:
+        return None
+    starts, order = _plan_index()
+    periods = len(starts) if when is None else bisect_right(starts, when)
+    for i in reversed(order[:periods]):
+        price = PLAN_PRICES[i].get(kind, {}).get(key)
+        if price is not None:
+            return price
+    return None
+
+
+def plan_price(tier: str | None, when: datetime | None = None) -> float | None:
+    """The monthly list price of rate-limit tier *tier* at *when*, or None.
+
+    None covers three cases a caller must not turn into zero: no tier declared
+    for that stretch, a tier this table has never named, and a tier priced only
+    by a period that had not started yet.
+    """
+    return _priced_at("plans", tier, when)
+
+
+def seat_price(seat_tier: str | None, when: datetime | None = None) -> float | None:
+    """The monthly list price of team seat *seat_tier* at *when*, or None."""
+    return _priced_at("seats", seat_tier, when)
+
+
+def tier_set_price(tiers: Mapping[str, str | None], when: datetime | None) -> float | None:
+    """What one declared tier set cost per month: the seat, else the plan.
+
+    The seat wins because it is the thing bought. A seat carries a rate-limit
+    tier too, and it is often a personal plan's — pricing off that would charge
+    a team seat whatever the personal plan of the same limit costs, which is a
+    different number and not one anybody was billed.
+    """
+    return (
+        seat_price(tiers.get("seat_tier"), when)
+        or plan_price(tier_from(tiers), when)
+    )
+
+
+def tier_from(tiers: Mapping[str, str | None]) -> str | None:
+    """The rate-limit bucket a tier set draws against: per-user, then org pool.
+
+    `cache_db.effective_limit_tier` and `tier_timeline.effective_tier` spelled
+    once more, because this module may import neither: the status line defers
+    cache_db, and tier_timeline holds nothing but the stdlib on purpose.
+    """
+    return tiers.get("user_rate_limit_tier") or tiers.get("organization_rate_limit_tier")
+
+
+def prorated_plan_cost(
+    stretches: Sequence[tuple[float, float, Mapping[str, str | None] | None]],
+    start: datetime, end: datetime,
+) -> float | None:
+    """What the plans in *stretches* cost over *start*..*end*, by time in force.
+
+    A month that changed plan mid-cycle is billed prorated, so pricing it as
+    whichever plan happened to be running on the 1st would misprice five of the
+    seven months a year of receipts can hold. Each stretch pays its share of a
+    monthly rate: its own length over the span's.
+
+    None when nothing in the span has a price. Not zero — an unpriced month and
+    a free one are different answers, and a zero in a column beside real money
+    reads as the second.
+
+    Priced at each stretch's own start, so a span that crosses a price rise
+    pays the old rate up to it and the new one after.
+    """
+    span = end.timestamp() - start.timestamp()
+    if span <= 0:
+        return None
+    total, priced = 0.0, False
+    for from_ts, to_ts, tiers in stretches:
+        if tiers is None:
+            continue
+        rate = tier_set_price(tiers, datetime.fromtimestamp(from_ts, tz=UTC))
+        if rate is None:
+            continue
+        priced = True
+        total += rate * (to_ts - from_ts) / span
+    return total if priced else None
+
+
 def tiered_cost(count: int, base_rate: float, tiered_rate: float | None) -> float:
     """Calculate cost for a single token type with per-type 200K tiering."""
     if count > TIER_THRESHOLD and tiered_rate is not None:

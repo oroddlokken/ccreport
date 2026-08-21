@@ -508,3 +508,66 @@ class TestNoExternalOrigin:
         body = client.get("/").text
         assert "/static/vendor/uPlot.iife.min.js" in body
         assert "cdn." not in body
+
+
+class TestPlanColumn:
+    """A month's spend, beside what the plan behind it cost."""
+
+    def _declare(self, app, account, *entries):
+        from ccreport import tier_timeline
+        from ccreport.server import db
+
+        conn = app.state.db.connect()
+        db.set_account_tiers(conn, account, [
+            tier_timeline.Entry(
+                ts=ts, account=account, organization_rate_limit_tier=tier,
+            )
+            for ts, tier in entries
+        ], 1.0)
+        conn.commit()
+
+    def _months(self, app, days=90):
+        return {row["key"]: row for row in _view(app, days).breakdowns["month"]}
+
+    def _long_ago(self):
+        return datetime(2020, 1, 1, tzinfo=UTC).timestamp()
+
+    def test_a_month_with_no_declared_plan_carries_no_figure(self, app):
+        """Not a zero, which beside real spend reads as a month that was free."""
+        rows = self._months(app)
+        assert rows
+        assert all("plan_usd" not in row for row in rows.values())
+
+    def test_a_declared_plan_prices_every_month_on_the_page(self, app):
+        self._declare(app, "work", (self._long_ago(), "default_claude_max_5x"))
+        rows = self._months(app)
+        assert all(row["plan_usd"] == pytest.approx(100.0) for row in rows.values())
+
+    def test_two_accounts_sum_into_one_figure(self, app):
+        """The whole-server page sets one plan cost against one valuation."""
+        self._declare(app, "work", (self._long_ago(), "default_claude_max_5x"))
+        self._declare(app, "home", (self._long_ago(), "default_claude_pro"))
+        rows = self._months(app)
+        assert all(row["plan_usd"] == pytest.approx(120.0) for row in rows.values())
+
+    def test_an_unpriced_tier_leaves_the_month_unpriced(self, app):
+        self._declare(app, "work", (self._long_ago(), "default_raven"))
+        assert all("plan_usd" not in row for row in self._months(app).values())
+
+    def test_only_the_month_breakdown_gains_the_figure(self, app):
+        """A model has no subscription; a day is shorter than a billing cycle."""
+        self._declare(app, "work", (self._long_ago(), "default_claude_max_5x"))
+        view = _view(app)
+        for name, rows in view.breakdowns.items():
+            if name != "month":
+                assert all("plan_usd" not in row for row in rows)
+
+    def test_the_page_draws_the_column(self, app, client):
+        self._declare(app, "work", (self._long_ago(), "default_claude_max_5x"))
+        body = client.get("/?days=90&by=month").text
+        assert ">Plan</th>" in body
+        assert "$100.00" in body
+
+    def test_the_column_is_absent_from_the_other_tables(self, app, client):
+        body = client.get("/?days=90&by=model").text
+        assert body.count(">Plan</th>") == 1

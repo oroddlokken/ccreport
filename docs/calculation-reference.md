@@ -1307,6 +1307,53 @@ there would leave a change the person deleted still standing — and
 `db.content_stamp` reads the table so the dashboard's cache notices a
 declaration that arrived with no push behind it.
 
+#### 9.6.1 What the plan cost
+
+The timeline says which plan; `pricing.PLAN_PRICES` says what it cost. Monthly
+list prices in USD, tax excluded — that figure is the same wherever the payer
+lives and a VAT rate is not, so a report wanting the money actually charged is
+the place to apply one. Periods like `PRICING_HISTORY`'s, so a price rise is a
+new period and a month keeps pricing against the rate in force then.
+
+| Field | Priced by | Example |
+|-------|-----------|---------|
+| `seat_tier` | `seat_price` | `team_tier_1` → $100/mo, the Claude Code premium seat on Team at the annual rate |
+| `user_rate_limit_tier`, then `organization_rate_limit_tier` | `plan_price` | `default_claude_max_20x` → $200/mo |
+
+`tier_set_price` checks the seat first, and that ordering is the whole point of
+having two maps. A team seat carries a rate-limit tier as readily as a personal
+plan does — this org's seat reads `default_claude_max_5x` — so pricing off that
+field alone charges a seat whatever the personal plan of the same limit costs.
+The two happen to both be $100 today, which is exactly why the ordering has to
+be stated rather than discovered later.
+
+A tier no period names has no price. Not zero: an unpriced month and a free one
+are different answers, and a zero beside real spend reads as the second.
+
+**Proration.** A plan changed mid-cycle is billed prorated, so a month is
+priced that way. `TierTimeline.stretches` cuts a span at every declared change
+and hands back `(from, to, tiers)` — contiguous, gapless, and carrying all
+three tier fields rather than the resolved one, because the field that prices a
+stretch is not the field that groups it. `pricing.prorated_plan_cost` then
+weights each stretch's monthly rate by its share of the span, pricing each at
+its own start so a span crossing a price rise pays the old rate up to it.
+
+The split is two functions because neither module may gain the other's imports:
+`tier_timeline` holds nothing but the stdlib, and prices live in `pricing.py`.
+
+A worked month, February 2026 on the receipts behind this feature: 9 days
+before the first declared entry, 1 day of Pro at $20 and 25 days of Max 5x at
+$100, over a 28-day span — $90.53. The unpriced opening contributes nothing and
+does not void the month.
+
+**On the dashboard.** `dashboard._plan_costs` sums it across the accounts a
+page shows and attaches it to the `month` breakdown rows as `plan_usd`, after
+the fold rather than inside it: a plan cost is not a property of any record, and
+`breakdown()` sees neither the connection the timeline is read from nor which
+account a folded row belongs to. Only that dimension gets it — a model has no
+subscription behind it, and a day or a week is shorter than the thing a plan is
+billed by.
+
 ### 9.7 Rate-Limit Utilization History
 
 `windows.py` holds every calculation in this section: the window instance, its

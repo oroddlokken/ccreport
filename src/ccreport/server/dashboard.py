@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 
-from ccreport import aggregate, pricing
+from ccreport import aggregate, pricing, tier_timeline
 from ccreport.server import db, reports
 
 ALL_TIME = 0
@@ -425,6 +425,51 @@ def breakdown(merged: list[reports.MergedRecord], dimension: str,
     ]
 
 
+def _month_bounds(key: str) -> tuple[datetime, datetime]:
+    """A YYYY-MM key as the UTC instants its month opens and closes on.
+
+    UTC rather than the server's zone, because the timeline's own dates are
+    read as UTC. Both ends move together, so a month is a whole month wherever
+    the server sits — what it must not be is 31 days on one clock and 31 days
+    minus an offset on the other, which is what mixing the two would give.
+    """
+    year, month = (int(part) for part in key.split("-"))
+    start = datetime(year, month, 1, tzinfo=UTC)
+    end = datetime(year + (month == 12), (month % 12) + 1, 1, tzinfo=UTC)
+    return start, end
+
+
+def _plan_costs(conn, months: list[str], accounts: set[str]) -> dict[str, float]:
+    """What the plans behind *accounts* cost in each of *months*, in USD.
+
+    Summed across the accounts present, so the whole-server page sets one
+    figure against one valuation and an account page sets that account's.
+    *accounts* is display names, which is what a breakdown row groups on and
+    all a folded record carries.
+
+    A month no account has a declared plan for is absent rather than zero: a
+    column showing $0.00 beside real spend reads as a month that was free.
+    """
+    aliases = db.account_aliases(conn)
+    entries = db.account_tiers(conn)
+    if not entries:
+        return {}
+    timeline = tier_timeline.TierTimeline(entries)
+    wanted = [
+        row["account_uuid"] for row in reports.account_overview(conn)
+        if reports.account_display(row["account_uuid"], row["label"], aliases) in accounts
+    ]
+    costs: dict[str, float] = {}
+    for key in months:
+        start, end = _month_bounds(key)
+        for uuid in wanted:
+            spans = timeline.stretches(uuid, start.timestamp(), end.timestamp())
+            usd = pricing.prorated_plan_cost(spans, start, end)
+            if usd is not None:
+                costs[key] = costs.get(key, 0.0) + usd
+    return costs
+
+
 _CACHE: dict[tuple, tuple[tuple, Dashboard]] = {}
 _CACHE_LOCK = threading.Lock()
 
@@ -514,6 +559,20 @@ def build(conn, days: int, now: datetime | None = None,
     account_report = reports.build(merged, "account", nok)
     total_cost = account_report.total.cost
     accounts = [row.key for row in account_report.rows]
+    breakdowns = {
+        dimension: breakdown(merged, dimension, total_cost)
+        for dimension in (SCOPES if scope is not None else DIMENSIONS)
+    }
+    # Attached after the fold rather than inside it: a plan cost is not a
+    # property of any record, and breakdown() sees neither the connection the
+    # timeline is read from nor which account a folded row belongs to. One call
+    # for every month on the page, because the timeline is one query however
+    # many months are priced against it.
+    month_rows = breakdowns.get("month", [])
+    plan_costs = _plan_costs(conn, [row["key"] for row in month_rows], set(accounts))
+    for row in month_rows:
+        if row["key"] in plan_costs:
+            row["plan_usd"] = plan_costs[row["key"]]
 
     return Dashboard(
         days=days,
@@ -526,10 +585,7 @@ def build(conn, days: int, now: datetime | None = None,
         tiles=_tiles(merged, total_cost),
         chart_days=[] if scope is not None else axis,
         series=[] if scope is not None else _chart(merged, axis, accounts),
-        breakdowns={
-            dimension: breakdown(merged, dimension, total_cost)
-            for dimension in (SCOPES if scope is not None else DIMENSIONS)
-        },
+        breakdowns=breakdowns,
         machines=sorted({item.machine for item in merged}),
         scope=scope,
         charts=_charts(merged, axis, position_of) if scope is not None else [],

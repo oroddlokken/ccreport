@@ -413,6 +413,23 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
 - All pricing data lives in `pricing.py` — update only this file when prices
   change. Source: the LiteLLM pricing database; update `LAST_CHECKED` after
   verifying
+- Subscriptions are priced there too, in `PLAN_PRICES`: monthly list prices, tax
+  excluded, in periods like `PRICING_HISTORY`'s so a price rise is a new period
+  rather than an edit to a shipped one. Two maps per period, because a seat and
+  a plan are priced by different fields — a team seat carries a rate-limit tier
+  as readily as a personal plan does, and `default_claude_max_5x` on a seat is a
+  $100 seat rather than a $100 personal plan. `tier_set_price` checks `seats`
+  first for that reason. A tier no period names has no price, which is not a
+  price of zero: a month priced against one reads as unpriced, because a zero
+  beside real spend reads as a month that was free
+- A month that changed plan mid-cycle is billed prorated, so it is priced that
+  way: `tier_timeline.TierTimeline.stretches` cuts a span at every declared
+  change and `pricing.prorated_plan_cost` weights each stretch's monthly rate by
+  its share of the span. The split is two functions because neither module may
+  gain the other's imports — `tier_timeline` holds nothing but the stdlib, and
+  the prices belong in `pricing.py`. A stretch carries all three tier fields
+  rather than the resolved one: the field that prices a stretch is not the field
+  that groups it
 - A record's `costUSD` is its cost wherever this machine prices it — the JSONL
   parse (`pricing._line_cost`), a cached record (`pricing._rec_cost`) and the
   reports (`aggregate.UsageRecord.cost`) — and `calc_cost` answers only where

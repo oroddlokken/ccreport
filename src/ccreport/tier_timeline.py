@@ -27,6 +27,7 @@ import bisect
 import tomllib
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from itertools import pairwise
 from typing import NoReturn
 
 TIER_FIELDS = ("seat_tier", "user_rate_limit_tier", "organization_rate_limit_tier")
@@ -181,9 +182,15 @@ class TierTimeline:
     def __init__(self, entries: list[Entry]) -> None:
         self._ts: dict[str, list[float]] = {}
         self._tiers: dict[str, list[str | None]] = {}
+        # The whole tier set beside the resolved one. A report groups on the
+        # bucket an account drew against; a price is what the seat or the plan
+        # behind that bucket cost, and the two are not the same field.
+        self._sets: dict[str, list[dict[str, str | None]]] = {}
         for e in sorted(entries, key=lambda x: (x.account, x.ts)):
+            tiers = e.tiers()
             self._ts.setdefault(e.account, []).append(e.ts)
-            self._tiers.setdefault(e.account, []).append(effective_tier(e.tiers()))
+            self._tiers.setdefault(e.account, []).append(effective_tier(tiers))
+            self._sets.setdefault(e.account, []).append(tiers)
 
     def __bool__(self) -> bool:
         return bool(self._ts)
@@ -195,3 +202,39 @@ class TierTimeline:
             return None
         i = bisect.bisect_right(stamps, ts) - 1
         return self._tiers[account][i] if i >= 0 else None
+
+    def stretches(
+        self, account: str, start: float, end: float,
+    ) -> list[tuple[float, float, dict[str, str | None] | None]]:
+        """*account*'s plan spans clipped to *start*..*end*, as (from, to, tiers).
+
+        What a caller needs to price a month the way it was billed: a plan
+        changed mid-cycle bills prorated, so the answer is not one tier but how
+        long each was in force. Contiguous and gapless, so the lengths sum to
+        the span — a stretch before the first declared entry carries None
+        rather than being dropped, which is what keeps an unpriced opening
+        visible instead of quietly shortening the month.
+
+        All three tier fields travel, not the resolved one: a team seat and a
+        personal plan can land on the same rate-limit bucket and cost different
+        money, so the field that prices a stretch is not the field that groups
+        it.
+
+        Pricing is not done here: this module stays free of every import but
+        the stdlib, and the prices are `pricing.py`'s to hold.
+        """
+        if end <= start:
+            return []
+        stamps = self._ts.get(account)
+        if not stamps:
+            return [(start, end, None)]
+        tiers = self._sets[account]
+        # Every boundary inside the span, plus the span's own ends. bisect_left
+        # so an entry landing exactly on `start` opens the first stretch rather
+        # than adding a zero-length one before it.
+        cuts = [start, *(t for t in stamps if start < t < end), end]
+        out = []
+        for from_ts, to_ts in pairwise(cuts):
+            i = bisect.bisect_right(stamps, from_ts) - 1
+            out.append((from_ts, to_ts, tiers[i] if i >= 0 else None))
+        return out

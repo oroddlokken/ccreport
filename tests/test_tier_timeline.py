@@ -232,3 +232,79 @@ class TestTierTimeline:
     def test_an_empty_timeline_is_falsy(self):
         assert not tier_timeline.TierTimeline([])
         assert tier_timeline.TierTimeline(tier_timeline.parse(self.ENTRIES))
+
+
+class TestStretches:
+    """A month is billed by how long each plan was in force, not by one lookup."""
+
+    ENTRIES = """
+        [[tier]]
+        at = 2026-02-10T00:00:00Z
+        account = "home"
+        organization_rate_limit_tier = "pro"
+        [[tier]]
+        at = 2026-02-20T00:00:00Z
+        account = "home"
+        organization_rate_limit_tier = "max_5x"
+    """
+    FEB = (_epoch("2026-02-01T00:00:00+00:00"), _epoch("2026-03-01T00:00:00+00:00"))
+
+    @pytest.fixture
+    def timeline(self):
+        return tier_timeline.TierTimeline(tier_timeline.parse(self.ENTRIES))
+
+    def _days(self, spans):
+        return [
+            (round((b - a) / 86400, 3),
+             None if t is None else t["organization_rate_limit_tier"])
+            for a, b, t in spans
+        ]
+
+    def test_it_cuts_at_every_entry_inside_the_span(self, timeline):
+        assert self._days(timeline.stretches("home", *self.FEB)) == [
+            (9.0, None), (10.0, "pro"), (9.0, "max_5x"),
+        ]
+
+    def test_the_lengths_sum_to_the_span(self, timeline):
+        spans = timeline.stretches("home", *self.FEB)
+        assert sum(b - a for a, b, _ in spans) == self.FEB[1] - self.FEB[0]
+
+    def test_it_is_gapless_and_contiguous(self, timeline):
+        spans = timeline.stretches("home", *self.FEB)
+        assert [b for _, b, _ in spans[:-1]] == [a for a, _, _ in spans[1:]]
+
+    def test_an_unpriced_opening_is_carried_rather_than_dropped(self, timeline):
+        """Dropping it would quietly shorten the month it is part of."""
+        assert timeline.stretches("home", *self.FEB)[0][2] is None
+
+    def test_a_stretch_carries_every_tier_field_not_the_resolved_one(self):
+        """A seat and a personal plan can share a bucket and cost different money."""
+        tl = tier_timeline.TierTimeline(tier_timeline.parse("""
+            [[tier]]
+            at = 2026-02-10T00:00:00Z
+            account = "work"
+            seat_tier = "team_tier_1"
+            user_rate_limit_tier = "default_claude_max_5x"
+        """))
+        (_, _, tiers) = tl.stretches("work", *self.FEB)[1]
+        assert tiers == {
+            "seat_tier": "team_tier_1",
+            "user_rate_limit_tier": "default_claude_max_5x",
+            "organization_rate_limit_tier": None,
+        }
+
+    def test_a_span_wholly_inside_one_plan_is_one_stretch(self, timeline):
+        march = (_epoch("2026-03-01T00:00:00+00:00"), _epoch("2026-04-01T00:00:00+00:00"))
+        assert self._days(timeline.stretches("home", *march)) == [(31.0, "max_5x")]
+
+    def test_an_entry_landing_on_the_span_start_opens_it(self, timeline):
+        """Not a zero-length stretch of whatever ran before."""
+        spans = timeline.stretches("home", _epoch("2026-02-10T00:00:00+00:00"), self.FEB[1])
+        assert self._days(spans) == [(10.0, "pro"), (9.0, "max_5x")]
+
+    def test_an_account_with_no_entries_is_one_unpriced_stretch(self, timeline):
+        assert self._days(timeline.stretches("nobody", *self.FEB)) == [(28.0, None)]
+
+    def test_an_empty_span_has_no_stretches(self, timeline):
+        assert timeline.stretches("home", self.FEB[1], self.FEB[0]) == []
+        assert timeline.stretches("home", self.FEB[0], self.FEB[0]) == []

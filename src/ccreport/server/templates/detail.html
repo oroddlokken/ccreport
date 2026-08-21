@@ -62,28 +62,9 @@
 <section>
   <div class="chart-head"><h2>By {{ dimension }}</h2></div>
   <div class="table-clip">
-  <table class="breakdown">
-    <thead>
-      <tr>
-        <th scope="col">{{ dimension }}</th><th scope="col" class="num">Cost</th>
-        <th scope="col" class="num">Share</th><th scope="col" class="num">Tokens</th>
-        <th scope="col" class="num">Calls</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for row in view.breakdowns[dimension] %}
-      <tr>
-        <td><a href="/{{ dimension }}/{{ row.key | urlencode }}?days={{ view.days }}">{{ row.key }}</a></td>
-        <td class="num" data-usd="{{ row.cost }}">{{ "${:,.2f}".format(row.cost) }}</td>
-        <td class="num">{{ (row.share * 100) | round(1) }}%</td>
-        <td class="num" data-int="{{ row.tokens }}">{{ "{:,}".format(row.tokens) }}</td>
-        <td class="num" data-int="{{ row.calls }}">{{ "{:,}".format(row.calls) }}</td>
-      </tr>
-      {% else %}
-      <tr><td colspan="5" class="dim">Nothing in this range.</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  {% with name = dimension, rows = view.breakdowns[dimension], days = view.days %}
+    {% include "_breakdown_table.html" %}
+  {% endwith %}
   </div>
 </section>
 {% endfor %}
