@@ -1,7 +1,7 @@
 """Which Claude account a record billed to, from the account_events change log.
 
-A session JSONL names no account and ~/.claude.json holds only the current
-login, so this timeline is the only thing that can attribute a historic record.
+A session JSONL names no account and Claude Code's config file holds only the
+current login, so this timeline is the only thing that can attribute a historic record.
 It lives apart from ccreport.py because the push client answers the same
 question in a detached process, and importing the CLI there would pull rich
 into it.

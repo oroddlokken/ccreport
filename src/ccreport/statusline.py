@@ -866,9 +866,24 @@ def _accumulate_cache_stats(
 
 # --- Account capture ---
 
-# Where Claude Code keeps the signed-in account. There is no configurable
-# location for it — unlike the settings files, which merge across three roots.
+# Where Claude Code keeps the signed-in account. A config directory holds it on
+# some installs and $HOME on others, and an upgrade leaves both behind, so the
+# directories are tried first and the home file is what answers when neither is
+# there.
+CLAUDE_CONFIG_DIRS = (Path.home() / ".claude-config", Path.home() / ".claude")
 CLAUDE_CONFIG_JSON = Path.home() / ".claude.json"
+
+
+def _config_json_path() -> Path:
+    """The config file to read: the first candidate that exists, home last."""
+    for directory in CLAUDE_CONFIG_DIRS:
+        candidate = directory / ".claude.json"
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return CLAUDE_CONFIG_JSON
 
 
 def _capture_account(memo: dict | None = None) -> None:
@@ -879,21 +894,24 @@ def _capture_account(memo: dict | None = None) -> None:
     unrecorded here is one ccreport can never attribute. cache_db writes only on
     an actual change, so the usual render pays a read and a SELECT.
 
-    ~/.claude.json is large — hundreds of kilobytes — and holds one key this
-    cares about, so *memo* carries the (mtime_ns, size) the last parse saw and
-    an unchanged stamp skips the parse. Pass no memo to force it.
+    The file is large — hundreds of kilobytes — and holds one key this cares
+    about, so *memo* carries the (path, mtime_ns, size) the last parse saw and
+    an unchanged stamp skips the parse. The path is in the stamp because
+    _config_json_path can start answering with a different file mid-session.
+    Pass no memo to force the parse.
 
     Best-effort: any failure costs the change log one sample, never the status
     line. docs/calculation-reference.md section 9.1 enumerates them.
     """
     try:
+        path = _config_json_path()
         stamp = None
         if memo is not None:
-            st = CLAUDE_CONFIG_JSON.stat()
-            stamp = [st.st_mtime_ns, st.st_size]
+            st = path.stat()
+            stamp = [str(path), st.st_mtime_ns, st.st_size]
             if memo.get("account") == stamp:
                 return
-        oauth = json.loads(CLAUDE_CONFIG_JSON.read_bytes()).get("oauthAccount")
+        oauth = json.loads(path.read_bytes()).get("oauthAccount")
         if isinstance(oauth, dict):
             from ccreport import cache_db
 
@@ -909,7 +927,7 @@ def _capture_account(memo: dict | None = None) -> None:
 def _render_account() -> str:
     """Who this session bills to: email, organization, or both.
 
-    Source is the change log _capture_account writes, not ~/.claude.json: the
+    Source is the change log _capture_account writes, not the config file: the
     log is what ccreport attributes records to, so the segment and the reports
     name one account by one name, and a render whose memo skipped the parse
     still has the newest event to read.

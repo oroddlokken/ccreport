@@ -122,8 +122,12 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   rate-limit snapshots run on slow renders only
 - A second per-session temp file (`.memo`, `_load_memo`/`_save_memo`) holds what
   no later render need re-derive and so has no TTL: the DSP verdict, fixed once
-  the session's `claude` was launched, and the `(mtime_ns, size)` of
-  `~/.claude.json` that the last account capture parsed
+  the session's `claude` was launched, and the `(path, mtime_ns, size)` of the
+  config file that the last account capture parsed — the path is in the stamp
+  because `statusline._config_json_path` picks the first of
+  `~/.claude-config/.claude.json`, `~/.claude/.claude.json` and
+  `~/.claude.json` that exists, and a file appearing in a config directory is a
+  different file rather than a rewrite of the one the stamp came from
 - The quota guard reads and never fetches. S and W come from the `.quota` file a
   slow render writes while `CCQUOTA_STOP` is set — `rate_limit_snapshots` stores
   a row only when a reading moves, so its newest ts dates the last change and
@@ -473,7 +477,7 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   log's own key is persisted
 - Which account a record billed to comes from the `account_events` change log,
   not the JSONL — a session log names no account. Slow-path renders append an
-  event when `~/.claude.json` names a different identity or tier, and `ccreport`
+  event when the config file names a different identity or tier, and `ccreport`
   stamps each record at read time from the newest event at or before it.
   `cache_db._ACCOUNT_IDENTITY_COLS` answers "same account?",
   `cache_db.effective_limit_tier()` picks the user tier over the org one, and

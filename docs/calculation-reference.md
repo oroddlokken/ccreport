@@ -1098,17 +1098,21 @@ All ANSI color codes consolidated here:
 ## 9. Account Attribution
 
 Which Claude account paid for a record. Nothing in the data says so directly:
-a session JSONL carries no account field, and `~/.claude.json` holds only the
+a session JSONL carries no account field, and the config file holds only the
 account signed in *right now*. Attribution therefore runs off a captured
 timeline of account changes.
 
 ### 9.1 Capture
 
-- **Source**: the `oauthAccount` object in `~/.claude.json`
+- **Source**: the `oauthAccount` object in the config file
+  `statusline.py::_config_json_path()` resolves — the first of
+  `~/.claude-config/.claude.json`, `~/.claude/.claude.json` and
+  `~/.claude.json` that exists. Which one holds it depends on the install:
+  a Linux machine here carries the `~/.claude/` copy, macOS the `$HOME` one
 - **Capture point**: `statusline.py::_capture_account()`, on every
   slow-path render. The render is the only thing that runs often enough to
   catch a mid-session `/login`; there is no hook for it. The file is a quarter
-  of a megabyte, so it is reparsed only when its `(mtime_ns, size)` differs
+  of a megabyte, so it is reparsed only when its `(path, mtime_ns, size)` differs
   from the stamp the session memo holds — an account cannot have changed in a
   file nothing rewrote
 - **Stored — identity**: `accountUuid` (stable key), `emailAddress` (label),

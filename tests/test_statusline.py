@@ -1234,10 +1234,62 @@ class TestCaptureAccount:
 
     @pytest.fixture
     def config(self, tmp_path, monkeypatch):
-        """A stand-in ~/.claude.json the test writes; returns its path."""
+        """A stand-in config file the test writes; returns its path.
+
+        The directory candidates are pointed at empty tmp dirs as well, or a
+        machine that really has ~/.claude/.claude.json would read its own
+        account into the test.
+        """
         path = tmp_path / "claude.json"
+        monkeypatch.setattr(sl, "CLAUDE_CONFIG_DIRS", (tmp_path / "a", tmp_path / "b"))
         monkeypatch.setattr(sl, "CLAUDE_CONFIG_JSON", path)
         return path
+
+    def test_the_home_file_answers_when_no_directory_holds_one(self, config, tmp_path):
+        assert sl._config_json_path() == config
+
+    def test_a_config_directory_wins_over_the_home_file(self, config, tmp_path):
+        second = tmp_path / "b" / ".claude.json"
+        second.parent.mkdir()
+        second.write_text("{}")
+        assert sl._config_json_path() == second
+
+    def test_the_first_directory_wins_over_the_second(self, config, tmp_path):
+        for name in ("a", "b"):
+            candidate = tmp_path / name / ".claude.json"
+            candidate.parent.mkdir()
+            candidate.write_text("{}")
+        assert sl._config_json_path() == tmp_path / "a" / ".claude.json"
+
+    def test_the_account_is_read_from_the_directory_the_resolver_picked(self, tmp_path, config):
+        import json
+
+        picked = tmp_path / "a" / ".claude.json"
+        picked.parent.mkdir()
+        picked.write_text(json.dumps({"oauthAccount": self.ACC}))
+        config.write_text(json.dumps({"oauthAccount": {"accountUuid": "uuid-home"}}))
+        sl._capture_account()
+        (event,) = self._log()
+        assert event["account_uuid"] == "uuid-work"
+
+    def test_the_memo_stamp_carries_the_path(self, tmp_path, config):
+        """A file appearing in a config directory is a different file, not a
+        rewrite of the one the stamp was taken from, so the skip cannot hold.
+        """
+        import json
+        import os
+
+        memo: dict = {}
+        config.write_text(json.dumps({"oauthAccount": self.ACC}))
+        sl._capture_account(memo)
+
+        picked = tmp_path / "a" / ".claude.json"
+        picked.parent.mkdir()
+        picked.write_text(json.dumps({"oauthAccount": {"accountUuid": "uuid-home"}}))
+        st = config.stat()
+        os.utime(picked, ns=(st.st_atime_ns, st.st_mtime_ns))
+        sl._capture_account(memo)
+        assert [e["account_uuid"] for e in self._log()] == ["uuid-work", "uuid-home"]
 
     def _log(self):
         from ccreport import cache_db
