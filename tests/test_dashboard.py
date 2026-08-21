@@ -730,3 +730,84 @@ class TestPlanTile:
     def test_the_span_reads_in_whichever_unit_is_a_quantity(self, months, days, expected):
         """"0.3 months" is a fraction to convert; "8 days" is already converted."""
         assert dashboard._fmt_span(months, days) == expected
+
+
+class TestPlanSpanOnScopedPages:
+    """The denominator has to cover the same period as the numerator."""
+
+    def _declare(self, app):
+        from ccreport import tier_timeline
+        from ccreport.server import db
+
+        conn = app.state.db.connect()
+        db.set_account_tiers(conn, "work", [tier_timeline.Entry(
+            ts=datetime(2020, 1, 1, tzinfo=UTC).timestamp(), account="work",
+            organization_rate_limit_tier="default_claude_max_5x",
+        )], 1.0)
+        conn.commit()
+
+    def _tile(self, view):
+        return next((t for t in view.tiles if t.label == "Value vs plan"), None)
+
+    def _scoped(self, app, dimension, key, days=90):
+        return dashboard.build(
+            app.state.db.connect(), days, NOW, dashboard.Scope(dimension, key),
+        )
+
+    def test_a_project_prices_the_span_it_ran_over_not_the_range(self, app):
+        """projB's records cover part of the 90 days the toggle reaches back."""
+        self._declare(app)
+        start, end = dashboard.range_bounds(90, NOW)
+        merged = dashboard.reports.load_grouped(
+            app.state.db.connect(), dashboard.reports.Filters(since=start, until=end),
+        )
+        first, last = dashboard._active_span(
+            [m for m in merged if m.record.project == "projB"], start, end,
+        )
+        assert (first, last) != (start, end)
+        months = pricing.months_in_span(first, last)
+        scoped = present(self._tile(self._scoped(app, "project", "projB")))
+        assert dashboard._fmt_span(months, (last - first).days) in scoped.subline
+
+    def test_the_scoped_figure_is_smaller_than_the_whole_ranges(self, app):
+        self._declare(app)
+        plans = dashboard._Plans(app.state.db.connect(), {"work@example.net"})
+        start, end = dashboard.range_bounds(90, NOW)
+        merged = dashboard.reports.load_grouped(
+            app.state.db.connect(), dashboard.reports.Filters(since=start, until=end),
+        )
+        narrow = dashboard._active_span(
+            [m for m in merged if m.record.project == "projB"], start, end,
+        )
+        assert present(plans.cost(*narrow)) < present(plans.cost(start, end))
+
+    def test_a_month_page_still_charges_the_whole_month(self, app):
+        """The month was paid for whether or not every day of it was worked."""
+        self._declare(app)
+        key = _view(app, 90).breakdowns["month"][0]["key"]
+        tile = present(self._tile(self._scoped(app, "month", key)))
+        opens, closes = dashboard._month_bounds(key)
+        plans = dashboard._Plans(app.state.db.connect(), {"work@example.net"})
+        expected = present(plans.cost(opens, closes))
+        assert f"${expected:,.0f}" in tile.subline.replace("$100.00", "$100")
+
+    def test_the_whole_server_page_prices_its_whole_range(self, app):
+        """No scope, so the range is the question and the bound is not applied."""
+        self._declare(app)
+        start, end = dashboard.range_bounds(90, NOW)
+        expected = dashboard._fmt_span(
+            pricing.months_in_span(start, end), (end - start).days,
+        )
+        assert expected in present(self._tile(_view(app, 90))).subline
+
+    def test_an_empty_page_falls_back_to_the_range(self, app):
+        start, end = dashboard.range_bounds(90, NOW)
+        assert dashboard._active_span([], start, end) == (start, end)
+
+    def test_the_bound_never_widens_past_the_range(self, app):
+        self._declare(app)
+        start, end = dashboard.range_bounds(7, NOW)
+        merged = dashboard.reports.load_grouped(app.state.db.connect())
+        first, last = dashboard._active_span(merged, start, end)
+        assert first >= start
+        assert last <= end

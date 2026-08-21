@@ -297,6 +297,27 @@ def _in_nok(usd: float, nok: aggregate.NokCtx, on: date) -> float | None:
     return usd * rate * (1.25 if nok.mva else 1.0)
 
 
+def _active_span(merged: list[reports.MergedRecord], start: datetime,
+                 end: datetime) -> tuple[datetime, datetime]:
+    """The part of *start*..*end* the page's own records actually cover.
+
+    A page about one project is set against the subscription that bought it,
+    and the denominator has to cover the same period as the numerator. The
+    range bounds do not: on the all-time toggle they run from the server's
+    oldest record, so a project first seen in August was priced against every
+    month since February and read as barely having paid for itself.
+
+    Whole local days, so a project seen once still spans a day rather than an
+    instant, and clipped to the range so a toggle still narrows the page.
+    """
+    if not merged:
+        return start, end
+    stamps = [item.record.timestamp.astimezone(start.tzinfo) for item in merged]
+    first = min(stamps).replace(hour=0, minute=0, second=0, microsecond=0)
+    last = max(stamps).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    return max(first, start), min(last, end)
+
+
 def _fmt_span(months: float, days: int) -> str:
     """How long a span is, in whichever unit reads as a quantity at that scale.
 
@@ -669,12 +690,21 @@ def build(conn, days: int, now: datetime | None = None,
             )
 
     tiles = _tiles(merged, total_cost)
-    plan_usd = plans.cost(start, end)
+    # A period page charges its whole period: the month was paid for whether or
+    # not every day of it was worked, and shortening it to the days with
+    # records would flatter every quiet month. Every other scope is narrowed to
+    # what it covers.
+    priced_from, priced_to = (
+        (start, end) if scope is None or scope.is_period
+        else _active_span(merged, start, end)
+    )
+    plan_usd = plans.cost(priced_from, priced_to)
     if plan_usd is not None:
         tiles.append(_plan_tile(
-            total_cost, plan_usd, nok, (end - timedelta(days=1)).date(),
+            total_cost, plan_usd, nok, (priced_to - timedelta(days=1)).date(),
             scope.dimension if scope and scope.dimension in SLICE_SCOPES else None,
-            _fmt_span(pricing.months_in_span(start, end), (end - start).days),
+            _fmt_span(pricing.months_in_span(priced_from, priced_to),
+                      (priced_to - priced_from).days),
         ))
 
     return Dashboard(

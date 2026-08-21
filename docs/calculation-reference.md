@@ -1377,6 +1377,18 @@ Proportional attribution was the alternative and is useless here: giving each
 project its share of the plan makes every slice show the dashboard's multiple,
 so the tile would say nothing about the slice.
 
+**Which span it prices.** A scoped page prices the subscription over the span
+its own records cover, clipped to the page's range (`dashboard._active_span`) —
+not over the range bounds, which on the all-time toggle run from the server's
+oldest record. A project first seen in August priced against every month since
+February reads as barely having paid for itself, when over its own life it paid
+many times over.
+
+Period pages are the exception and charge their whole period: a month was paid
+for whether or not every day of it was worked, and shortening it to the days
+with records would flatter every quiet month. The whole-server page needs no
+bound — its records are all the records.
+
 Two things the wording carries deliberately. A quiet span is worth *less* than
 its plan, and the subline says "less than" rather than printing a minus sign
 where a word belongs. And every figure in it is an API-list valuation, not

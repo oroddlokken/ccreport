@@ -236,7 +236,11 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   project, machine — the numerator is one part of what the subscription bought
   and the denominator is all of it, so the subline says "this project alone".
   Without that qualifier the sentence reads identically on a page about one
-  model and a page about everything
+  model and a page about everything. A scoped page prices the span its own
+  records cover (`_active_span`) rather than the range bounds, which on the
+  all-time toggle start at the server's oldest record; a period page is the
+  exception and charges its whole period, because the month was paid for
+  whether or not every day of it was worked
 - Which rows a report has is `aggregate.py`; what they look like is
   `ccreport.py`. The row builders there are the one place the rollup path and
   the full record path meet, and the server folds records through the same
