@@ -133,12 +133,33 @@ class RemainderMachine(BaseModel):
     )
 
 
+class DeclaredTier(BaseModel):
+    """One plan change this server has declared for the asking account.
+
+    No account field: the response is scoped to the one account the pull asked
+    about, and a machine signed in elsewhere has no business holding another's
+    plan history. No display name either — the client resolves identity off its
+    own capture log, as `ccreport tiers` does.
+    """
+
+    ts: float
+    seat_tier: str | None = None
+    user_rate_limit_tier: str | None = None
+    organization_rate_limit_tier: str | None = None
+
+
 class PullResponse(BaseModel):
     """The remainder, per contributing machine. Never the asking machine's own."""
 
     account_uuid: str
     bucket_s: int
     machines: list[RemainderMachine] = Field(default_factory=list)
+    tiers: list[DeclaredTier] = Field(default_factory=list)
+    """This account's declared timeline, oldest first. The server is where a
+    timeline has to be typed for the dashboard to price a month, and it reaches
+    records no client can still re-push, so it is the copy the machines take
+    theirs from. Empty where this server declares nothing, which a client reads
+    as nothing to take rather than as a timeline of no entries."""
 
 
 class IngestBatch(BaseModel):
@@ -427,6 +448,14 @@ def _remainder(
     return PullResponse(
         account_uuid=request.account_uuid,
         bucket_s=pull.BUCKET_S,
+        tiers=[
+            DeclaredTier(
+                ts=entry.ts, seat_tier=entry.seat_tier,
+                user_rate_limit_tier=entry.user_rate_limit_tier,
+                organization_rate_limit_tier=entry.organization_rate_limit_tier,
+            )
+            for entry in db.account_tiers(conn, request.account_uuid)
+        ],
         machines=[
             RemainderMachine(
                 machine_id=item.machine_id, label=item.label,

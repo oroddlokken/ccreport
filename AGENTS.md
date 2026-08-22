@@ -553,6 +553,19 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   behind it. `set_account_tiers` replaces one account's rows wholesale: the
   timeline is a document, and merging a paste into what was there would leave a
   change the person deleted still standing
+- The timeline travels back the other way on the pull, as `pull.tiers` beside
+  the cost rows, scoped to the one account the pull asked about. The server
+  wins: `push.store_tiers` replaces that account's backfilled rows with what
+  came back, so a `ccreport tiers` run against an account the server declares
+  is undone by the next pull, and `ccreport tiers` says so where a server is
+  configured. An empty section writes nothing rather than clearing what is
+  here — a server nobody typed a timeline into must not delete the declaration
+  on the one machine whose person did. `cache_db.replace_backfilled_account`
+  inserts OR IGNORE: `account_events.ts` is the whole primary key, so an entry
+  landing on a capture's own instant would take the only record that anyone was
+  signed in at that moment, and it is dropped instead. Identity is copied from
+  this machine's capture log, never from the wire — the server holds a uuid and
+  a plan change, which says nothing about who the account is
 - How full each rate-limit window got over time lives in `rate_limit_snapshots`,
   appended by slow-path renders from the live percentages, so an unobserved
   window leaves no history. `ccreport limits` is the reader: it groups by

@@ -550,16 +550,25 @@ def set_account_alias(conn: sqlite3.Connection, account_uuid: str, alias: str, n
     )
 
 
-def account_tiers(conn: sqlite3.Connection) -> list[tier_timeline.Entry]:
+def account_tiers(
+    conn: sqlite3.Connection, account_uuid: str | None = None,
+) -> list[tier_timeline.Entry]:
     """Every declared plan change, as the entries a TierTimeline is built from.
 
     Read once per report and handed to the row builders, for the reason
     account_aliases is: a merged corpus is one query's worth of plan changes
     and hundreds of thousands of records.
+
+    *account_uuid* narrows it to one account, which is what a pull sends back:
+    a machine is signed in to one account and another's plan history is not
+    its to hold.
     """
+    where = " WHERE account_uuid = ?" if account_uuid is not None else ""
     rows = conn.execute(
-        "SELECT account_uuid, from_ts, seat_tier, user_rate_limit_tier, "
-        "organization_rate_limit_tier FROM account_tiers ORDER BY account_uuid, from_ts"
+        "SELECT account_uuid, from_ts, seat_tier, user_rate_limit_tier, "  # noqa: S608
+        f"organization_rate_limit_tier FROM account_tiers{where} "
+        "ORDER BY account_uuid, from_ts",
+        (account_uuid,) if account_uuid is not None else (),
     ).fetchall()
     return [
         tier_timeline.Entry(

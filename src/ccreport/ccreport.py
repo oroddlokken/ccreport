@@ -1731,10 +1731,11 @@ def cmd_push(args) -> None:
         # samples" on every line reads as a broken feature.
         samples = f", {result.samples} samples" if result.samples else ""
         pulled = f", {result.pulled} machines pulled" if result.pulled else ""
+        declared = f", {result.declared} plan changes" if result.declared else ""
         console.print(
             f"[bold]{result.server}[/bold]: {len(result.accepted)} sent, "
             f"{len(result.skipped)} unchanged, {len(result.rejected)} rejected "
-            f"({result.records} records{samples}{pulled})",
+            f"({result.records} records{samples}{pulled}{declared})",
         )
         for path, detail in result.rejected:
             failed = True
@@ -1889,9 +1890,12 @@ def cmd_pull(args) -> None:
             failed = True
             console.print(f"[bold]{server.url}[/bold]: [red]{exc}[/red]")
             continue
+        declared = (
+            f", {result.declared} declared plan change(s)" if result.declared else ""
+        )
         console.print(
             f"[bold]{server.url}[/bold]: {result.pulled} other machine(s) "
-            "on this account",
+            f"on this account{declared}",
         )
     if failed:
         sys.exit(1)
@@ -2231,6 +2235,8 @@ def cmd_tiers(args) -> None:
     Exits 1 on an unreadable file or an account the log does not know. Every
     other outcome, abort included, returns.
     """
+    from ccreport import push
+
     if args.remove:
         gone = clear_backfilled_accounts()
         print(f"Removed {gone} declared plan change(s)." if gone
@@ -2273,6 +2279,10 @@ def cmd_tiers(args) -> None:
 
     backfill_account_events(rows)
     print("Declared. `ccreport limits` reads these as the tier in force.")
+    if push.configured():
+        print("A server that declares one of these accounts replaces its rows here on "
+              "the next pull. Type the timeline there too, or it comes back as the "
+              "server has it.")
     print("Undo with: ccreport tiers --remove")
 
 

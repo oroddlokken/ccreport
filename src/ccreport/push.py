@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ccreport import protocol
+from ccreport import protocol, tier_timeline
 
 CONFIG_PATH = Path.home() / ".config" / "ccreport" / "push.toml"
 
@@ -115,6 +115,10 @@ class PushResult:
     pulled: int = 0
     """Contributing machines the reply named. Zero on a plain push, which asks
     for no remainder, and on a machine signed in to no account at all."""
+    declared: int = 0
+    """Plan changes the server declared for this account, written to the local
+    change log. Zero where the server declares none, which is not the same as a
+    timeline of no entries — see store_tiers."""
     blocked_by: tuple[str, ...] = ()
     """The CIDRs a blocked push wanted and could not find an address inside.
 
@@ -771,6 +775,61 @@ def store_pull(server_url: str, reply: dict, now: float) -> int:
     return len(machines)
 
 
+def store_tiers(reply: dict) -> int:
+    """Write the server's declared timeline for this account. Returns the rows.
+
+    The server is the one source: the timeline has to be typed there for the
+    dashboard to price a month, and it reaches records whose logs have rotated
+    off every machine. So its document replaces this account's backfilled rows
+    outright, and a `ccreport tiers` run against an account the server declares
+    is undone by the next pull.
+
+    A reply that declares nothing writes nothing, rather than clearing what is
+    here. An empty section is a server nobody has typed a timeline into, and
+    reading it as "the timeline is empty" would delete the declaration on the
+    one machine whose person did type one.
+
+    Identity is copied from this machine's own capture log, as `ccreport tiers`
+    copies it: a plan change says nothing about who the account is, and a row
+    that introduced an identity could introduce a typo of one.
+    """
+    from ccreport import cache_db
+
+    remainder = reply.get("pull") or {}
+    account_uuid = remainder.get("account_uuid")
+    entries = remainder.get("tiers") or []
+    if not account_uuid or not entries:
+        return 0
+    identity = _identity_of(account_uuid)
+    if identity is None:
+        return 0
+    return cache_db.replace_backfilled_account(account_uuid, [
+        {
+            "ts": float(entry["ts"]),
+            **identity,
+            **{field: entry.get(field) for field in tier_timeline.TIER_FIELDS},
+        }
+        for entry in entries
+    ])
+
+
+def _identity_of(account_uuid: str) -> dict | None:
+    """The identity columns this machine's log carries for *account_uuid*.
+
+    The newest event naming it, so a person whose login email changed is
+    written under the address they use now. None where the log has never seen
+    the account, which a pull cannot reach — it asks about the account this
+    machine is signed in to — and which is left as a no-op rather than as a row
+    naming nobody.
+    """
+    from ccreport.cache_db import _ACCOUNT_IDENTITY_COLS, load_account_events
+
+    for event in reversed(load_account_events()):
+        if event["account_uuid"] == account_uuid:
+            return {col: event[col] for col in _ACCOUNT_IDENTITY_COLS}
+    return None
+
+
 def pull_from(server: ServerConfig) -> PushResult:
     """Ask *server* for the spend this machine does not have, and store it.
 
@@ -789,6 +848,7 @@ def pull_from(server: ServerConfig) -> PushResult:
         "pull": {"account_uuid": account_uuid},
     })
     result.pulled = store_pull(server.url, reply, now)
+    result.declared = store_tiers(reply)
     return result
 
 
@@ -881,6 +941,7 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
             acknowledged.append((path, mtime_ns, size))
         if reply.get("pull"):
             result.pulled = store_pull(server.url, reply, pulled_at)
+            result.declared = store_tiers(reply)
 
     # The only writes, and only for what the server said it stored. A rejected
     # file stays unrecorded on purpose, so the next run offers it again.

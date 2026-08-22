@@ -3473,6 +3473,42 @@ def backfill_account_events(entries: list[dict[str, Any]]) -> int:
     return len(entries)
 
 
+def replace_backfilled_account(account_uuid: str, entries: list[dict[str, Any]]) -> int:
+    """Make *entries* the whole backfilled timeline for one account. Returns them.
+
+    What a pull writes. The server is the one source, so its document replaces
+    this account's declared rows outright rather than merging into them: a
+    change someone deleted there must not stay standing here, and a
+    `ccreport tiers` run against an account the server declares is undone by
+    the next pull.
+
+    One account's rows and no other's, and OR IGNORE is what keeps it to those.
+    ts is the whole primary key, so an entry landing on a moment some other row
+    already holds would take that row's place -- and where the row is a capture,
+    the only record that anyone was ever signed in at that moment is gone. The
+    entry is dropped instead, which is why the count returned is what landed
+    rather than what was offered.
+
+    The delete and the inserts share a transaction, so a failure between them
+    cannot leave the machine with the timeline gone and nothing in its place.
+    """
+    conn = get_connection()
+    with conn:
+        conn.execute(
+            "DELETE FROM account_events WHERE source = ? AND account_uuid = ?",
+            (SOURCE_BACKFILL, account_uuid),
+        )
+        cur = conn.executemany(
+            f"INSERT OR IGNORE INTO account_events (ts, source, {_ACCOUNT_SELECT}) "  # noqa: S608
+            f"VALUES ({_ACCOUNT_PLACEHOLDERS})",
+            [
+                (e["ts"], SOURCE_BACKFILL, *(e.get(col) for col in _ACCOUNT_COLS))
+                for e in entries
+            ],
+        )
+    return cur.rowcount
+
+
 def clear_backfilled_accounts() -> int:
     """Delete every backfilled row. Returns how many went.
 

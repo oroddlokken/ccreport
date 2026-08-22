@@ -14,7 +14,7 @@ import pytest
 import server_fixture as sf
 from fastapi.testclient import TestClient
 
-from ccreport import cache_db, push
+from ccreport import cache_db, push, tier_timeline
 from ccreport import ccreport as ccr
 from ccreport.server import pull
 from ccreport.server.factory import create_app
@@ -169,6 +169,134 @@ class TestStoringAPull:
 
     def test_a_reply_with_no_pull_section_stores_nothing(self, client_cache):
         assert push.store_pull(URL, {"machine_id": "laptop-1"}, TS) == 0
+
+
+class TestTheDeclaredTimeline:
+    """The server is the one source; the machines take their copy from it."""
+
+    def _declare(self, app, account="acct-1", *entries):
+        from ccreport.server import db as server_db
+
+        conn = app.state.db.connect()
+        server_db.set_account_tiers(conn, account, [
+            tier_timeline.Entry(
+                ts=ts, account=account, organization_rate_limit_tier=tier,
+            )
+            for ts, tier in (entries or ((100.0, "default_claude_max_5x"),))
+        ], 1.0)
+        conn.commit()
+
+    def _declared(self):
+        return [
+            e for e in cache_db.load_account_events()
+            if e["source"] == cache_db.SOURCE_BACKFILL
+        ]
+
+    def test_the_reply_carries_the_accounts_timeline(self, server):
+        self._declare(server, "acct-1", (100.0, "default_claude_pro"), (200.0, "max_20x"))
+        tiers = _reply(server)["pull"]["tiers"]
+        assert [(t["ts"], t["organization_rate_limit_tier"]) for t in tiers] == [
+            (100.0, "default_claude_pro"), (200.0, "max_20x"),
+        ]
+
+    def test_a_server_that_declares_nothing_sends_an_empty_section(self, server):
+        assert _reply(server)["pull"]["tiers"] == []
+
+    def test_another_accounts_entries_never_reach_this_machine(self, server):
+        self._declare(server, "acct-2", (100.0, "max_20x"))
+        assert _reply(server)["pull"]["tiers"] == []
+
+    def test_a_pull_writes_them_as_backfilled_rows(self, server, client_cache):
+        self._declare(server, "acct-1", (100.0, "default_claude_pro"))
+        assert push.store_tiers(_reply(server)) == 1
+        [row] = self._declared()
+        assert row["organization_rate_limit_tier"] == "default_claude_pro"
+        assert (row["account_uuid"], row["email"]) == ("acct-1", "me@example.net")
+
+    def test_the_capture_it_copied_its_identity_from_is_untouched(self, server, client_cache):
+        self._declare(server, "acct-1")
+        before = [e for e in cache_db.load_account_events()
+                  if e["source"] == cache_db.SOURCE_CAPTURE]
+        push.store_tiers(_reply(server))
+        assert [e for e in cache_db.load_account_events()
+                if e["source"] == cache_db.SOURCE_CAPTURE] == before
+
+    def test_a_second_pull_with_nothing_changed_writes_nothing_new(self, server, client_cache):
+        self._declare(server, "acct-1", (100.0, "default_claude_pro"), (200.0, "max_20x"))
+        push.store_tiers(_reply(server))
+        after_first = cache_db.load_account_events()
+        push.store_tiers(_reply(server))
+        assert cache_db.load_account_events() == after_first
+
+    def test_an_entry_deleted_on_the_server_goes_here_too(self, server, client_cache):
+        """Server-wins: the timeline is a document, not rows to merge into."""
+        self._declare(server, "acct-1", (100.0, "default_claude_pro"), (200.0, "max_20x"))
+        push.store_tiers(_reply(server))
+        assert len(self._declared()) == 2
+        self._declare(server, "acct-1", (100.0, "default_claude_pro"))
+        push.store_tiers(_reply(server))
+        assert [(e["ts"], e["organization_rate_limit_tier"]) for e in self._declared()] == [
+            (100.0, "default_claude_pro"),
+        ]
+
+    def test_a_server_declaring_nothing_leaves_a_local_declaration_standing(
+        self, server, client_cache,
+    ):
+        """An empty section is a server nobody typed a timeline into."""
+        cache_db.backfill_account_events([
+            {"ts": 5.0, "account_uuid": "acct-1", "email": "me@example.net",
+             "organization_rate_limit_tier": "max_20x"},
+        ])
+        assert push.store_tiers(_reply(server)) == 0
+        assert len(self._declared()) == 1
+
+    def test_an_account_this_machine_has_never_seen_writes_nothing(
+        self, server, client_cache,
+    ):
+        client_cache.execute("DELETE FROM account_events")
+        client_cache.commit()
+        self._declare(server, "acct-1")
+        assert push.store_tiers(_reply(server)) == 0
+        assert self._declared() == []
+
+    def test_another_accounts_declared_rows_are_left_alone(self, server, client_cache):
+        """A person on two accounts pulls for one of them at a time."""
+        cache_db.backfill_account_events([
+            {"ts": 300.0, "account_uuid": "acct-2", "email": "other@example.net",
+             "organization_rate_limit_tier": "max_20x"},
+        ])
+        self._declare(server, "acct-1", (100.0, "default_claude_pro"))
+        push.store_tiers(_reply(server))
+        assert {(e["ts"], e["account_uuid"]) for e in self._declared()} == {
+            (100.0, "acct-1"), (300.0, "acct-2"),
+        }
+
+    def test_an_entry_on_a_captures_own_instant_is_dropped_not_written(
+        self, server, client_cache,
+    ):
+        """ts is the whole primary key; a write there would take the capture's place,
+        and a capture is the only record that anyone was signed in at that moment."""
+        self._declare(server, "acct-1", (1.0, "max_20x"), (100.0, "default_claude_pro"))
+        assert push.store_tiers(_reply(server)) == 1
+        capture = [e for e in cache_db.load_account_events() if e["ts"] == 1.0]
+        assert [e["source"] for e in capture] == [cache_db.SOURCE_CAPTURE]
+        assert [e["ts"] for e in self._declared()] == [100.0]
+
+    def test_a_reply_with_no_pull_section_declares_nothing(self, client_cache):
+        assert push.store_tiers({"machine_id": "laptop-1"}) == 0
+
+    def test_a_pull_run_reports_what_it_declared(self, server, client_cache,
+                                                 tmp_path, monkeypatch):
+        self._declare(server, "acct-1", (100.0, "default_claude_pro"))
+        token = sf.mint_for(server, "laptop-1", "Laptop")
+        config = tmp_path / "push.toml"
+        config.write_text(f'[server."{URL}"]\ntoken = "{token}"\nlabel = "Laptop"\n')
+        client = TestClient(server)
+        monkeypatch.setattr(push, "post_batch", lambda _s, batch: client.post(
+            "/v1/ingest", headers=sf.auth(token), json=batch).json())
+        [server_config] = push.load_config(config)
+        assert push.pull_from(server_config).declared == 1
+        assert len(self._declared()) == 1
 
 
 class TestTheMergedReport:
