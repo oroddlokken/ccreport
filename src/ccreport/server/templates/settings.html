@@ -6,16 +6,18 @@ dashboard keeps its own answer, and clearing cookies here goes back to the defau
 
 {% if note %}<p class="notice">{{ note }}</p>{% endif %}
 
-<form method="post" action="/settings">
-  <label class="check">
-    <input type="checkbox" name="hide_redacted" value="1" {% if hide_redacted %}checked{% endif %}>
-    Hide redacted spend
-  </label>
-  <p class="hint">A restricted machine strips the project name off every project it has not opted
-  in to, and those records are drawn as one row per account, named
-  <span class="mono">&lt;account&gt;-aggregated</span>. Ticked, they are left out of the dashboard
-  and the pages it links to, totals and charts included. Limits, Machines, Accounts and Projects
-  count them either way.</p>
+<form method="post" action="/settings" class="prefs">
+  <div class="pref">
+    <label class="check">
+      <input type="checkbox" name="hide_redacted" value="1" {% if hide_redacted %}checked{% endif %}>
+      Hide redacted spend
+    </label>
+    <p class="hint">A restricted machine strips the project name off every project it has not
+    opted in to, and those records are drawn as one row per account, named
+    <span class="mono">&lt;account&gt;-aggregated</span>. Ticked, they are left out of the
+    dashboard and the pages it links to, totals and charts included. Limits, Machines, Accounts
+    and Projects count them either way.</p>
+  </div>
   <button type="submit">Save</button>
 </form>
 {% endblock %}

@@ -233,6 +233,16 @@ form.confirm { align-items: center; gap: .6rem; margin-top: .9rem; }
 form.confirm label { flex-direction: row; align-items: center; gap: .3rem; }
 form.confirm input { flex: 1 1 12rem; }
 
+/* A preference stacks: its box, then the hint under the box it explains, then
+   the button under both. The flex row every other form takes would sit all
+   three side by side and centre the checkbox against a paragraph. */
+form.prefs { display: block; max-width: 64ch; margin-top: 1.4rem; }
+form.prefs .pref { margin: 0 0 1.2rem; }
+form.prefs label.check { margin-top: 0; font-size: .95rem; }
+/* Indented past the box, so the hint reads as the label's and not as the next
+   preference's. */
+form.prefs .pref .hint { margin-left: 1.55rem; }
+
 .hint { color: var(--dim); font-size: .75rem; line-height: 1.45; margin: .35rem 0 0; max-width: 64ch; }
 .hint.note { border-top: 1px solid var(--line); margin-top: 1rem; padding-top: .7rem; }
 /* A command breaks across a line as "ccreport --" / "server", which reads as
