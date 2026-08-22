@@ -711,9 +711,9 @@ class TestPlanTile:
         self._declare(app, tier="default_claude_pro")
         assert "more than the" in present(self._tile(_view(app))).subline
 
-    def test_it_sits_after_the_five_that_were_there(self, app):
+    def test_it_sits_before_the_five_that_were_there(self, app):
         self._declare(app)
-        assert [t.label for t in _view(app).tiles][-1] == "Value vs plan"
+        assert next(t.label for t in _view(app).tiles) == "Value vs plan"
 
     @pytest.mark.parametrize("dimension", ["day", "week", "month", "account"])
     def test_a_page_about_a_whole_span_or_one_account_says_nothing_extra(
@@ -828,7 +828,7 @@ class TestPlanTile:
     @pytest.mark.parametrize(
         ("months", "days", "expected"),
         [(6.7, 203, "6.7 months"), (1.05, 32, "1.1 months"),
-         (1.0, 31, "31 days"), (0.26, 8, "8 days")],
+         (1.0, 31, "31 days"), (0.26, 8, "8 days"), (0.03, 1, "1 day")],
     )
     def test_the_span_reads_in_whichever_unit_is_a_quantity(self, months, days, expected):
         """"0.3 months" is a fraction to convert; "8 days" is already converted."""
@@ -988,3 +988,44 @@ class TestCacheStamp:
         assert dashboard.cache_stamp(conn, NOW) != dashboard.cache_stamp(
             conn, NOW + timedelta(days=1),
         )
+
+
+class TestCoveredAxis:
+    """A detail page charts the days its own records cover, not the toggle's."""
+
+    def _scoped(self, app, dimension, key, days=90):
+        return dashboard.build(
+            app.state.db.connect(), days, NOW, dashboard.Scope(dimension, key),
+        )
+
+    def _days(self, view) -> list[str]:
+        return view.charts[0].axis
+
+    def test_it_opens_on_the_first_day_the_scope_has_a_record(self, app):
+        """One sonnet record, 20 days back, on a page reaching back 90."""
+        axis = self._days(self._scoped(app, "model", "claude-sonnet-4-5-20250929"))
+        assert axis == [(NOW - timedelta(days=20)).strftime("%Y-%m-%d")]
+
+    def test_it_ends_on_the_last_day_the_scope_has_a_record(self, app):
+        axis = self._days(self._scoped(app, "project", "projB"))
+        assert axis[0] == (NOW - timedelta(days=40)).strftime("%Y-%m-%d")
+        assert axis[-1] == (NOW - timedelta(days=3)).strftime("%Y-%m-%d")
+
+    def test_every_record_still_lands_on_the_axis(self, app):
+        view = self._scoped(app, "project", "projB")
+        drawn = sum(value or 0.0 for trace in view.charts[3].traces for value in trace.values)
+        assert drawn == 2.0
+
+    def test_the_days_between_are_kept(self, app):
+        """Trimmed at the ends alone: the axis stays dense in the middle."""
+        axis = self._days(self._scoped(app, "project", "projB"))
+        assert len(axis) == 38
+
+    def test_the_index_page_keeps_the_whole_range(self, app):
+        assert len(_view(app, 90).chart_days) == 90
+
+    def test_a_month_page_charts_its_whole_month(self, app):
+        key = _view(app, 90).breakdowns["month"][0]["key"]
+        opens, closes = dashboard._month_bounds(key)
+        view = self._scoped(app, "month", key)
+        assert len(self._days(view)) == (closes - opens).days

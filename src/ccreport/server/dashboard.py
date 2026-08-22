@@ -326,7 +326,9 @@ def _fmt_span(months: float, days: int) -> str:
     span already converted. The cut is just above one month, so a span of
     roughly a month is called one rather than 31 days.
     """
-    return f"{months:.1f} months" if months >= 1.05 else f"{days} days"
+    if months >= 1.05:
+        return f"{months:.1f} months"
+    return "1 day" if days == 1 else f"{days} days"
 
 
 def _plan_tile(total_cost: float, plan_usd: float, nok: aggregate.NokCtx,
@@ -383,6 +385,27 @@ def _account_rows(report, total_cost: float) -> list[AccountRow]:
 def _day_axis(start: datetime, days: int) -> list[str]:
     """The calendar days a range covers, in order."""
     return [(start + timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(days)]
+
+
+def _covered_axis(axis: list[str], merged: list[reports.MergedRecord]) -> list[str]:
+    """*axis* cut back to the first and last day *merged* has a record on.
+
+    A page about one model is charted over the range toggle, which on all-time
+    opens at the server's oldest record. A model first seen in July then drew
+    four fifths of every plot as a flat zero and squeezed its own shape into
+    the right edge.
+
+    Cut on `day_key` rather than on the timestamp `_active_span` reads: that is
+    the pushing machine's calendar day, and a machine an hour off this server's
+    clock would otherwise keep a record whose instant falls outside the day it
+    belongs to, which `_day_position` drops. Records with no day on the axis
+    leave it whole -- there is nothing to centre on.
+    """
+    days = {item.record.day_key() for item in merged}
+    covered = [position for position, day in enumerate(axis) if day in days]
+    if not covered:
+        return axis
+    return axis[covered[0]:covered[-1] + 1]
 
 
 def _day_position(axis: list[str]):
@@ -741,6 +764,8 @@ def build(conn, days: int, now: datetime | None = None,
             key_of = _DIMENSION_KEYS[scope.dimension]
             merged = [item for item in merged if str(key_of(item)) == scope.key]
         axis = _day_axis(start, (end - start).days)
+        if scope is not None:
+            axis = _covered_axis(axis, merged)
         position_of = _day_position(axis)
 
     nok = reports.nok_context(merged)
@@ -779,7 +804,9 @@ def build(conn, days: int, now: datetime | None = None,
     )
     plan_usd = plans.cost(priced_from, priced_to)
     if plan_usd is not None:
-        tiles.append(_plan_tile(
+        # First in the row, though it is built last: it needs the span the page
+        # covers, which is only known once the records are folded.
+        tiles.insert(0, _plan_tile(
             total_cost, plan_usd, nok, (priced_to - timedelta(days=1)).date(),
             scope.dimension if scope and scope.dimension in SLICE_SCOPES else None,
             _fmt_span(pricing.months_in_span(priced_from, priced_to),
