@@ -182,6 +182,13 @@ class TestCharts:
         ]
         assert {c["unit"] for c in charts} == {"usd", "tokens", "calls"}
 
+    def test_a_page_drops_the_chart_split_by_what_it_is_about(self, client):
+        for path, dropped in (("/account/work%40example.net", "cost-account"),
+                              ("/model/claude-haiku-4-5", "cost-model")):
+            keys = [c["key"] for c in _charts(client.get(path).text)]
+            assert dropped not in keys
+            assert len(keys) == 3
+
     def test_a_trace_carries_one_value_per_bucket(self, client):
         for chart in _charts(client.get("/project/infrastructure").text):
             assert all(len(t["values"]) == len(chart["axis"]) for t in chart["traces"])
