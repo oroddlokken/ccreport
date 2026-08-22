@@ -14,6 +14,7 @@ account, with its real cost and token counts and no name of its own.
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
@@ -549,9 +550,11 @@ class _Plans:
         aliases = db.account_aliases(conn)
         # Display names, because that is what a folded record carries and what
         # a breakdown row groups on. The timeline is keyed by uuid, so the two
-        # meet here and nowhere else.
+        # meet here and nowhere else. account_names rather than
+        # account_overview: the spend beside a name there costs a dedup scan of
+        # every record, and a plan tile throws it away.
         self._uuids = [
-            row["account_uuid"] for row in reports.account_overview(conn)
+            row["account_uuid"] for row in reports.account_names(conn)
             if reports.account_display(row["account_uuid"], row["label"], aliases) in accounts
         ] if entries else []
 
@@ -612,6 +615,55 @@ def cached_build(database: db.Database, days: int, now: datetime | None = None) 
     view = build(conn, days, now)
     with _CACHE_LOCK:
         _CACHE[key] = (stamp, view)
+    return view
+
+
+DETAIL_CACHE_MAX = 96
+"""How many detail pages `cached_detail` holds before the oldest goes.
+
+Chosen against what one weighs rather than picked round: an all-time entry on a
+three-year corpus is its four charts, seven series each over a day per column,
+plus the breakdown rows behind them -- a few hundred kilobytes at the top end.
+Ninety-six of those is tens of megabytes held against a server whose database
+is hundreds, and it covers every model, machine and account a server has with
+room for the months people click through.
+"""
+
+_DETAIL_CACHE: OrderedDict[tuple, tuple[tuple, Dashboard]] = OrderedDict()
+
+
+def cached_detail(database: db.Database, days: int, scope: Scope,
+                  now: datetime | None = None) -> Dashboard:
+    """One entity's page, held the way `cached_build` holds the index.
+
+    Same invalidation, `db.content_stamp` and the render's local date, and the
+    same bargain over the lock: two threads missing on one key both build,
+    where holding it across a build would queue every other entity behind one.
+
+    Bounded, where `cached_build` needs no bound. Its key space is one entry
+    per range toggle per server; this one is one per model, project, machine,
+    account, day, week and month the server holds, and a new day arrives every
+    day. The least recently served entry goes at `DETAIL_CACHE_MAX`.
+
+    Raises whatever `build` raises -- a period key that is not a date is a
+    ValueError, and nothing is stored for it.
+    """
+    conn = database.connect()
+    now = now or datetime.now(tz=UTC).astimezone()
+    days = days if days in RANGES else DEFAULT_RANGE
+    key = (str(database.path), days, scope.dimension, scope.key)
+    stamp = (db.content_stamp(conn), now.strftime("%Y-%m-%d"))
+    with _CACHE_LOCK:
+        hit = _DETAIL_CACHE.get(key)
+        if hit is not None and hit[0] == stamp:
+            _DETAIL_CACHE.move_to_end(key)
+            return hit[1]
+    view = build(conn, days, now, scope=scope)
+    with _CACHE_LOCK:
+        _DETAIL_CACHE[key] = (stamp, view)
+        _DETAIL_CACHE.move_to_end(key)
+        while len(_DETAIL_CACHE) > DETAIL_CACHE_MAX:
+            _DETAIL_CACHE.popitem(last=False)
     return view
 
 

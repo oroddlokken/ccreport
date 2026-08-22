@@ -460,9 +460,10 @@ def detail(request: Request, dimension: str, key: str,
     of them claimed reaches here. A dimension this server has no breakdown for
     is a 404: the URL was mistyped, and an empty page reads as an idle month.
 
-    Not cached. `cached_build` holds the whole-server view per range, which is
-    the page a browser opens over and over; one entity is a page someone
-    clicked into.
+    Cached through `dashboard.cached_detail`, which invalidates on the same
+    push or midnight `cached_build` does and evicts the least recently served
+    entry: one entity per model, project, machine, account, day, week and month
+    is a key space that grows daily, where the index's is one per range toggle.
 
     A period key the period cannot be keyed on is a 404 for the same reason:
     /month/2026-13 is a mistyped URL, and its empty page reads as an idle month.
@@ -471,7 +472,7 @@ def detail(request: Request, dimension: str, key: str,
         raise HTTPException(status_code=404, detail=f"No {dimension} pages.")
     scope = dashboard.Scope(dimension=dimension, key=key)
     try:
-        view = dashboard.build(request.app.state.db.connect(), days, scope=scope)
+        view = dashboard.cached_detail(request.app.state.db, days, scope)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=f"{key} is not a {dimension}.") from exc
     return templates.TemplateResponse(request, "detail.html", {

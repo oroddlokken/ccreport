@@ -624,6 +624,36 @@ class TestProjectOverview:
         assert reports.project_overview(app.state.db.connect()) == []
 
 
+class TestAccountNames:
+    """What _Plans reads, without account_overview's scan of the whole table."""
+
+    def test_every_account_that_pushed_is_named(self, app):
+        rows = {r["account_uuid"]: r["label"] for r in reports.account_names(
+            app.state.db.connect())}
+        assert rows == {"u-work": "me@work.example", "u-home": "me@home.example"}
+
+    def test_the_label_is_the_newest_one_that_account_pushed(self, app):
+        """A changed login email has both in the table; the older is not who they are."""
+        client = TestClient(app)
+        token = sf.mint_for(app, "laptop-1", "Laptop")
+        client.post(
+            "/v1/ingest",
+            json=sf.batch(
+                [sf.record(mid="c1", dk="c1:r", ts=_ts(9), account_uuid="u-work",
+                           account_label="new@work.example")],
+                path="/p/new.jsonl", label="Laptop",
+            ),
+            headers=sf.auth(token),
+        )
+        rows = {r["account_uuid"]: r["label"] for r in reports.account_names(
+            app.state.db.connect())}
+        assert rows["u-work"] == "new@work.example"
+
+    def test_an_empty_database_names_nobody(self, tmp_path):
+        app = create_app(sf.config(tmp_path))
+        assert reports.account_names(app.state.db.connect()) == []
+
+
 class TestAccountAliases:
     """A screenshot of the dashboard leaks the login email; an alias is the fix."""
 

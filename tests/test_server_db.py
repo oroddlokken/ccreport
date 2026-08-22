@@ -85,6 +85,34 @@ class TestSchema:
         second.close()
         assert "idx_srec_ts" in names
 
+    def test_the_grouped_fold_walks_an_index_instead_of_sorting(self, conn):
+        """The temp b-tree was half of what a detail page spent in SQL."""
+        from ccreport.server import reports
+
+        dedup, params = reports._dedup_clause(reports.Filters())
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN " + reports._GROUPED_SQL % dedup, params,
+        ).fetchall()
+        assert not any("TEMP B-TREE" in str(step) for step in plan), plan
+        assert any("COVERING INDEX idx_srec_group" in str(step) for step in plan), plan
+
+    def test_a_database_written_before_the_group_index_gains_it(self, tmp_path):
+        """Stamped one below the step that carries it, which is where a server
+        that last ran the previous build sits."""
+        path = tmp_path / "server.db"
+        first = db.connect(path)
+        first.execute("DROP INDEX idx_srec_group")
+        first.execute("PRAGMA user_version = 8")
+        first.close()
+        second = db.connect(path)
+        try:
+            assert second.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_srec_group'",
+            ).fetchone() is not None
+            assert second.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+        finally:
+            second.close()
+
     def test_a_new_column_reaches_a_database_that_already_has_the_table(
         self, tmp_path, monkeypatch,
     ):

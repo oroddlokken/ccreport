@@ -282,9 +282,11 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   not, which is why `factory.py` mounts `/static` before the router — the
   catch-all would otherwise answer 404 for every asset. The scope matches the
   string the breakdown table shows, not a stored column, so an alias, a machine
-  label and a redacted project bucket each reach their own rows, and it is
-  never cached: `cached_build` holds the whole-server view per range, which is
-  the page a browser opens over and over
+  label and a redacted project bucket each reach their own rows. It is cached
+  through `dashboard.cached_detail`, which invalidates on the `content_stamp`
+  and local date `cached_build` does but evicts: the index has one entry per
+  range toggle, where an entity page has one per model, project, machine,
+  account, day, week and month, and a new day arrives every day
 - The three `dashboard.PERIODS` — day, week, month — are their own range and
   print no toggle: the span is the page. A day charts by hour, so it is the one
   build that calls `reports.load`; a week and a month chart by day and take

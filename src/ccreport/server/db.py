@@ -111,6 +111,16 @@ CREATE INDEX IF NOT EXISTS idx_srec_file ON server_records(machine_id, file_path
 -- toggle scans the same rows the all-time one does.
 CREATE INDEX IF NOT EXISTS idx_srec_ts ON server_records(ts);
 
+-- Every uncached build folds the corpus by reports.GROUP_COLS. Those seven
+-- lead here in order, so SQLite walks the groups instead of sorting them into
+-- a temp b-tree, and the columns behind them are every one the grouped query
+-- reads -- dk and id among them, so the dedup clause is answered off the same
+-- index and the scan never leaves it. On a 599 MB database it costs 174 MB and
+-- halves the query.
+CREATE INDEX IF NOT EXISTS idx_srec_group ON server_records(
+    machine_id, account_uuid, account_label, project, model, day, oslo_date,
+    ts, cost, input_tokens, output_tokens, cache_create, cache_read, dk, id);
+
 -- What each machine has already pushed, so a re-push of an unchanged file is a
 -- no-op and a re-push of a grown file replaces that file's rows. A request
 -- carries whole files and never part of one, which is what makes replacing
@@ -291,6 +301,7 @@ MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(6, "rate_limit_samples"),
     migrations.Step(7, "extra_usage_samples"),
     migrations.Step(8, "account_tiers"),
+    migrations.Step(9, "idx_srec_group"),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 

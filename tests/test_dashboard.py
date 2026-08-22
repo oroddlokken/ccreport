@@ -413,6 +413,96 @@ class TestCachedBuild:
         assert dashboard.cached_build(app.state.db, 30, NOW) is view
 
 
+class TestCachedDetail:
+    """One build per entity per push, and a bound the index cache does not need."""
+
+    @pytest.fixture(autouse=True)
+    def empty_cache(self):
+        dashboard._DETAIL_CACHE.clear()
+        yield
+        dashboard._DETAIL_CACHE.clear()
+
+    def _scope(self, key="projA", dimension="project"):
+        return dashboard.Scope(dimension=dimension, key=key)
+
+    def test_a_second_render_of_the_same_entity_reuses_the_first(self, app):
+        first = dashboard.cached_detail(app.state.db, 30, self._scope(), NOW)
+        assert dashboard.cached_detail(app.state.db, 30, self._scope(), NOW) is first
+
+    def test_each_entity_is_cached_apart(self, app):
+        a = dashboard.cached_detail(app.state.db, 30, self._scope("projA"), NOW)
+        b = dashboard.cached_detail(app.state.db, 30, self._scope("projB"), NOW)
+        assert a is not b
+        assert dashboard.cached_detail(app.state.db, 30, self._scope("projA"), NOW) is a
+
+    def test_each_range_of_one_entity_is_cached_apart(self, app):
+        week = dashboard.cached_detail(app.state.db, 7, self._scope(), NOW)
+        month = dashboard.cached_detail(app.state.db, 30, self._scope(), NOW)
+        assert week is not month
+
+    def test_a_push_invalidates_it(self, app):
+        first = dashboard.cached_detail(app.state.db, 30, self._scope(), NOW)
+        client = TestClient(app)
+        token = sf.mint_for(app, "laptop-1", "Laptop")
+        resp = client.post(
+            "/v1/ingest",
+            json=sf.batch([_rec(5, "work")], path="/p/extra5.jsonl", label="Laptop"),
+            headers=sf.auth(token),
+        )
+        assert resp.json()["files"][0]["status"] == "accepted", resp.json()
+        second = dashboard.cached_detail(app.state.db, 30, self._scope(), NOW)
+        assert second is not first
+        assert second.total_cost > first.total_cost
+
+    def test_a_new_day_invalidates_it(self, app):
+        first = dashboard.cached_detail(app.state.db, 30, self._scope(), NOW)
+        second = dashboard.cached_detail(
+            app.state.db, 30, self._scope(), NOW + timedelta(days=1),
+        )
+        assert second is not first
+
+    def test_the_oldest_entry_goes_at_the_bound(self, app, monkeypatch):
+        """Unbounded, the cache is one entry per day this server ever saw."""
+        monkeypatch.setattr(dashboard, "DETAIL_CACHE_MAX", 3)
+        first = dashboard.cached_detail(app.state.db, 30, self._scope("projA"), NOW)
+        for key in ("projB", "projC", "projD"):
+            dashboard.cached_detail(app.state.db, 30, self._scope(key), NOW)
+        assert len(dashboard._DETAIL_CACHE) == 3
+        assert dashboard.cached_detail(
+            app.state.db, 30, self._scope("projA"), NOW) is not first
+        assert dashboard.cached_detail(
+            app.state.db, 30, self._scope("projD"), NOW) is dashboard.cached_detail(
+            app.state.db, 30, self._scope("projD"), NOW)
+
+    def test_serving_an_entry_keeps_it_from_being_evicted(self, app, monkeypatch):
+        monkeypatch.setattr(dashboard, "DETAIL_CACHE_MAX", 2)
+        first = dashboard.cached_detail(app.state.db, 30, self._scope("projA"), NOW)
+        dashboard.cached_detail(app.state.db, 30, self._scope("projB"), NOW)
+        assert dashboard.cached_detail(app.state.db, 30, self._scope("projA"), NOW) is first
+        dashboard.cached_detail(app.state.db, 30, self._scope("projC"), NOW)
+        assert dashboard.cached_detail(app.state.db, 30, self._scope("projA"), NOW) is first
+
+    def test_two_databases_do_not_share_an_entry(self, app, tmp_path):
+        other = create_app(sf.config(tmp_path / "other"))
+        assert dashboard.cached_detail(
+            other.state.db, 30, self._scope(), NOW).total_cost == 0.0
+        assert dashboard.cached_detail(
+            app.state.db, 30, self._scope(), NOW).total_cost > 0.0
+
+    def test_a_period_key_that_is_not_a_date_still_raises(self, app):
+        """Nothing is stored for it; the page turns it into a 404."""
+        with pytest.raises(ValueError):
+            dashboard.cached_detail(app.state.db, 30, self._scope("2026-13", "month"), NOW)
+        assert not dashboard._DETAIL_CACHE
+
+    def test_the_page_serves_the_cached_view(self, app):
+        view = dashboard.cached_detail(
+            app.state.db, dashboard.DEFAULT_RANGE, self._scope(), NOW)
+        assert TestClient(app).get("/project/projA").status_code == 200
+        assert dashboard.cached_detail(
+            app.state.db, dashboard.DEFAULT_RANGE, self._scope(), NOW) is view
+
+
 class TestPage:
     def test_it_renders_the_headline_and_the_footnote(self, client):
         body = client.get("/").text
@@ -665,6 +755,19 @@ class TestPlanTile:
             app.state.db.connect(), {"work@example.net"},
         ).cost(*dashboard.range_bounds(30, NOW)))
         assert just_work < whole
+
+    def test_a_renamed_account_still_finds_its_plan(self, app):
+        """_Plans matches display names, and an alias replaces the pushed label."""
+        from ccreport.server import db
+
+        self._declare(app, "work")
+        conn = app.state.db.connect()
+        db.set_account_alias(conn, "work", "personal", 1.0)
+        conn.commit()
+        priced = dashboard._Plans(conn, {"personal"}).cost(*dashboard.range_bounds(30, NOW))
+        assert priced is not None
+        assert dashboard._Plans(
+            conn, {"work@example.net"}).cost(*dashboard.range_bounds(30, NOW)) is None
 
     def test_the_page_draws_it(self, app, client):
         self._declare(app)
