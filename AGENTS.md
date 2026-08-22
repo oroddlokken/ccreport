@@ -254,7 +254,11 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   scripts still carry a new table or index, and `Step(N, "name")` with no
   callable is what moves the version that re-runs them — but a column added to a
   table that is already there is skipped by the very `IF NOT EXISTS` that makes
-  the script safe to re-run, so it needs a step that does the `ALTER`. Steps run
+  the script safe to re-run, so it needs a step that does the `ALTER`. An index
+  over a column that arrives that way goes in the step too, not the script:
+  `connect` runs the script first, and on a database written before the step the
+  column is not there yet — `idx_srec_group` is the one, and the script says so
+  where it used to sit. Steps run
   inside a transaction with the stamp, so one may not `BEGIN`, `COMMIT` or turn
   `foreign_keys` off, and needs no meta flag: its version is the flag. An entry
   that has shipped is never edited — `migrations.run` records each step's source
@@ -420,6 +424,32 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   machine's row loses it. The one count left raw is `db.machine_overview`'s,
   which is what a machine pushed and what deleting it takes away — the column
   says `Pushed`
+- Which copy that is, is `server_records.dup`, decided when the row is written
+  rather than per query: 1 on every row that is not the lowest id within its
+  (account_uuid, dk), 0 on the winner and on every row the log gave no key.
+  Half the table is dup=1, and rediscovering which half cost a materialized
+  384,063-row subquery on every request — the flag took the dashboard fold from
+  1.69s to 0.20s and /settings/accounts from 2.16s to 0.23s. `db.py` is the only
+  writer: `_reconcile_dup` over the keys one file touched, `reconcile_all_dup`
+  where the keys are too many to name, which is the migration and a machine
+  deletion. Both directions matter — an inserted copy loses because SQLite hands
+  out ids above every surviving one, and a deleted winner promotes whichever
+  copy is next, which is why `replace_file_records` reads the file's keys before
+  it deletes them. `_dedup_clause` reads the flag wherever the filters cannot
+  move the answer, which `reports._narrows_dedup` decides: account and the date
+  bounds cannot, project and machine can, and there the subquery still runs. The
+  invariant the two forms share is a test, because nothing at runtime rechecks it
+- The server's SQLite is opened with `db.MMAP_SIZE` and SQLite's own 2 MB page
+  cache. The map is where a report's index reads land and is shared across
+  worker threads, where a page cache is a copy per connection: 64 MB of cache on
+  top of the map bought 0.08s on a host with 5 GB of memory. `ANALYZE` is
+  refused, not merely absent — with statistics the planner drops the covering
+  scan of `idx_srec_group` and the all-time dashboard goes from 0.17s to 2.14s.
+  Nothing may add a `sqlite_stat1` table to this database. `db.truncate_wal`
+  after an ingest is the other half: the automatic checkpoint copies pages back
+  but never shortens the file, and long-lived reader connections keep it from
+  resetting, so it reached 204 MB beside a 774 MB database with every page
+  already checkpointed
 - The dashboard's chart library is vendored under
   `server/static/vendor/`, not fetched from a CDN, so the page draws with no
   internet. Nothing updates it: a new version is a deliberate copy plus an edit

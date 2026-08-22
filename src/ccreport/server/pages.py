@@ -158,13 +158,29 @@ def rename_machine(request: Request, machine_id: str, label: str = Form("")):
     return RedirectResponse(url="/settings/machines", status_code=303)
 
 
+_ACCOUNTS_CACHE: dashboard.StampCache[list[dict]] = dashboard.StampCache()
+_PROJECTS_CACHE: dashboard.StampCache[list[dict]] = dashboard.StampCache()
+
+
+def _overview(request: Request, cache: dashboard.StampCache[list[dict]], build) -> list[dict]:
+    """One /settings table, held against the stamp every dashboard view is.
+
+    Both queries dedup the whole record table to sum a cost, which is seconds
+    on a corpus of half a million and is the same answer until a push lands or
+    a name is typed. A plan declared to start later in the day is the one thing
+    the stamp does not carry, and it shows at the next midnight.
+    """
+    database = request.app.state.db
+    conn = database.connect()
+    now = datetime.now(tz=UTC).astimezone()
+    return cache.get((str(database.path),), dashboard.cache_stamp(conn, now), lambda: build(conn))
+
+
 @router.get("/settings/accounts", response_class=HTMLResponse)
 def accounts(request: Request):
     """Every account that has pushed, each row a field for the name to draw it under."""
-    conn = request.app.state.db.connect()
-    return templates.TemplateResponse(
-        request, "accounts.html", {"accounts": reports.account_overview(conn)},
-    )
+    accounts = _overview(request, _ACCOUNTS_CACHE, reports.account_overview)
+    return templates.TemplateResponse(request, "accounts.html", {"accounts": accounts})
 
 
 @router.post("/settings/accounts/{account_uuid}/alias")
@@ -199,8 +215,8 @@ def _tiers_page(request: Request, account_uuid: str, text: str, **note):
     hand back the document they were trying to replace, with their own work
     gone and the error pointing at a line no longer on screen.
     """
-    conn = request.app.state.db.connect()
-    accounts = {a["account_uuid"]: a for a in reports.account_overview(conn)}
+    accounts = {a["account_uuid"]: a
+                for a in _overview(request, _ACCOUNTS_CACHE, reports.account_overview)}
     if account_uuid not in accounts:
         raise HTTPException(status_code=404, detail=f"No account {account_uuid}.")
     return templates.TemplateResponse(
@@ -241,7 +257,8 @@ def set_tiers(request: Request, account_uuid: str, timeline: str = Form("")):
     redirect has nowhere to carry it.
     """
     conn = request.app.state.db.connect()
-    accounts = {a["account_uuid"]: a for a in reports.account_overview(conn)}
+    accounts = {a["account_uuid"]: a
+                for a in _overview(request, _ACCOUNTS_CACHE, reports.account_overview)}
     if account_uuid not in accounts:
         raise HTTPException(status_code=404, detail=f"No account {account_uuid}.")
     try:
@@ -267,10 +284,8 @@ def projects(request: Request):
     the machine that pushed it, and folding two machines' names into one row is
     what typing the same name in both fields does.
     """
-    conn = request.app.state.db.connect()
-    return templates.TemplateResponse(
-        request, "projects.html", {"projects": reports.project_overview(conn)},
-    )
+    projects = _overview(request, _PROJECTS_CACHE, reports.project_overview)
+    return templates.TemplateResponse(request, "projects.html", {"projects": projects})
 
 
 @router.post("/settings/projects/alias")
@@ -389,10 +404,11 @@ def limit_windows(request: Request, days: int = Query(default=dashboard.DEFAULT_
     Named above the catch-all below, which would otherwise answer this path
     with a 404 for a dimension called "limits".
 
-    Not cached. A window list is a page someone clicked into, and its records
-    are loaded over the window spans rather than over the whole range.
+    Cached through `limits.cached_build`, on the stamp and the local date the
+    dashboard's index is: the records behind it are loaded over the window
+    spans rather than over the range, and that span holds still between pushes.
     """
-    view = limits.build(request.app.state.db.connect(), days)
+    view = limits.cached_build(request.app.state.db, days)
     return templates.TemplateResponse(request, "limits.html", {
         "view": view,
         "ranges": dashboard.RANGES,
@@ -414,8 +430,8 @@ def limit_window(request: Request, window: str, resets_at: float,
     period key is: an empty page reads as a window nobody used.
     """
     try:
-        view = limits.build_window(
-            request.app.state.db.connect(), window, resets_at, model or None, account,
+        view = limits.cached_window(
+            request.app.state.db, window, resets_at, model or None, account,
         )
     except LookupError as exc:
         raise HTTPException(

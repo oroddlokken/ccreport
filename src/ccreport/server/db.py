@@ -75,6 +75,14 @@ CREATE INDEX IF NOT EXISTS idx_tokens_machine ON machine_tokens(machine_id);
 -- both keep their rows; reports collapse them by dedup key and attribute each
 -- to the machine that reported it first, which is how a synced log neither
 -- double-counts nor silently erases one machine's contribution.
+--
+-- dup is that collapse, decided once at write time instead of per query: 1 on
+-- every row that is not the lowest id within its (account_uuid, dk), 0 on the
+-- one that is and on every row the log gave no key. Half this table is dup=1 --
+-- 431,439 rows of 815,841 when the flag was added -- and each read used to
+-- rediscover which half by materialising 384,063 MIN(id) rows. Not in REC_COLS:
+-- nothing pushes it, `_reconcile_dup` derives it, and it is the only column
+-- here a client never sees.
 CREATE TABLE IF NOT EXISTS server_records (
     id            INTEGER PRIMARY KEY,
     machine_id    TEXT NOT NULL REFERENCES machines(machine_id) ON DELETE CASCADE,
@@ -96,13 +104,20 @@ CREATE TABLE IF NOT EXISTS server_records (
     input_tokens  INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
     cache_create  INTEGER NOT NULL,
-    cache_read    INTEGER NOT NULL
+    cache_read    INTEGER NOT NULL,
+    dup           INTEGER NOT NULL DEFAULT 0
 );
 
 -- Read-time dedup groups by (account, dedup key): the same call pushed from
 -- two machines is one call billed once, and the account bounds the comparison
 -- so two people's identical-looking keys never collapse into one.
 CREATE INDEX IF NOT EXISTS idx_srec_account_dk ON server_records(account_uuid, dk);
+-- What account_overview and account_names ask for: the newest label an account
+-- pushed. Without it that scalar subquery reads every row of the account off
+-- idx_srec_account_dk, which carries neither ts nor the label, and sorts them
+-- in a temp b-tree to return one string -- 0.79s of a 2.13s page.
+CREATE INDEX IF NOT EXISTS idx_srec_acct_ts
+    ON server_records(account_uuid, ts DESC, account_label);
 -- Every ingest deletes one file's rows before inserting them again, and the
 -- machine leads because a file path is only unique within a machine.
 CREATE INDEX IF NOT EXISTS idx_srec_file ON server_records(machine_id, file_path);
@@ -111,15 +126,10 @@ CREATE INDEX IF NOT EXISTS idx_srec_file ON server_records(machine_id, file_path
 -- toggle scans the same rows the all-time one does.
 CREATE INDEX IF NOT EXISTS idx_srec_ts ON server_records(ts);
 
--- Every uncached build folds the corpus by reports.GROUP_COLS. Those seven
--- lead here in order, so SQLite walks the groups instead of sorting them into
--- a temp b-tree, and the columns behind them are every one the grouped query
--- reads -- dk and id among them, so the dedup clause is answered off the same
--- index and the scan never leaves it. On a 599 MB database it costs 174 MB and
--- halves the query.
-CREATE INDEX IF NOT EXISTS idx_srec_group ON server_records(
-    machine_id, account_uuid, account_label, project, model, day, oslo_date,
-    ts, cost, input_tokens, output_tokens, cache_create, cache_read, dk, id);
+-- idx_srec_group is not here. It leads with dup, which a database written
+-- before migration 10 does not have yet, and this script runs before the chain
+-- that adds it -- so `_add_dup_column` creates the index as well. Its shape and
+-- the reasoning behind it are there.
 
 -- What each machine has already pushed, so a re-push of an unchanged file is a
 -- no-op and a re-push of a grown file replaces that file's rows. A request
@@ -283,6 +293,87 @@ def row_to_record(row: tuple) -> dict:
     return rec
 
 
+_ACCOUNT_AT = REC_COLS.index("account_uuid")
+_DK_AT = REC_COLS.index("dk")
+
+DedupKey = tuple[str, str]
+"""One (account_uuid, dk) pair: the grain the dedup flag is decided at."""
+
+_RECONCILE_CHUNK = 1000
+"""Keys per reconcile statement. Two parameters each, well under SQLite's
+variable ceiling, and small enough that the VALUES list stays cheap to parse."""
+
+_RECONCILE_SQL = """\
+UPDATE server_records AS s
+   SET dup = CASE WHEN s.id = w.min_id THEN 0 ELSE 1 END
+  FROM (SELECT account_uuid, dk, MIN(id) AS min_id
+          FROM server_records
+         WHERE (account_uuid, dk) IN (VALUES %s)
+      GROUP BY account_uuid, dk) AS w
+ WHERE s.account_uuid = w.account_uuid AND s.dk = w.dk
+"""
+
+
+def _reconcile_dup(conn: sqlite3.Connection, keys: set[DedupKey]) -> None:
+    """Re-decide the dedup flag for *keys* and nothing else.
+
+    The lowest surviving id within a key wins, which is the rule every report
+    read before the flag existed. Called with the keys a write touched, so the
+    cost is the keys in one file rather than the table.
+
+    Both directions matter. Inserting a second copy of a call makes it a loser,
+    because a new row's id is above every surviving one -- SQLite hands out
+    max(id)+1, and a delete only frees ids above what is left. Deleting the
+    winner promotes whichever copy is next, which is why the caller collects the
+    keys of the rows it is about to delete before deleting them.
+
+    A key whose every row is gone has no row in *w* and is skipped: there is
+    nothing left to flag.
+    """
+    ordered = sorted(keys)
+    for start in range(0, len(ordered), _RECONCILE_CHUNK):
+        chunk = ordered[start:start + _RECONCILE_CHUNK]
+        values = ", ".join(["(?, ?)"] * len(chunk))
+        conn.execute(_RECONCILE_SQL % values, [part for key in chunk for part in key])
+
+
+def reconcile_all_dup(conn: sqlite3.Connection) -> None:
+    """Re-decide the dedup flag for every keyed row in the table.
+
+    The whole-table form of `_reconcile_dup`, for the two callers that cannot
+    name their keys cheaply: the migration that fills the column, and a machine
+    deletion, whose cascade can strip the winner from any key the machine ever
+    pushed. Collecting those keys first would be hundreds of thousands of them
+    and slower than this, which took 4.2s over 815,841 rows.
+
+    A row the log gave no dedup key is 0: it stands for itself, as it always
+    has. Cleared rather than assumed, because this is the form that has to
+    answer for whatever it finds -- the incremental one never writes a 1 there,
+    but this is what a caller reaches for when it does not trust the column.
+    """
+    conn.execute(
+        "UPDATE server_records SET dup = 0 WHERE dup <> 0 AND (dk IS NULL OR dk = '')",
+    )
+    conn.execute("""
+        UPDATE server_records AS s
+           SET dup = CASE WHEN s.id = w.min_id THEN 0 ELSE 1 END
+          FROM (SELECT account_uuid, dk, MIN(id) AS min_id
+                  FROM server_records
+                 WHERE dk IS NOT NULL AND dk <> ''
+              GROUP BY account_uuid, dk) AS w
+         WHERE s.account_uuid = w.account_uuid AND s.dk = w.dk
+    """)
+
+
+def _file_dedup_keys(conn: sqlite3.Connection, machine_id: str, file_path: str) -> set[DedupKey]:
+    """The dedup keys one machine's file currently holds rows for."""
+    return set(conn.execute(
+        "SELECT DISTINCT account_uuid, dk FROM server_records "
+        "WHERE machine_id = ? AND file_path = ? AND dk IS NOT NULL AND dk <> ''",
+        (machine_id, file_path),
+    ))
+
+
 def _add_label_updated_at(conn: sqlite3.Connection) -> None:
     """Give an existing machines table the column content_stamp reads.
 
@@ -295,6 +386,47 @@ def _add_label_updated_at(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE machines ADD COLUMN label_updated_at REAL")
 
 
+_GROUP_INDEX_SQL = """\
+CREATE INDEX IF NOT EXISTS idx_srec_group ON server_records(
+    dup, machine_id, account_uuid, account_label, project, model, day, oslo_date,
+    ts, cost, input_tokens, output_tokens, cache_create, cache_read, dk, id)
+"""
+"""The index every uncached build folds the corpus over.
+
+dup leads, so a report walks the surviving half and never sees the other one --
+384,063 index entries instead of 815,841 on the database this was measured
+against. reports.GROUP_COLS follows in order, so SQLite walks the groups instead
+of sorting them into a temp b-tree, and behind those sit every column the
+grouped query reads. dk and id are still among them: the dedup subquery is not
+gone, it is what a project- or machine-filtered read still uses, and it is
+answered off this index without leaving it.
+"""
+
+
+def _add_dup_column(conn: sqlite3.Connection) -> None:
+    """Give server_records the dedup flag, fill it, and reshape the group index.
+
+    Idempotent on the column, as `_add_label_updated_at` is: a database this
+    build created has dup from the CREATE script and still reaches here, where a
+    bare ALTER would raise on the duplicate and take the bootstrap down.
+
+    The index is created here rather than in the CREATE script because it leads
+    with a column that script cannot add -- the script runs first, and on a
+    database written before this step dup does not exist yet. The old shape is
+    dropped rather than left beside the new one: it indexes the same fourteen
+    columns and would cost another 166 MB to keep.
+
+    The backfill took 4.2s over 815,841 rows and the index 2.9s, both inside the
+    transaction migrations.run holds.
+    """
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(server_records)")]
+    if "dup" not in cols:
+        conn.execute("ALTER TABLE server_records ADD COLUMN dup INTEGER NOT NULL DEFAULT 0")
+    conn.execute("DROP INDEX IF EXISTS idx_srec_group")
+    reconcile_all_dup(conn)
+    conn.execute(_GROUP_INDEX_SQL)
+
+
 MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(4, "machines.label_updated_at", _add_label_updated_at),
     migrations.Step(5, "project_aliases"),
@@ -302,6 +434,7 @@ MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(7, "extra_usage_samples"),
     migrations.Step(8, "account_tiers"),
     migrations.Step(9, "idx_srec_group"),
+    migrations.Step(10, "server_records.dup", _add_dup_column),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 
@@ -350,6 +483,52 @@ class Database:
             self._local.conn = None
 
 
+MMAP_SIZE = 512 * 1024 * 1024
+"""How much of the database each connection reads through a memory map.
+
+Enough to hold every index -- 388 MB of the 774 MB this was measured against,
+and where a report's reads land. It took the accounts page from 2.16s to 1.40s.
+
+The page cache is deliberately left at SQLite's 2 MB default beside it. Raising
+that to 64 MB on top of the map bought 0.08s, and it is per connection where the
+map is not: a map is the host's own page cache addressed directly, so N worker
+threads share one copy of a page, while N page caches are N copies on a server
+with 5 GB of memory.
+
+An I/O error against a mapped page arrives as SIGBUS rather than as a return
+code, which is the trade: a local disk failing takes the process down instead of
+raising. Nothing here is on a network filesystem.
+"""
+
+WAL_TRUNCATE_BYTES = 64 * 1024 * 1024
+"""How large the WAL may grow before a checkpoint truncates it.
+
+The automatic checkpoint copies pages back but never shortens the file, and the
+server's connections are long-lived, so a reader is holding the WAL open often
+enough that it is rarely reset either: it reached 204 MB against a 774 MB
+database, all of it already checkpointed. Truncation needs a moment with no
+reader, which is why it is attempted after an ingest and its failure ignored.
+"""
+
+
+def truncate_wal(conn: sqlite3.Connection, path: Path) -> bool:
+    """Shorten an oversized WAL, and say whether it went.
+
+    False covers both halves of "not now": under the threshold, or a reader
+    holding the file open so the checkpoint could not reset it. Neither is worth
+    reporting -- the next ingest asks again, and the WAL is correct at any size.
+    """
+    wal = path.with_name(path.name + "-wal")
+    try:
+        if wal.stat().st_size < WAL_TRUNCATE_BYTES:
+            return False
+    except OSError:
+        return False
+    # (busy, pages in the WAL, pages moved back). Only the first says whether
+    # the file was reset; the other two describe a checkpoint that ran either way.
+    return conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+
+
 def connect(path: Path) -> sqlite3.Connection:
     """Open *path*, creating the schema when this build has not stamped it yet."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -362,6 +541,7 @@ def connect(path: Path) -> sqlite3.Connection:
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute(f"PRAGMA mmap_size = {MMAP_SIZE}")
         if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             # journal_mode lives in the database header, so unlike the pragmas
             # above it only needs setting on a file this build has not opened.
@@ -446,9 +626,15 @@ def delete_machine(conn: sqlite3.Connection, machine_id: str) -> int:
     Its tokens, its ingest_files and its server_records follow through the
     ON DELETE CASCADE the three declare, which is why the count is read first:
     afterwards there is nothing left to count.
+
+    The cascade can strip the winning copy from any dedup key this machine ever
+    pushed, so the flag is re-decided across the table afterwards. Every other
+    machine's copy of a shared call is promoted here rather than silently
+    vanishing from every report along with the machine that reported it first.
     """
     destroyed = record_count(conn, machine_id)
     conn.execute("DELETE FROM machines WHERE machine_id = ?", (machine_id,))
+    reconcile_all_dup(conn)
     return destroyed
 
 
@@ -920,6 +1106,10 @@ def replace_file_records(
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # Before the delete, because afterwards there is nothing left to read
+        # them off: a key this file was the only holder of a copy for still has
+        # copies elsewhere, and one of those is about to become the winner.
+        keys = _file_dedup_keys(conn, machine_id, file_path)
         conn.execute(
             "DELETE FROM server_records WHERE machine_id = ? AND file_path = ?",
             (machine_id, file_path),
@@ -928,6 +1118,10 @@ def replace_file_records(
             f"INSERT INTO server_records ({_REC_SELECT}) VALUES ({_REC_PLACEHOLDERS})",  # noqa: S608
             rows,
         )
+        keys.update(
+            (row[_ACCOUNT_AT], row[_DK_AT]) for row in rows if row[_DK_AT]
+        )
+        _reconcile_dup(conn, keys)
         conn.execute(
             "INSERT INTO ingest_files (machine_id, file_path, mtime_ns, size, n_records, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?) "

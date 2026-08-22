@@ -158,6 +158,12 @@ def load(conn: sqlite3.Connection, filters: Filters | None = None) -> list[Merge
 
     A record with no dedup key is kept as it stands: the log carried nothing to
     match it on, and dropping it would lose a real call.
+
+    Where the filters cannot move which copy wins, the stored flag drops the
+    losers in SQL and the loop below finds nothing left to collapse. That is
+    half the table on a corpus two machines have both pushed — rows this used to
+    read, build a UsageRecord for, and throw away. The loop stays because it is
+    what answers the filtered case, where no stored flag can.
     """
     filters = filters or Filters()
     aliases = db.account_aliases(conn)
@@ -167,6 +173,8 @@ def load(conn: sqlite3.Connection, filters: Filters | None = None) -> list[Merge
         filters, db.accounts_with_alias(conn, filters.account),
         db.projects_with_alias(conn, filters.project),
     )
+    if not _narrows_dedup(filters):
+        clause = f"{clause} AND dup = 0" if clause else " WHERE dup = 0"
     rows = conn.execute(
         f"SELECT machine_id, {_SELECT} FROM server_records{clause} ORDER BY id",  # noqa: S608
         params,
@@ -235,6 +243,22 @@ GROUP_COLS = ("machine_id", "account_uuid", "account_label", "project", "model",
 """What one grouped row stands for. Every column a merged report groups on
 except the session, which no page folding these rows breaks down by."""
 
+def _narrows_dedup(filters: Filters) -> bool:
+    """Whether *filters* can change which copy of a shared call survives.
+
+    Project and machine can. Ask for the desk alone and the desk's copy of a
+    synced call wins, where over both machines the laptop's did; ask for one of
+    the two names a repo was checked out under and that machine's copy wins.
+    Both are what a page about one machine or one project is for.
+
+    Account cannot: the dedup groups by account already, so narrowing to one
+    account leaves every group inside it whole. Neither can the date bounds --
+    two copies of one call carry the ts their log gave them, so no bound splits
+    a pair.
+    """
+    return filters.project is not None or filters.machine is not None
+
+
 def _dedup_clause(
     filters: Filters, aliased: tuple[str, ...] = (), pairs: tuple[tuple[str, str], ...] = (),
 ) -> tuple[str, list]:
@@ -243,18 +267,19 @@ def _dedup_clause(
     The lowest id per (account, dedup key) wins and a record with no key is
     kept as it stands.
 
-    One grouped pass over idx_srec_account_dk rather than a correlated subquery
-    per row — the same answer in a third of the time on a corpus of half a
-    million.
+    Where the filters cannot move that answer — which is every page this server
+    draws — it is `server_records.dup`, decided when the row was written. The
+    subquery it replaces materialised 384,063 MIN(id) rows on every request, and
+    the flag took the dashboard fold from 1.69s to 0.20s and the accounts page
+    from 2.16s to 0.23s.
 
-    The subquery repeats every filter but the date bounds, because load()
-    dedups within the set its filters admitted and which copy survives depends
-    on which are in that set. `machine` is the one this is visible through: ask
-    for the desk alone and the desk's copy of a synced call wins, where over
-    both machines the laptop's did. The date bounds are left off because they
-    cannot split a pair — two copies of one call carry the ts their log gave
-    them — and repeating them doubles what the all-time range costs.
+    Where they can, the subquery still runs, over the same filters minus the
+    date bounds: which copy survives depends on the set being deduped, and a
+    stored flag only ever answers for the whole table. That is `/v1/report`
+    narrowed to a project or a machine, and nothing else.
     """
+    if not _narrows_dedup(filters):
+        return "a.dup = 0", []
     clauses, params = _clauses(
         replace(filters, since=None, until=None), aliased=aliased, pairs=pairs,
     )

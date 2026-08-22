@@ -427,6 +427,9 @@ def ingest(
     extra = db.store_extra_samples(
         conn, auth.machine_id, [reading.model_dump() for reading in batch.extra],
     )
+    # The one moment a truncation can land: this thread has just committed
+    # everything it holds, and a push is rare enough that asking costs a stat.
+    db.truncate_wal(conn, request.app.state.db.path)
     return IngestResponse(
         machine_id=auth.machine_id, files=results, samples=stored, extra=extra,
         pull=_remainder(conn, auth.machine_id, batch.pull),

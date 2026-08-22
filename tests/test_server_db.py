@@ -39,7 +39,7 @@ class TestSchema:
         one and not the other shifts every insert one place and lands here.
         """
         cols = [row[1] for row in conn.execute("PRAGMA table_info(server_records)")]
-        assert cols == ["id", *db.REC_COLS]
+        assert cols == ["id", *db.REC_COLS, "dup"]
 
     @pytest.mark.parametrize(
         ("table", "cols"),
@@ -112,6 +112,74 @@ class TestSchema:
             assert second.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
         finally:
             second.close()
+
+    def test_the_group_index_leads_with_the_dedup_flag(self, conn):
+        """Half the table is dup=1; leading with it means a fold never reads that half."""
+        cols = [row[2] for row in conn.execute("PRAGMA index_info(idx_srec_group)")]
+        assert cols[0] == "dup"
+
+    def test_the_newest_label_lookup_has_a_covering_index(self, conn):
+        """Without it the accounts page sorts every row of an account for one string."""
+        plan = conn.execute("""
+            EXPLAIN QUERY PLAN
+            SELECT account_label FROM server_records
+             WHERE account_uuid = ? AND account_label IS NOT NULL
+          ORDER BY ts DESC LIMIT 1
+        """, ("acct-1",)).fetchall()
+        assert not any("TEMP B-TREE" in str(step) for step in plan), plan
+        assert any("idx_srec_acct_ts" in str(step) for step in plan), plan
+
+    def test_a_database_written_before_the_flag_gains_it_filled_in(self, tmp_path):
+        """The column is derived, so the step that adds it has to decide every
+        row: a backfill of zeroes would read as a corpus with no duplicates."""
+        path = tmp_path / "server.db"
+        first = db.connect(path)
+        for machine_id in ("m1", "m2"):
+            db.upsert_machine(first, machine_id, machine_id, 100.0)
+            db.replace_file_records(
+                first, machine_id, "/p/a.jsonl", 1, 10,
+                [db.record_to_row(_record(machine_id=machine_id))], 500.0,
+            )
+        first.execute("DROP INDEX idx_srec_group")
+        first.execute("ALTER TABLE server_records DROP COLUMN dup")
+        first.execute("PRAGMA user_version = 9")
+        first.close()
+
+        second = db.connect(path)
+        try:
+            assert second.execute(
+                "SELECT machine_id FROM server_records WHERE dup = 0",
+            ).fetchall() == [("m1",)]
+            assert second.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+        finally:
+            second.close()
+
+    def test_every_connection_reads_through_a_memory_map(self, conn):
+        """The map is where a report's index reads land, and it is shared where
+        a per-connection page cache is not."""
+        assert conn.execute("PRAGMA mmap_size").fetchone()[0] == db.MMAP_SIZE
+
+    def test_a_wal_under_the_threshold_is_left_alone(self, tmp_path):
+        """Truncation is for a file that grew, not for every push."""
+        path = tmp_path / "server.db"
+        conn = db.connect(path)
+        try:
+            db.upsert_machine(conn, "m1", "laptop", 100.0)
+            assert db.truncate_wal(conn, path) is False
+        finally:
+            conn.close()
+
+    def test_an_oversized_wal_is_truncated(self, tmp_path, monkeypatch):
+        """It reached 204 MB against a 774 MB database, all of it checkpointed."""
+        path = tmp_path / "server.db"
+        conn = db.connect(path)
+        try:
+            db.upsert_machine(conn, "m1", "laptop", 100.0)
+            monkeypatch.setattr(db, "WAL_TRUNCATE_BYTES", 1)
+            assert db.truncate_wal(conn, path) is True
+            assert path.with_name(path.name + "-wal").stat().st_size == 0
+        finally:
+            conn.close()
 
     def test_a_new_column_reaches_a_database_that_already_has_the_table(
         self, tmp_path, monkeypatch,
@@ -269,6 +337,89 @@ class TestWholeFileIngest:
 
     def test_an_unpushed_file_has_no_fingerprint(self, conn):
         assert db.file_fingerprint(conn, "m1", "/p/never.jsonl") is None
+
+
+class TestDedupFlag:
+    """The column that says which copy of a shared call every report reads."""
+
+    def _flags(self, conn) -> list[tuple]:
+        return conn.execute(
+            "SELECT machine_id, mid, dup FROM server_records ORDER BY id",
+        ).fetchall()
+
+    def _push(self, conn, machine_id, rows, *, path="/p/a.jsonl", mtime_ns=1, size=10):
+        db.upsert_machine(conn, machine_id, machine_id, 100.0)
+        db.replace_file_records(conn, machine_id, path, mtime_ns, size, rows, 500.0)
+
+    def test_the_first_copy_of_a_key_wins_and_later_ones_lose(self, conn):
+        """Two machines on a synced home directory push the same call twice."""
+        self._push(conn, "m1", [db.record_to_row(_record())])
+        self._push(conn, "m2", [db.record_to_row(_record(machine_id="m2"))])
+        assert self._flags(conn) == [("m1", "msg_1", 0), ("m2", "msg_1", 1)]
+
+    def test_a_record_the_log_gave_no_key_stands_for_itself(self, conn):
+        """Nothing matches it, so nothing may collapse it into something else."""
+        self._push(conn, "m1", [
+            db.record_to_row(_record(mid="msg_1", dk=None)),
+            db.record_to_row(_record(mid="msg_2", dk="")),
+            db.record_to_row(_record(mid="msg_3", dk=None)),
+        ])
+        assert [row[2] for row in self._flags(conn)] == [0, 0, 0]
+
+    def test_one_key_under_two_accounts_is_two_calls(self, conn):
+        """The dedup groups by account, so two people's keys never collide."""
+        self._push(conn, "m1", [
+            db.record_to_row(_record(account_uuid="acct-1")),
+            db.record_to_row(_record(account_uuid="acct-2")),
+        ])
+        assert [row[2] for row in self._flags(conn)] == [0, 0]
+
+    def test_losing_the_winner_promotes_the_next_copy(self, conn):
+        """The file holding the winner is re-pushed without it."""
+        self._push(conn, "m1", [db.record_to_row(_record())])
+        self._push(conn, "m2", [db.record_to_row(_record(machine_id="m2"))])
+        self._push(conn, "m1", [db.record_to_row(_record(mid="msg_9", dk="other"))],
+                   mtime_ns=2, size=20)
+        assert self._flags(conn) == [("m2", "msg_1", 0), ("m1", "msg_9", 0)]
+
+    def test_a_repushed_file_does_not_take_the_key_back(self, conn):
+        """Its rows are gone and reinserted above every id that survived."""
+        self._push(conn, "m1", [db.record_to_row(_record())])
+        self._push(conn, "m2", [db.record_to_row(_record(machine_id="m2"))])
+        self._push(conn, "m1", [db.record_to_row(_record())], mtime_ns=2, size=20)
+        assert self._flags(conn) == [("m2", "msg_1", 0), ("m1", "msg_1", 1)]
+
+    def test_deleting_a_machine_promotes_what_it_was_hiding(self, conn):
+        """Otherwise a shared call leaves with the machine that reported it first."""
+        self._push(conn, "m1", [db.record_to_row(_record())])
+        self._push(conn, "m2", [db.record_to_row(_record(machine_id="m2"))])
+        assert db.delete_machine(conn, "m1") == 1
+        assert self._flags(conn) == [("m2", "msg_1", 0)]
+
+    def test_the_whole_table_form_agrees_with_the_incremental_one(self, conn):
+        """Every write maintains the flag; the migration and a delete rebuild it."""
+        self._push(conn, "m1", [
+            db.record_to_row(_record(mid="msg_1")),
+            db.record_to_row(_record(mid="msg_2", dk=None)),
+        ])
+        self._push(conn, "m2", [db.record_to_row(_record(machine_id="m2"))])
+        incremental = self._flags(conn)
+        conn.execute("UPDATE server_records SET dup = 1 - dup")
+        db.reconcile_all_dup(conn)
+        assert self._flags(conn) == incremental
+
+    def test_more_keys_than_one_statement_holds_are_all_flagged(self, conn):
+        """The reconcile chunks its VALUES list; the seam must not drop a key."""
+        count = db._RECONCILE_CHUNK * 2 + 1
+        rows = [db.record_to_row(_record(mid=f"msg_{n}", dk=f"dk_{n}")) for n in range(count)]
+        self._push(conn, "m1", rows)
+        self._push(conn, "m2", [
+            db.record_to_row(_record(machine_id="m2", mid=f"msg_{n}", dk=f"dk_{n}"))
+            for n in range(count)
+        ])
+        assert conn.execute(
+            "SELECT COUNT(*) FROM server_records WHERE machine_id = 'm2' AND dup = 1",
+        ).fetchone()[0] == count
 
 
 class TestProjectAliases:

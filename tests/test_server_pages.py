@@ -821,3 +821,73 @@ class TestDeletingATokenAndAMachine:
         gated = TestClient(create_app(sf.config(tmp_path, networks=sf.ELSEWHERE)))
         assert gated.post("/tokens/abc/delete").status_code == 403
         assert gated.post("/settings/machines/x/delete", data={"confirm": "x"}).status_code == 403
+
+
+class TestSettingsOverviewCache:
+    """Both tables dedup the whole record table to sum a cost. Once per push."""
+
+    @pytest.fixture(autouse=True)
+    def empty_caches(self):
+        pages._ACCOUNTS_CACHE.clear()
+        pages._PROJECTS_CACHE.clear()
+        yield
+        pages._ACCOUNTS_CACHE.clear()
+        pages._PROJECTS_CACHE.clear()
+
+    def _push(self, client, **over):
+        token = _token_from(_mint(client).text)
+        over.setdefault("ts", time.time())
+        return client.post(
+            "/v1/ingest", json=sf.batch([sf.record(**over)], path=over.pop("path", "/p/a.jsonl")),
+            headers=sf.auth(token),
+        )
+
+    @pytest.mark.parametrize("route", ["/settings/accounts", "/settings/projects"])
+    def test_a_second_load_builds_nothing(self, client, route, monkeypatch):
+        self._push(client)
+        client.get(route)
+        monkeypatch.setattr(
+            pages.reports, "account_overview", _refuse, raising=True,
+        )
+        monkeypatch.setattr(
+            pages.reports, "project_overview", _refuse, raising=True,
+        )
+        assert client.get(route).status_code == 200
+
+    @pytest.mark.parametrize("route", ["/settings/accounts", "/settings/projects"])
+    def test_a_push_invalidates_it(self, client, route):
+        self._push(client, project="projA")
+        first = client.get(route).text
+        self._push(client, mid="m2", dk="d2", project="projB", path="/p/b.jsonl")
+        assert client.get(route).text != first
+
+    def test_an_alias_invalidates_the_accounts_table(self, client):
+        self._push(client)
+        client.get("/settings/accounts")
+        client.post("/settings/accounts/acct-1/alias", data={"alias": "personal"})
+        assert 'value="personal"' in client.get("/settings/accounts").text
+
+    def test_a_project_alias_invalidates_the_projects_table(self, client):
+        self._push(client, project="projA")
+        client.get("/settings/projects")
+        client.post("/settings/projects/alias",
+                    data={"machine_id": "laptop-1", "project": "projA", "alias": "renamed"})
+        assert 'value="renamed"' in client.get("/settings/projects").text
+
+    def test_two_databases_do_not_share_an_entry(self, client, tmp_path):
+        """Two empty ones stamp identically, so the path has to be in the key."""
+        self._push(client)
+        assert "me@example.net" in client.get("/settings/accounts").text
+        other = TestClient(create_app(sf.config(tmp_path / "other")))
+        assert "me@example.net" not in other.get("/settings/accounts").text
+
+    def test_the_tiers_page_reads_the_held_table(self, client, monkeypatch):
+        """Its 404 check is the same query the accounts table already paid for."""
+        self._push(client)
+        client.get("/settings/accounts")
+        monkeypatch.setattr(pages.reports, "account_overview", _refuse, raising=True)
+        assert client.get("/settings/accounts/acct-1/tiers").status_code == 200
+
+
+def _refuse(*_args, **_kwargs):
+    raise AssertionError("the held table should have answered")

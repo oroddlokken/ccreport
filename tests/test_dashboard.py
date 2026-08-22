@@ -463,7 +463,7 @@ class TestCachedDetail:
 
     def test_the_oldest_entry_goes_at_the_bound(self, app, monkeypatch):
         """Unbounded, the cache is one entry per day this server ever saw."""
-        monkeypatch.setattr(dashboard, "DETAIL_CACHE_MAX", 3)
+        monkeypatch.setattr(dashboard._DETAIL_CACHE, "limit", 3)
         first = dashboard.cached_detail(app.state.db, 30, self._scope("projA"), NOW)
         for key in ("projB", "projC", "projD"):
             dashboard.cached_detail(app.state.db, 30, self._scope(key), NOW)
@@ -914,3 +914,77 @@ class TestPlanSpanOnScopedPages:
         first, last = dashboard._active_span(merged, start, end)
         assert first >= start
         assert last <= end
+
+
+class TestStampCache:
+    """The one mechanism behind every held view: the index, an entity page, a
+    window list, a window and the two /settings tables."""
+
+    def test_a_second_get_under_one_stamp_reuses_the_first(self):
+        cache: dashboard.StampCache[object] = dashboard.StampCache()
+        first = cache.get(("k",), ("s",), object)
+        assert cache.get(("k",), ("s",), object) is first
+
+    def test_a_moved_stamp_rebuilds(self):
+        cache: dashboard.StampCache[object] = dashboard.StampCache()
+        first = cache.get(("k",), ("s",), object)
+        assert cache.get(("k",), ("t",), object) is not first
+
+    def test_each_key_is_held_apart(self):
+        cache: dashboard.StampCache[object] = dashboard.StampCache()
+        a = cache.get(("a",), ("s",), object)
+        b = cache.get(("b",), ("s",), object)
+        assert a is not b
+        assert cache.get(("a",), ("s",), object) is a
+
+    def test_no_limit_holds_everything(self):
+        cache: dashboard.StampCache[object] = dashboard.StampCache()
+        for n in range(50):
+            cache.get((n,), ("s",), object)
+        assert len(cache) == 50
+
+    def test_the_least_recently_served_goes_at_the_limit(self):
+        cache: dashboard.StampCache[object] = dashboard.StampCache(2)
+        first = cache.get(("a",), ("s",), object)
+        cache.get(("b",), ("s",), object)
+        cache.get(("a",), ("s",), object)
+        cache.get(("c",), ("s",), object)
+        assert len(cache) == 2
+        assert cache.get(("a",), ("s",), object) is first
+
+    def test_a_build_that_raises_stores_nothing(self):
+        """A 404 on a mistyped URL has to be a 404 on the next request too."""
+        cache: dashboard.StampCache[object] = dashboard.StampCache()
+
+        def boom():
+            raise LookupError("nope")
+
+        with pytest.raises(LookupError):
+            cache.get(("k",), ("s",), boom)
+        assert len(cache) == 0
+
+    def test_clear_empties_it(self):
+        cache: dashboard.StampCache[object] = dashboard.StampCache()
+        cache.get(("k",), ("s",), object)
+        cache.clear()
+        assert len(cache) == 0
+
+
+class TestCacheStamp:
+    def test_a_push_moves_it(self, app):
+        conn = app.state.db.connect()
+        before = dashboard.cache_stamp(conn, NOW)
+        client = TestClient(app)
+        token = sf.mint_for(app, "laptop-1", "Laptop")
+        client.post(
+            "/v1/ingest",
+            json=sf.batch([_rec(4, "work", project="projD")], path="/p/stamp.jsonl"),
+            headers=sf.auth(token),
+        )
+        assert dashboard.cache_stamp(conn, NOW) != before
+
+    def test_a_new_day_moves_it(self, app):
+        conn = app.state.db.connect()
+        assert dashboard.cache_stamp(conn, NOW) != dashboard.cache_stamp(
+            conn, NOW + timedelta(days=1),
+        )

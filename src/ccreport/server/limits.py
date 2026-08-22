@@ -146,6 +146,10 @@ def _spend_indexes(
     hours, and a grouped row has folded the hour away. Dedup is what makes the
     number an answer — summing the rows raw double-counts every call a synced
     log stored twice.
+
+    Not a coarser grain either: bucketing by (model, minute) moved a window's
+    spend by 9.7%, and by five minutes 37%. A fill span of minutes is most of
+    one bucket.
     """
     if not instances:
         return {}
@@ -267,6 +271,54 @@ def build(conn, days: int, now: datetime | None = None) -> LimitsView:
             )
             for window in windows.window_types([row.instance for row in rows])
         ],
+    )
+
+
+WINDOW_CACHE_MAX = 128
+"""How many window pages `cached_window` holds before the oldest goes.
+
+Sized against the list they are clicked from: a 30-day toggle drew 89 window
+instances on the server this was measured on, where a page pickles at 10 KiB
+and a week window's 169-bucket charts at 33. The key space grows by about five
+session windows a day, so it needs the bound the list cache does not.
+"""
+
+_LIST_CACHE: dashboard.StampCache[LimitsView] = dashboard.StampCache()
+_WINDOW_CACHE: dashboard.StampCache[WindowView] = dashboard.StampCache(WINDOW_CACHE_MAX)
+
+
+def cached_build(database: db.Database, days: int, now: datetime | None = None) -> LimitsView:
+    """build(), held against the stamp `dashboard.cached_build` holds the index at.
+
+    One entry per (database, range toggle), as the index cache is: what a
+    window cost is priced over the whole span the listed windows cover, and
+    that answer moves only when a push lands or the day rolls over.
+    """
+    conn = database.connect()
+    now = now or datetime.now(tz=UTC).astimezone()
+    days = days if days in dashboard.RANGES else dashboard.DEFAULT_RANGE
+    return _LIST_CACHE.get(
+        (str(database.path), days), dashboard.cache_stamp(conn, now),
+        lambda: build(conn, days, now),
+    )
+
+
+def cached_window(database: db.Database, window: str, resets_at: float, model: str | None,
+                  account: str, now: datetime | None = None) -> WindowView:
+    """build_window(), held the way `dashboard.cached_detail` holds an entity page.
+
+    Keyed on the reset `windows.rl_window_key` rounds to rather than on the
+    number in the URL, so the second of two links a rounding apart is served
+    the page the first built.
+
+    Raises the LookupError build_window raises, and stores nothing for it.
+    """
+    conn = database.connect()
+    now = now or datetime.now(tz=UTC).astimezone()
+    key = (str(database.path), window, windows.rl_window_key(resets_at), model, account)
+    return _WINDOW_CACHE.get(
+        key, dashboard.cache_stamp(conn, now),
+        lambda: build_window(conn, window, resets_at, model, account, now),
     )
 
 

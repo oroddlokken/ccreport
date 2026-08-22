@@ -134,6 +134,45 @@ class TestLoading:
         assert {m.record.day_key() for m in merged} == {"2026-03-02", "2026-03-03"}
 
 
+class TestDedupClause:
+    """Which of the two dedups a read gets, and why it may have that one."""
+
+    @pytest.mark.parametrize(
+        ("filters", "flagged"),
+        [
+            (reports.Filters(), True),
+            (reports.Filters(since=datetime(2026, 3, 3, tzinfo=UTC)), True),
+            (reports.Filters(account="me@home.example"), True),
+            (reports.Filters(project="projA"), False),
+            (reports.Filters(machine="desk-1"), False),
+        ],
+    )
+    def test_only_a_filter_that_can_move_the_winner_pays_for_the_subquery(
+        self, filters, flagged,
+    ):
+        clause, _params = reports._dedup_clause(filters)
+        assert (clause == "a.dup = 0") is flagged, clause
+
+    def test_the_flag_holds_the_answer_the_subquery_derives(self, app):
+        """The invariant every write path maintains, and the only thing that
+        makes reading the column instead of the subquery the same read."""
+        conn = app.state.db.connect()
+        assert conn.execute(
+            "SELECT id FROM server_records WHERE dup = 0 ORDER BY id",
+        ).fetchall() == conn.execute("""
+            SELECT id FROM server_records a
+             WHERE a.dk IS NULL OR a.dk = ''
+                OR a.id IN (SELECT MIN(id) FROM server_records GROUP BY account_uuid, dk)
+          ORDER BY id
+        """).fetchall()
+
+    def test_a_machine_page_still_sees_its_own_copy_of_a_shared_call(self, app):
+        """Ask for the desk alone and the desk's copy wins, where over both
+        machines the laptop's did. No stored flag can answer that."""
+        merged = reports.load(app.state.db.connect(), reports.Filters(machine="desk-1"))
+        assert {m.record.message_id: m.machine for m in merged} == {"b1": "Desk", "a2": "Desk"}
+
+
 def _totals(merged):
     """What a grouped load has to agree with load() about, to the cent."""
     return (

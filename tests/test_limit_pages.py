@@ -9,7 +9,7 @@ import pytest
 import server_fixture as sf
 from fastapi.testclient import TestClient
 
-from ccreport.server import limits
+from ccreport.server import dashboard, limits
 from ccreport.server.factory import create_app
 
 NOW = datetime.now(tz=UTC).astimezone()
@@ -208,3 +208,98 @@ class TestTheMerge:
             row.instance.resets_at != 9_999_999_999.0
             for group in view.groups for row in group.rows
         )
+
+
+class TestCachedWindows:
+    """One build per range and one per window instance, until a push lands."""
+
+    @pytest.fixture(autouse=True)
+    def empty_caches(self):
+        limits._LIST_CACHE.clear()
+        limits._WINDOW_CACHE.clear()
+        yield
+        limits._LIST_CACHE.clear()
+        limits._WINDOW_CACHE.clear()
+
+    @staticmethod
+    def _push_sample(app, used_pct: float):
+        token = sf.mint_for(app, "laptop-1", "Laptop")
+        TestClient(app).post("/v1/ingest", headers=sf.auth(token), json=sf.sample_batch([
+            sf.sample(ts=_ts(0.25), used_pct=used_pct, resets_at=RESET),
+        ]))
+
+    def test_a_second_render_of_a_range_reuses_the_first(self, app):
+        first = limits.cached_build(app.state.db, 30, NOW)
+        assert limits.cached_build(app.state.db, 30, NOW) is first
+
+    def test_each_range_is_held_apart(self, app):
+        week = limits.cached_build(app.state.db, 7, NOW)
+        month = limits.cached_build(app.state.db, 30, NOW)
+        assert week is not month
+        assert limits.cached_build(app.state.db, 7, NOW) is week
+
+    def test_an_unknown_range_shares_the_default_entry(self, app):
+        assert limits.cached_build(app.state.db, 999, NOW) is limits.cached_build(
+            app.state.db, dashboard.DEFAULT_RANGE, NOW,
+        )
+
+    def test_a_pushed_sample_invalidates_the_list(self, app):
+        first = limits.cached_build(app.state.db, 30, NOW)
+        self._push_sample(app, 88.0)
+        second = limits.cached_build(app.state.db, 30, NOW)
+        assert second is not first
+        assert second.groups[0].rows[0].instance.peak == 88.0
+
+    def test_a_new_day_invalidates_the_list(self, app):
+        first = limits.cached_build(app.state.db, 30, NOW)
+        assert limits.cached_build(app.state.db, 30, NOW + timedelta(days=1)) is not first
+
+    def test_two_databases_do_not_share_an_entry(self, app, tmp_path):
+        other = create_app(sf.config(tmp_path / "other"))
+        assert limits.cached_build(other.state.db, 30, NOW).groups == []
+        assert limits.cached_build(app.state.db, 30, NOW).groups != []
+
+    def test_the_list_page_serves_the_cached_view(self, app):
+        view = limits.cached_build(app.state.db, dashboard.DEFAULT_RANGE)
+        TestClient(app).get("/limits")
+        assert limits.cached_build(app.state.db, dashboard.DEFAULT_RANGE) is view
+
+    def test_a_second_render_of_one_window_reuses_the_first(self, app):
+        first = limits.cached_window(app.state.db, "session", RESET, None, "me@example.net", NOW)
+        assert limits.cached_window(
+            app.state.db, "session", RESET, None, "me@example.net", NOW,
+        ) is first
+
+    def test_a_reset_a_rounding_apart_is_the_same_page(self, app):
+        """Stored jitter would otherwise build the window once per link."""
+        first = limits.cached_window(app.state.db, "session", RESET, None, "me@example.net", NOW)
+        assert limits.cached_window(
+            app.state.db, "session", RESET + 20, None, "me@example.net", NOW,
+        ) is first
+
+    def test_a_window_nobody_pushed_stores_nothing(self, app):
+        with pytest.raises(LookupError):
+            limits.cached_window(app.state.db, "session", 1.0, None, "nobody", NOW)
+        assert len(limits._WINDOW_CACHE) == 0
+
+    def test_the_oldest_window_goes_at_the_bound(self, app, monkeypatch):
+        """One entry per instance, and five session windows arrive every day."""
+        token = sf.mint_for(app, "laptop-2", "Other")
+        TestClient(app).post("/v1/ingest", headers=sf.auth(token), json=sf.sample_batch([
+            sf.sample(ts=_ts(2.0), used_pct=9.0, resets_at=RESET,
+                      account_uuid="acct-2", account_label="other@example.net"),
+        ]))
+        monkeypatch.setattr(limits._WINDOW_CACHE, "limit", 1)
+        first = limits.cached_window(app.state.db, "session", RESET, None, "me@example.net", NOW)
+        limits.cached_window(app.state.db, "session", RESET, None, "other@example.net", NOW)
+        assert len(limits._WINDOW_CACHE) == 1
+        assert limits.cached_window(
+            app.state.db, "session", RESET, None, "me@example.net", NOW,
+        ) is not first
+
+    def test_the_window_page_serves_the_cached_view(self, app, client):
+        view = limits.cached_window(app.state.db, "session", RESET, None, "me@example.net")
+        client.get(_window_url(client.get("/limits").text))
+        assert limits.cached_window(
+            app.state.db, "session", RESET, None, "me@example.net",
+        ) is view

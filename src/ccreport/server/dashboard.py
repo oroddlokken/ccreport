@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 
@@ -582,40 +582,80 @@ class _Plans:
         return total if priced else None
 
 
-_CACHE: dict[tuple, tuple[tuple, Dashboard]] = {}
 _CACHE_LOCK = threading.Lock()
+
+
+def cache_stamp(conn, now: datetime) -> tuple:
+    """What a held view is checked against: what has been pushed, and the day.
+
+    `db.content_stamp` covers every write and every name typed into /settings.
+    The local date is beside it because a range ends at the next midnight, and
+    a view held across one keeps drawing yesterday's axis.
+    """
+    return db.content_stamp(conn), now.strftime("%Y-%m-%d")
+
+
+class StampCache[T]:
+    """Built views, each held until the stamp it was built from moves.
+
+    *limit* evicts the least recently served entry and belongs to a key space
+    that grows — one entry per entity, per window instance, per day. A key
+    space of one entry per range toggle passes None and needs no bound.
+
+    Two threads missing on one key both build. That costs a duplicate query,
+    where holding the lock across a build queues every other key behind one.
+    """
+
+    def __init__(self, limit: int | None = None) -> None:
+        self.limit = limit
+        self._held: OrderedDict[tuple, tuple[tuple, T]] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._held)
+
+    def clear(self) -> None:
+        self._held.clear()
+
+    def get(self, key: tuple, stamp: tuple, build: Callable[[], T]) -> T:
+        """The view held for *key* under *stamp*, or what *build* returns.
+
+        Whatever *build* raises propagates and nothing is stored for it: a URL
+        naming a window nobody pushed is a 404 on every request rather than a
+        held one.
+        """
+        with _CACHE_LOCK:
+            held = self._held.get(key)
+            if held is not None and held[0] == stamp:
+                self._held.move_to_end(key)
+                return held[1]
+        view = build()
+        with _CACHE_LOCK:
+            self._held[key] = (stamp, view)
+            self._held.move_to_end(key)
+            while self.limit is not None and len(self._held) > self.limit:
+                self._held.popitem(last=False)
+        return view
+
+
+_CACHE: StampCache[Dashboard] = StampCache()
 
 
 def cached_build(database: db.Database, days: int, now: datetime | None = None) -> Dashboard:
     """build(), reusing the last one until a push or a new day invalidates it.
 
     One entry per (database, range toggle), so the whole cache is as many
-    entries as RANGES has per server. Each is held against `db.content_stamp`
-    and the local date the render fell on: the stamp covers what was pushed,
-    the date covers the ranges that end at the next midnight and would
-    otherwise keep yesterday's axis.
+    entries as RANGES has per server.
 
     Keyed on the database path and not on the range alone, because a process
     can hold more than one — every server test does — and two empty databases
     have the same stamp.
-
-    Two threads can miss on the same range at once and both build. That costs a
-    duplicate query and nothing else, which is cheaper than holding the lock
-    across a build and serializing every other range behind it.
     """
     conn = database.connect()
     now = now or datetime.now(tz=UTC).astimezone()
     days = days if days in RANGES else DEFAULT_RANGE
-    key = (str(database.path), days)
-    stamp = (db.content_stamp(conn), now.strftime("%Y-%m-%d"))
-    with _CACHE_LOCK:
-        hit = _CACHE.get(key)
-    if hit is not None and hit[0] == stamp:
-        return hit[1]
-    view = build(conn, days, now)
-    with _CACHE_LOCK:
-        _CACHE[key] = (stamp, view)
-    return view
+    return _CACHE.get(
+        (str(database.path), days), cache_stamp(conn, now), lambda: build(conn, days, now),
+    )
 
 
 DETAIL_CACHE_MAX = 96
@@ -629,21 +669,17 @@ is hundreds, and it covers every model, machine and account a server has with
 room for the months people click through.
 """
 
-_DETAIL_CACHE: OrderedDict[tuple, tuple[tuple, Dashboard]] = OrderedDict()
+_DETAIL_CACHE: StampCache[Dashboard] = StampCache(DETAIL_CACHE_MAX)
 
 
 def cached_detail(database: db.Database, days: int, scope: Scope,
                   now: datetime | None = None) -> Dashboard:
     """One entity's page, held the way `cached_build` holds the index.
 
-    Same invalidation, `db.content_stamp` and the render's local date, and the
-    same bargain over the lock: two threads missing on one key both build,
-    where holding it across a build would queue every other entity behind one.
-
     Bounded, where `cached_build` needs no bound. Its key space is one entry
     per range toggle per server; this one is one per model, project, machine,
     account, day, week and month the server holds, and a new day arrives every
-    day. The least recently served entry goes at `DETAIL_CACHE_MAX`.
+    day.
 
     Raises whatever `build` raises -- a period key that is not a date is a
     ValueError, and nothing is stored for it.
@@ -651,20 +687,11 @@ def cached_detail(database: db.Database, days: int, scope: Scope,
     conn = database.connect()
     now = now or datetime.now(tz=UTC).astimezone()
     days = days if days in RANGES else DEFAULT_RANGE
-    key = (str(database.path), days, scope.dimension, scope.key)
-    stamp = (db.content_stamp(conn), now.strftime("%Y-%m-%d"))
-    with _CACHE_LOCK:
-        hit = _DETAIL_CACHE.get(key)
-        if hit is not None and hit[0] == stamp:
-            _DETAIL_CACHE.move_to_end(key)
-            return hit[1]
-    view = build(conn, days, now, scope=scope)
-    with _CACHE_LOCK:
-        _DETAIL_CACHE[key] = (stamp, view)
-        _DETAIL_CACHE.move_to_end(key)
-        while len(_DETAIL_CACHE) > DETAIL_CACHE_MAX:
-            _DETAIL_CACHE.popitem(last=False)
-    return view
+    return _DETAIL_CACHE.get(
+        (str(database.path), days, scope.dimension, scope.key),
+        cache_stamp(conn, now),
+        lambda: build(conn, days, now, scope=scope),
+    )
 
 
 def _period_records(conn, start: datetime, end: datetime, days: set[str],
