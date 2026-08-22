@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING
 from ccreport import pricing
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from ccreport.aggregate import UsageRecord
 
 # aggregate is a type-checking import alone: exchange.py imports cache_db, and
@@ -327,6 +329,23 @@ def window_family(inst: WindowInstance) -> str | None:
 _SERIES = ("usd", "cache_read", "observed_input")
 _USD, _CACHE_READ, _OBSERVED = range(len(_SERIES))
 
+SpendRow = tuple[float, float, float, float, str]
+"""One call as `SpendIndex` reads it: instant, USD, cache reads, observed input
+and model family. Observed input is what the API was shown — fresh input, plus
+what was written to the cache and read back from it."""
+
+
+def spend_row(rec: UsageRecord) -> SpendRow:
+    """One record as the five numbers an index keeps of it."""
+    tokens = rec.tokens
+    return (
+        rec.timestamp.timestamp(),
+        rec.cost(),
+        float(tokens.cache_read),
+        float(tokens.input + tokens.cache_create + tokens.cache_read),
+        pricing.model_family(rec.model),
+    )
+
 
 class SpendIndex:
     """Deduplicated record cost and token counts, summable over a time range.
@@ -345,15 +364,25 @@ class SpendIndex:
     def __init__(self, records: list[UsageRecord]) -> None:
         self._ts: dict[str, list[float]] = {}
         self._cum: dict[str, list[list[float]]] = {}
-        for rec in records:
-            when = rec.timestamp.timestamp()
-            tokens = rec.tokens
-            values = (
-                rec.cost(),
-                float(tokens.cache_read),
-                float(tokens.input + tokens.cache_create + tokens.cache_read),
-            )
-            for key in (SPEND_ALL, pricing.model_family(rec.model)):
+        self._absorb(spend_row(rec) for rec in records)
+
+    @classmethod
+    def from_rows(cls, rows: Iterable[SpendRow]) -> SpendIndex:
+        """An index over rows a caller read without building records first.
+
+        Five numbers per call is what this class reads; a UsageRecord carries a
+        project, a session, an account and three date derivations besides, and
+        the server was building 83,250 of them per window page to sum three
+        columns. Same order requirement as *records*.
+        """
+        index = cls([])
+        index._absorb(rows)
+        return index
+
+    def _absorb(self, rows: Iterable[SpendRow]) -> None:
+        for when, usd, cache_read, observed, family in rows:
+            values = (usd, cache_read, observed)
+            for key in (SPEND_ALL, family):
                 self._ts.setdefault(key, []).append(when)
                 cum = self._cum.setdefault(key, [[0.0] for _ in _SERIES])
                 for series, value in zip(cum, values, strict=True):

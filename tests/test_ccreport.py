@@ -2631,6 +2631,24 @@ class TestSpendIndex:
         assert ccr.SpendIndex([]).empty is True
         assert self._index().empty is False
 
+    def test_rows_build_the_index_records_do(self):
+        """The server reads five columns where it used to build a record per
+        call; the two forms have to be the same index or it prices differently."""
+        records = [
+            _spend_rec("2026-06-15T08:00", usd=1.0),
+            _spend_rec("2026-06-15T09:00", usd=2.0, model="claude-fable-5"),
+            _spend_rec("2026-06-15T10:00", usd=4.0),
+        ]
+        rows = ccr.SpendIndex.from_rows(windows.spend_row(rec) for rec in records)
+        span = (_local_epoch("2026-06-15T08:00"), _local_epoch("2026-06-15T10:00"))
+        for family in (None, "fable", "opus", "haiku"):
+            assert rows.total(*span, family) == ccr.SpendIndex(records).total(*span, family)
+            assert rows.cache_tokens(*span, family) == ccr.SpendIndex(records).cache_tokens(
+                *span, family)
+
+    def test_an_index_over_no_rows_is_as_empty_as_one_over_no_records(self):
+        assert ccr.SpendIndex.from_rows([]).empty is True
+
     def _tokens(self, start, end, family=None):
         return self._index().cache_tokens(_local_epoch(start), _local_epoch(end), family)
 

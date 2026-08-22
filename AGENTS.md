@@ -225,9 +225,20 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   the billing month rolling over
 - A quota belongs to an account, not to a machine, so `server/limits.py` groups
   samples on (account, window, model, reset) and two laptops signed into one
-  account draw one fill curve. It prices each window against `reports.load` —
-  the full record path, bounded to the window spans — because a 5-hour window is
-  priced over hours and a grouped row has folded the hour away. `/limits` is
+  account draw one fill curve. It prices each window per call, bounded to the
+  window spans, because a 5-hour window is priced over hours and a grouped row
+  has folded the hour away — and not at a coarser grain either: bucketing by
+  (model, minute) moved a window's spend 9.7% and by five minutes 37%, since a
+  fill span of minutes is most of one bucket. Per call is not per record,
+  though. `reports.load_spend` reads the five columns `windows.SpendIndex`
+  keeps — instant, USD, cache reads, observed input, family — and
+  `SpendIndex.from_rows` takes them as they are, where building a UsageRecord
+  each cost a week window 83,250 of them to sum three columns. What the page
+  *plots* is folded, through `reports.load_bucketed`: `load_grouped`'s columns
+  cut again at the axis the charts already sum into, `FLOOR` so a call before
+  the origin cannot land in the first bucket, each group carrying its own
+  earliest instant so a caller recomputing the position has nothing to round.
+  36,846 records became 269 rows and no drawn number moved. `/limits` is
   registered before the `/{dimension}/{key}` catch-all, and one window's page
   carries the model and the account in the query string: both can hold a slash
 - The month breakdown and the "Value vs plan" tile both price a span through

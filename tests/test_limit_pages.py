@@ -184,6 +184,37 @@ class TestOneWindowsPage:
         url = _window_url(client.get("/limits").text)
         assert client.get(url.replace("account=", "account=x")).status_code == 404
 
+    def test_folding_to_the_axis_draws_what_the_records_drew(self, app):
+        """The fold is only allowed because it is lossless for this page: the
+        charts sum into these buckets and the breakdown sums the lot."""
+        from ccreport import pricing, windows
+        from ccreport.server import reports
+
+        conn = app.state.db.connect()
+        view = limits.build(conn, 0, NOW)
+        [row] = [r for group in view.groups for r in group.rows]
+        _axis, first, step = limits._axis(row.instance, NOW.timestamp())
+
+        folded = limits._window_records(conn, row, first, step)
+        started = row.instance.started_at
+        per_record = reports.load(conn, reports.Filters(
+            since=datetime.fromtimestamp(
+                started if started is not None else row.instance.first_ts, tz=UTC),
+            until=datetime.fromtimestamp(row.instance.resets_at, tz=UTC),
+            account=row.account))
+        family = windows.window_family(row.instance)
+        if family is not None:
+            per_record = [m for m in per_record
+                          if pricing.model_family(m.record.model) == family]
+
+        assert sum(m.record.count for m in folded) == len(per_record)
+        assert sum(m.record.cost() for m in folded) == pytest.approx(
+            sum(m.record.cost() for m in per_record))
+        assert ([(r["key"], r["calls"], r["tokens"]) for r in
+                 dashboard.breakdown(folded, "model", 1.0)]
+                == [(r["key"], r["calls"], r["tokens"]) for r in
+                    dashboard.breakdown(per_record, "model", 1.0)])
+
 
 class TestTheMerge:
     def test_two_accounts_resetting_together_stay_apart(self, app):

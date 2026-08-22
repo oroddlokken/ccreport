@@ -142,26 +142,31 @@ def _spend_indexes(
     with somebody else's work. Bounded because a page about last week has no
     use for two years of records.
 
-    The full record path, not the grouped one: a 5-hour window is priced over
-    hours, and a grouped row has folded the hour away. Dedup is what makes the
-    number an answer — summing the rows raw double-counts every call a synced
-    log stored twice.
+    Per call, not per bucket: a 5-hour window is priced over hours, and a
+    grouped row has folded the hour away. Not a coarser grain either --
+    bucketing by (model, minute) moved a window's spend by 9.7%, and by five
+    minutes 37%, because a fill span of minutes is most of one bucket. Dedup is
+    what makes the number an answer: summing the rows raw double-counts every
+    call a synced log stored twice.
 
-    Not a coarser grain either: bucketing by (model, minute) moved a window's
-    spend by 9.7%, and by five minutes 37%. A fill span of minutes is most of
-    one bucket.
+    Per call is not the same as per record, though, and `reports.load_spend`
+    reads the five columns an index keeps instead of building a UsageRecord for
+    each — the identity on one is not something a window is priced by.
+
+    Narrowed to the one account where the instances name one, which is every
+    window page: the list page draws whatever accounts pushed a reading and
+    cannot say a single name, so it reads the span whole.
     """
     if not instances:
         return {}
     since = datetime.fromtimestamp(min(i.first_ts for _a, i, _m in instances), tz=UTC)
     until = datetime.fromtimestamp(max(i.peak_ts for _a, i, _m in instances), tz=UTC)
-    merged = reports.load(
-        conn, reports.Filters(since=since, until=until + timedelta(seconds=1)),
-    )
-    per_account: dict[str, list] = {}
-    for item in merged:
-        per_account.setdefault(item.account, []).append(item.record)
-    return {account: windows.SpendIndex(recs) for account, recs in per_account.items()}
+    named = {account for account, _i, _m in instances}
+    per_account = reports.load_spend(conn, reports.Filters(
+        since=since, until=until + timedelta(seconds=1),
+        account=next(iter(named)) if len(named) == 1 else None,
+    ))
+    return {account: windows.SpendIndex.from_rows(rows) for account, rows in per_account.items()}
 
 
 _EMPTY_INDEX = windows.SpendIndex([])
@@ -365,20 +370,29 @@ def _fill_traces(instance: windows.WindowInstance, first: float, step: float,
             for machine, values in traces.items()]
 
 
-def _window_records(conn, row: WindowRow) -> list[reports.MergedRecord]:
+def _window_records(
+    conn, row: WindowRow, first: float, step: float,
+) -> list[reports.MergedRecord]:
     """The records that filled this window: its account, its span, its family.
 
     The family filter is the same one the Spend column applies — a scoped
     window is filled by the model it names and the Sonnet window by its own
     definition, while session and week count everything.
+
+    Folded to the axis the charts plot on, which is what every caller does with
+    them anyway: three charts sum into those buckets and the breakdown sums the
+    lot. A week window drew 36,846 records to fill 169 hourly columns.
+
+    Not what prices the window — that is `_spend_indexes`, per call, because a
+    fill span can be shorter than one of these buckets.
     """
     instance = row.instance
     start = instance.started_at if instance.started_at is not None else instance.first_ts
-    merged = reports.load(conn, reports.Filters(
+    merged = reports.load_bucketed(conn, reports.Filters(
         since=datetime.fromtimestamp(start, tz=UTC),
         until=datetime.fromtimestamp(instance.resets_at, tz=UTC),
         account=row.account,
-    ))
+    ), origin=first, step=step)
     family = windows.window_family(instance)
     if family is None:
         return merged
@@ -483,7 +497,7 @@ def build_window(
         raise LookupError(window)
     [row] = _rows(conn, wanted, now.timestamp())
     axis, first, step = _axis(row.instance, now.timestamp())
-    merged = _window_records(conn, row)
+    merged = _window_records(conn, row, first, step)
     total = sum(item.record.cost() for item in merged)
     started = row.instance.started_at
     return WindowView(

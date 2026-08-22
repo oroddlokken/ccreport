@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 
-from ccreport import aggregate, exchange, tier_timeline
+from ccreport import aggregate, exchange, pricing, tier_timeline, windows
 from ccreport.aggregate import NokCtx, ReportRows, Row, UsageRecord
 from ccreport.server import db
 from ccreport.server.db import REC_COLS
@@ -329,6 +329,102 @@ def load_grouped(conn: sqlite3.Connection, filters: Filters | None = None) -> li
     merged = [_as_grouped(row, labels, aliases, proj_aliases, tiers) for row in rows]
     merged.sort(key=lambda m: m.record.timestamp)
     return merged
+
+
+_BUCKETED_SQL = f"""
+    SELECT {_GROUP_LIST}, MIN(a.ts), SUM(a.cost), COUNT(*),
+           SUM(a.input_tokens), SUM(a.output_tokens), SUM(a.cache_create), SUM(a.cache_read)
+      FROM server_records a
+     WHERE %s
+     GROUP BY {_GROUP_LIST}, CAST(FLOOR((a.ts - ?) / ?) AS INTEGER)
+"""  # noqa: S608 - GROUP_COLS is a literal tuple; every filter binds a parameter
+
+
+def load_bucketed(
+    conn: sqlite3.Connection, filters: Filters | None = None, *,
+    origin: float, step: float,
+) -> list[MergedRecord]:
+    """load_grouped's rows, cut again at every *step* from *origin*.
+
+    For a page that plots a span finer than the day `load_grouped` folds to.
+    A window page's axis is five minutes or an hour wide, and folding to
+    exactly that is lossless for it: every chart sums its records into those
+    same buckets, and a breakdown sums them all.
+
+    `FLOOR` rather than a bare `CAST`, which truncates toward zero and would
+    put the bucket before the origin in the one after it. Each group carries
+    its earliest instant, as `load_grouped`'s do, and that instant is inside
+    the group's own bucket — so a caller that recomputes the position from it
+    lands where the grouping put it, with no rounding to agree about.
+
+    Every field is real; nothing here is hollowed out. The one thing folded
+    away is which call within a (identity, bucket) pair was which, which is
+    what `count` says instead.
+    """
+    filters = filters or Filters()
+    aliases = db.account_aliases(conn)
+    proj_aliases = db.project_aliases(conn)
+    tiers = tier_timeline.TierTimeline(db.account_tiers(conn))
+    aliased = db.accounts_with_alias(conn, filters.account)
+    pairs = db.projects_with_alias(conn, filters.project)
+    dedup, dedup_params = _dedup_clause(filters, aliased, pairs)
+    clauses, params = _clauses(filters, table="a", aliased=aliased, pairs=pairs)
+    rows = conn.execute(
+        _BUCKETED_SQL % " AND ".join([dedup, *clauses]),
+        [*dedup_params, *params, origin, step],
+    ).fetchall()
+
+    labels = dict(conn.execute("SELECT machine_id, label FROM machines").fetchall())
+    merged = [_as_grouped(row, labels, aliases, proj_aliases, tiers) for row in rows]
+    merged.sort(key=lambda m: m.record.timestamp)
+    return merged
+
+
+_SPEND_SQL = """
+    SELECT a.account_uuid, a.account_label, a.ts, a.cost, a.cache_read,
+           a.input_tokens, a.cache_create, a.model
+      FROM server_records a
+     WHERE %s
+  ORDER BY a.ts
+"""
+
+
+def load_spend(
+    conn: sqlite3.Connection, filters: Filters | None = None,
+) -> dict[str, list[windows.SpendRow]]:
+    """The five numbers a `windows.SpendIndex` keeps, per displayed account.
+
+    Deduplicated and ordered like `load`, which is what the bisect behind an
+    index needs, but stopping at the columns that index reads. A window page
+    was building 83,250 UsageRecords -- each with a project, a session, a tier
+    lookup and three date derivations -- to sum three columns, and threw every
+    one of them away.
+
+    Per account because a window belongs to one: pricing a shared machine's
+    windows against everyone's work would bill one person for another's.
+    """
+    filters = filters or Filters()
+    aliases = db.account_aliases(conn)
+    aliased = db.accounts_with_alias(conn, filters.account)
+    pairs = db.projects_with_alias(conn, filters.project)
+    dedup, dedup_params = _dedup_clause(filters, aliased, pairs)
+    clauses, params = _clauses(filters, table="a", aliased=aliased, pairs=pairs)
+    rows = conn.execute(
+        _SPEND_SQL % " AND ".join([dedup, *clauses]), dedup_params + params,
+    ).fetchall()
+
+    # One family per distinct model rather than per call: the corpus names a
+    # handful of models and the lookup is a scan of each name.
+    families: dict[str, str] = {}
+    per_account: dict[str, list[windows.SpendRow]] = {}
+    for uuid, label, ts, cost, cache_read, tokens_in, cache_create, model in rows:
+        family = families.get(model)
+        if family is None:
+            family = families[model] = pricing.model_family(model)
+        per_account.setdefault(account_display(uuid, label, aliases), []).append(
+            (ts, cost, float(cache_read), float(tokens_in + cache_create + cache_read), family),
+        )
+    return per_account
 
 
 def _as_grouped(

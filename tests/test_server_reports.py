@@ -16,7 +16,7 @@ import server_fixture as sf
 from fastapi.testclient import TestClient
 from rich.console import Console
 
-from ccreport import aggregate, tier_timeline
+from ccreport import aggregate, tier_timeline, windows
 from ccreport import ccreport as ccr
 from ccreport.server import db, reports
 from ccreport.server.factory import create_app
@@ -171,6 +171,101 @@ class TestDedupClause:
         machines the laptop's did. No stored flag can answer that."""
         merged = reports.load(app.state.db.connect(), reports.Filters(machine="desk-1"))
         assert {m.record.message_id: m.machine for m in merged} == {"b1": "Desk", "a2": "Desk"}
+
+
+class TestSpendLoading:
+    """The five columns a window is priced from, without a record around them."""
+
+    def _index(self, app, account):
+        conn = app.state.db.connect()
+        return windows.SpendIndex.from_rows(reports.load_spend(conn)[account])
+
+    def test_it_prices_a_span_the_way_the_record_path_does(self, app):
+        """The whole point: fewer objects, not a different number."""
+        conn = app.state.db.connect()
+        span = (_ts(1), _ts(4))
+        for account in ("me@work.example", "me@home.example"):
+            records = [m.record for m in reports.load(conn) if m.account == account]
+            assert self._index(app, account).total(*span) == pytest.approx(
+                windows.SpendIndex(records).total(*span))
+
+    def test_the_copy_a_synced_log_stored_twice_is_priced_once(self, app):
+        rows = reports.load_spend(app.state.db.connect())["me@work.example"]
+        assert len(rows) == 2
+
+    def test_a_family_is_resolved_per_model_not_per_call(self, app):
+        """Memoized in the loader; the answer must still be per model."""
+        rows = reports.load_spend(app.state.db.connect())["me@work.example"]
+        assert sorted(row[4] for row in rows) == ["opus", "sonnet"]
+
+    def test_rows_come_back_in_the_order_the_bisect_needs(self, app):
+        rows = reports.load_spend(app.state.db.connect())["me@work.example"]
+        assert [row[0] for row in rows] == sorted(row[0] for row in rows)
+
+    def test_an_account_with_no_records_is_absent_rather_than_empty(self, app):
+        assert "nobody@example.net" not in reports.load_spend(app.state.db.connect())
+
+
+class TestBucketedLoading:
+    """load_grouped cut again at the axis a window page plots on."""
+
+    def _bucketed(self, app, step, origin=None):
+        return reports.load_bucketed(
+            app.state.db.connect(), origin=origin if origin is not None else _ts(1), step=step)
+
+    def test_an_hour_wide_axis_totals_what_the_records_do(self, app):
+        conn = app.state.db.connect()
+        assert _totals(self._bucketed(app, 3600.0)) == _totals(reports.load(conn))
+
+    def test_every_call_is_counted_once(self, app):
+        conn = app.state.db.connect()
+        assert sum(m.record.count for m in self._bucketed(app, 3600.0)) == len(reports.load(conn))
+
+    def test_two_calls_in_one_bucket_become_one_row(self, tmp_path):
+        """The fold itself: same identity, same bucket, one row carrying both."""
+        app = create_app(sf.config(tmp_path))
+        token = sf.mint_for(app)
+        TestClient(app).post("/v1/ingest", headers=sf.auth(token), json=sf.batch([
+            sf.record(mid="c1", dk="c1:r", ts=_ts(2, 9), utc_offset=0),
+            sf.record(mid="c2", dk="c2:r", ts=_ts(2, 9) + 60, utc_offset=0),
+        ]))
+        folded = reports.load_bucketed(
+            app.state.db.connect(), origin=_ts(2), step=3600.0)
+        assert [m.record.count for m in folded] == [2]
+
+    def test_a_bucket_narrower_than_the_calls_keeps_them_apart(self, tmp_path):
+        """The same two calls, a minute apart, on a five-minute axis."""
+        app = create_app(sf.config(tmp_path))
+        token = sf.mint_for(app)
+        TestClient(app).post("/v1/ingest", headers=sf.auth(token), json=sf.batch([
+            sf.record(mid="c1", dk="c1:r", ts=_ts(2, 9), utc_offset=0),
+            sf.record(mid="c2", dk="c2:r", ts=_ts(2, 9) + 600, utc_offset=0),
+        ]))
+        folded = reports.load_bucketed(
+            app.state.db.connect(), origin=_ts(2), step=300.0)
+        assert [m.record.count for m in folded] == [1, 1]
+
+    def test_a_group_carries_an_instant_inside_its_own_bucket(self, app):
+        """What lets a caller recompute the position with nothing to round."""
+        origin, step = _ts(1), 3600.0
+        for item in self._bucketed(app, step, origin):
+            assert item.record.timestamp.timestamp() - origin >= 0
+
+    def test_a_record_before_the_origin_does_not_land_in_the_first_bucket(self, app):
+        """CAST truncates toward zero, so -0.5 would be bucket 0 and a call
+        from before the window would be drawn inside it. FLOOR is why not."""
+        origin, step = _ts(3), 86400.0
+        early = [m for m in self._bucketed(app, step, origin)
+                 if m.record.timestamp.timestamp() < origin]
+        assert early, "the fixture has records before day 3"
+        assert all(int((m.record.timestamp.timestamp() - origin) // step) < 0 for m in early)
+
+    def test_identity_survives_the_fold(self, app):
+        """Nothing here is hollowed out, unlike a record keyed on its own id."""
+        machines = {m.machine for m in self._bucketed(app, 3600.0)}
+        projects = {m.record.project for m in self._bucketed(app, 3600.0)}
+        assert machines == {"Laptop", "Desk"}
+        assert projects == {"projA", "projB"}
 
 
 def _totals(merged):
