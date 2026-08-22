@@ -44,6 +44,14 @@ class MergedRecord:
     machine: str
     account: str
     tier: str | None = None
+    redacted: bool = False
+    """Whether the pushing machine stripped this record's project name.
+
+    The record's own project is the bucket those rows fold into, which reads
+    as a project and is not one. Kept as the column's own answer rather than
+    matched off the displayed name, which a real project called
+    `foo-aggregated` would answer to as well.
+    """
 
 
 _SELECT = ", ".join(REC_COLS)
@@ -236,6 +244,7 @@ def _as_merged(
     return MergedRecord(
         record=record, machine=machine_label, account=account,
         tier=tiers.at(rec["account_uuid"], rec["ts"]) if tiers else None,
+        redacted=rec["project"] is None,
     )
 
 
@@ -466,6 +475,7 @@ def _as_grouped(
     return MergedRecord(
         record=record, machine=labels.get(machine_id, machine_id), account=account,
         tier=tiers.at(account_uuid, first_ts) if tiers else None,
+        redacted=project is None,
     )
 
 

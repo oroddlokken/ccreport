@@ -671,21 +671,25 @@ class StampCache[T]:
 _CACHE: StampCache[Dashboard] = StampCache()
 
 
-def cached_build(database: db.Database, days: int, now: datetime | None = None) -> Dashboard:
+def cached_build(database: db.Database, days: int, now: datetime | None = None,
+                 hide_redacted: bool = False) -> Dashboard:
     """build(), reusing the last one until a push or a new day invalidates it.
 
-    One entry per (database, range toggle), so the whole cache is as many
-    entries as RANGES has per server.
+    One entry per (database, range toggle, preference), so the whole cache is
+    twice as many entries as RANGES has per server.
 
     Keyed on the database path and not on the range alone, because a process
     can hold more than one — every server test does — and two empty databases
-    have the same stamp.
+    have the same stamp. The preference is in the key because it changes every
+    figure the view holds, and one browser's cookie must not answer another's
+    request.
     """
     conn = database.connect()
     now = now or datetime.now(tz=UTC).astimezone()
     days = days if days in RANGES else DEFAULT_RANGE
     return _CACHE.get(
-        (str(database.path), days), cache_stamp(conn, now), lambda: build(conn, days, now),
+        (str(database.path), days, hide_redacted), cache_stamp(conn, now),
+        lambda: build(conn, days, now, hide_redacted=hide_redacted),
     )
 
 
@@ -704,7 +708,7 @@ _DETAIL_CACHE: StampCache[Dashboard] = StampCache(DETAIL_CACHE_MAX)
 
 
 def cached_detail(database: db.Database, days: int, scope: Scope,
-                  now: datetime | None = None) -> Dashboard:
+                  now: datetime | None = None, hide_redacted: bool = False) -> Dashboard:
     """One entity's page, held the way `cached_build` holds the index.
 
     Bounded, where `cached_build` needs no bound. Its key space is one entry
@@ -719,9 +723,9 @@ def cached_detail(database: db.Database, days: int, scope: Scope,
     now = now or datetime.now(tz=UTC).astimezone()
     days = days if days in RANGES else DEFAULT_RANGE
     return _DETAIL_CACHE.get(
-        (str(database.path), days, scope.dimension, scope.key),
+        (str(database.path), days, scope.dimension, scope.key, hide_redacted),
         cache_stamp(conn, now),
-        lambda: build(conn, days, now, scope=scope),
+        lambda: build(conn, days, now, scope=scope, hide_redacted=hide_redacted),
     )
 
 
@@ -743,13 +747,28 @@ def _period_records(conn, start: datetime, end: datetime, days: set[str],
     return [item for item in load(conn, filters) if item.record.day_key() in days]
 
 
+def _visible(merged: list[reports.MergedRecord], hide_redacted: bool) -> list[reports.MergedRecord]:
+    """*merged*, less the records whose project name their machine stripped.
+
+    Dropped here rather than in SQL so the fold, the axis and every breakdown
+    see one set of records: a page that charted a day the filter had emptied
+    would draw a gap the table below it does not have.
+    """
+    return [item for item in merged if not item.redacted] if hide_redacted else merged
+
+
 def build(conn, days: int, now: datetime | None = None,
-          scope: Scope | None = None) -> Dashboard:
+          scope: Scope | None = None, hide_redacted: bool = False) -> Dashboard:
     """Everything the page shows, for one range toggle and one scope.
 
     With a *scope* the same fold runs over the records that match it alone, and
     the page gains the four charts. A period scope is its own range: the toggle
     cannot widen a page that is about one day, one week or one month.
+
+    *hide_redacted* leaves out every record a restricted machine stripped the
+    project from, which the totals, the account rows and the charts all lose
+    with it. A call two machines pushed, where the stripped copy is the one the
+    dedup kept, goes with them rather than falling back to the named copy.
 
     Raises ValueError where a period scope's key is not a date that period can
     be keyed on.
@@ -759,7 +778,7 @@ def build(conn, days: int, now: datetime | None = None,
     if scope is not None and scope.is_period:
         hourly = scope.dimension == "day"
         start, end, day_axis = period_span(scope.dimension, scope.key)
-        merged = _period_records(conn, start, end, set(day_axis), hourly)
+        merged = _visible(_period_records(conn, start, end, set(day_axis), hourly), hide_redacted)
         axis = _hour_axis(scope.key) if hourly else day_axis
         position_of = _hour_position(start) if hourly else _day_position(axis)
     else:
@@ -767,7 +786,9 @@ def build(conn, days: int, now: datetime | None = None,
             start, end = all_time_bounds(db.oldest_record_ts(conn), now)
         else:
             start, end = range_bounds(days, now)
-        merged = reports.load_grouped(conn, reports.Filters(since=start, until=end))
+        merged = _visible(
+            reports.load_grouped(conn, reports.Filters(since=start, until=end)), hide_redacted,
+        )
         if scope is not None:
             key_of = _DIMENSION_KEYS[scope.dimension]
             merged = [item for item in merged if str(key_of(item)) == scope.key]

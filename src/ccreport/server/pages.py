@@ -81,7 +81,9 @@ def index(request: Request, days: int = Query(default=dashboard.DEFAULT_RANGE),
     is where they live so a reload lands on the last click rather than back at
     model and cost.
     """
-    view = dashboard.cached_build(request.app.state.db, days)
+    view = dashboard.cached_build(
+        request.app.state.db, days, hide_redacted=_hide_redacted(request),
+    )
     return templates.TemplateResponse(request, "dashboard.html", {
         "view": view,
         "ranges": dashboard.RANGES,
@@ -98,6 +100,57 @@ def index(request: Request, days: int = Query(default=dashboard.DEFAULT_RANGE),
             ],
         }),
     })
+
+
+HIDE_REDACTED_COOKIE = "hide_redacted"
+"""The cookie a browser asking to leave redacted spend out carries.
+
+A cookie rather than a row: which spend a person wants drawn is a property of
+the screen they are looking at, not of the server, and two people reading the
+same dashboard from one machine's database disagree about it. There is no
+login here to hang it off either.
+"""
+
+PREF_MAX_AGE_S = 400 * 24 * 60 * 60
+"""How long a stored preference lives. Chrome caps a cookie at 400 days and
+silently shortens anything longer, so this is the longest one that survives."""
+
+
+def _hide_redacted(request: Request) -> bool:
+    """Whether this browser asked for redacted spend to be left out."""
+    return request.cookies.get(HIDE_REDACTED_COOKIE) == "1"
+
+
+@router.get("/settings", response_class=HTMLResponse)
+def settings(request: Request, saved: str = Query(default="")):
+    """What this browser has asked the dashboard to leave out.
+
+    Registered above the machines, accounts and projects pages it sits beside,
+    and unlike them it writes nothing anyone else can see.
+    """
+    return templates.TemplateResponse(request, "settings.html", {
+        "hide_redacted": _hide_redacted(request),
+        "note": "Saved." if saved else "",
+    })
+
+
+@router.post("/settings")
+def save_settings(hide_redacted: str = Form("")):
+    """Store the preferences this browser sends, or clear what it left out.
+
+    An unticked checkbox is absent from the form rather than false, so a
+    missing field deletes the cookie: the two states are what was posted and
+    what was not.
+    """
+    response = RedirectResponse(url="/settings?saved=1", status_code=303)
+    if hide_redacted:
+        response.set_cookie(
+            HIDE_REDACTED_COOKIE, "1", max_age=PREF_MAX_AGE_S,
+            path="/", httponly=True, samesite="lax",
+        )
+    else:
+        response.delete_cookie(HIDE_REDACTED_COOKIE, path="/")
+    return response
 
 
 @router.get("/settings/machines", response_class=HTMLResponse)
@@ -488,7 +541,9 @@ def detail(request: Request, dimension: str, key: str,
         raise HTTPException(status_code=404, detail=f"No {dimension} pages.")
     scope = dashboard.Scope(dimension=dimension, key=key)
     try:
-        view = dashboard.cached_detail(request.app.state.db, days, scope)
+        view = dashboard.cached_detail(
+            request.app.state.db, days, scope, hide_redacted=_hide_redacted(request),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=f"{key} is not a {dimension}.") from exc
     return templates.TemplateResponse(request, "detail.html", {

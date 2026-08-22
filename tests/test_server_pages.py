@@ -13,8 +13,8 @@ from fastapi.testclient import TestClient
 from ccreport.server import pages, tokens
 from ccreport.server.factory import create_app
 
-UI_ROUTES = ["/", "/settings/machines", "/settings/machines/laptop-1", "/settings/accounts",
-             "/settings/projects"]
+UI_ROUTES = ["/", "/settings", "/settings/machines", "/settings/machines/laptop-1",
+             "/settings/accounts", "/settings/projects"]
 
 
 @pytest.fixture(autouse=True)
@@ -891,3 +891,59 @@ class TestSettingsOverviewCache:
 
 def _refuse(*_args, **_kwargs):
     raise AssertionError("the held table should have answered")
+
+
+class TestPreferences:
+    """The one thing a browser tells this server about itself."""
+
+    def _redacted(self, client):
+        """One named project and one stripped record, pushed by one machine."""
+        token = sf.mint_for(client.app)
+        records = [
+            sf.record(mid="named", dk="named:r"),
+            sf.record(mid="hidden", dk="hidden:r", project=None, cwd=None, repo=None, sid=None),
+        ]
+        client.post("/v1/ingest", json=sf.batch(records), headers=sf.auth(token))
+
+    def test_the_page_opens_with_the_box_unticked(self, client):
+        page = client.get("/settings").text
+        assert 'name="hide_redacted"' in page
+        assert "checked" not in page
+
+    def test_saving_sets_the_cookie_and_redirects_back(self, client):
+        response = client.post(
+            "/settings", data={"hide_redacted": "1"}, follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert response.headers["location"] == "/settings?saved=1"
+        assert client.cookies[pages.HIDE_REDACTED_COOKIE] == "1"
+
+    def test_the_saved_box_is_ticked_when_the_page_comes_back(self, client):
+        client.post("/settings", data={"hide_redacted": "1"})
+        assert "checked" in client.get("/settings").text
+
+    def test_an_unticked_box_clears_what_was_stored(self, client):
+        """An unticked checkbox is absent from the form, not false."""
+        client.post("/settings", data={"hide_redacted": "1"})
+        client.post("/settings", data={})
+        assert pages.HIDE_REDACTED_COOKIE not in client.cookies
+        assert "checked" not in client.get("/settings").text
+
+    def test_the_dashboard_drops_the_bucket_for_a_browser_that_asked(self, client):
+        self._redacted(client)
+        assert "aggregated" in client.get("/?by=project").text
+        client.post("/settings", data={"hide_redacted": "1"})
+        assert "aggregated" not in client.get("/?by=project").text
+
+    def test_a_detail_page_drops_it_too(self, client):
+        self._redacted(client)
+        client.post("/settings", data={"hide_redacted": "1"})
+        assert "aggregated" not in client.get("/account/me@example.net").text
+
+    def test_the_settings_lists_count_it_either_way(self, client):
+        """The row that names an account is how the bucket is named at all."""
+        self._redacted(client)
+        client.post("/settings", data={"hide_redacted": "1"})
+        page = client.get("/settings/accounts").text
+        assert "me@example.net" in page
+        assert 'data-int="2"' in page

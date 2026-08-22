@@ -275,6 +275,62 @@ class TestRedactedProjects:
         assert [row["key"] for row in rows] == ["personal-aggregated"]
 
 
+class TestHidingRedactedSpend:
+    """The preference a browser carries: leave the stripped records out."""
+
+    def _mixed(self, tmp_path):
+        """One named project and one stripped record, on one account."""
+        app = create_app(sf.config(tmp_path))
+        token = sf.mint_for(app)
+        records = [
+            _rec(1, "work"),
+            sf.record(mid="r1", dk="r1:r", ts=_ts(2), project=None, cwd=None, repo=None,
+                      sid=None, utc_offset=_offset(), account_uuid="work",
+                      account_label="work@example.net"),
+        ]
+        TestClient(app).post("/v1/ingest", json=sf.batch(records), headers=sf.auth(token))
+        return app
+
+    def test_the_bucket_goes_and_the_total_drops_by_what_it_held(self, tmp_path):
+        conn = self._mixed(tmp_path).state.db.connect()
+        shown = dashboard.build(conn, 30, NOW)
+        hidden = dashboard.build(conn, 30, NOW, hide_redacted=True)
+        bucket = next(r for r in shown.breakdowns["project"] if r["key"].endswith("/aggregated"))
+        assert [r["key"] for r in hidden.breakdowns["project"]] == ["projA"]
+        assert hidden.total_cost == pytest.approx(shown.total_cost - bucket["cost"])
+
+    def test_the_named_project_keeps_every_number(self, tmp_path):
+        conn = self._mixed(tmp_path).state.db.connect()
+        shown = next(r for r in dashboard.build(conn, 30, NOW).breakdowns["project"]
+                     if r["key"] == "projA")
+        hidden = dashboard.build(conn, 30, NOW, hide_redacted=True).breakdowns["project"][0]
+        assert (hidden["cost"], hidden["tokens"], hidden["calls"]) == (
+            shown["cost"], shown["tokens"], shown["calls"],
+        )
+
+    def test_a_scoped_page_drops_them_as_the_index_does(self, tmp_path):
+        conn = self._mixed(tmp_path).state.db.connect()
+        scope = dashboard.Scope(dimension="account", key="work@example.net")
+        view = dashboard.build(conn, 30, NOW, scope=scope, hide_redacted=True)
+        assert [r["key"] for r in view.breakdowns["project"]] == ["projA"]
+
+    def test_a_day_page_drops_them_too(self, tmp_path):
+        """The period branch loads its own records, one at a time."""
+        conn = self._mixed(tmp_path).state.db.connect()
+        day = (NOW - timedelta(days=2)).strftime("%Y-%m-%d")
+        scope = dashboard.Scope(dimension="day", key=day)
+        assert dashboard.build(conn, 30, NOW, scope=scope).total_cost > 0
+        assert dashboard.build(conn, 30, NOW, scope=scope, hide_redacted=True).total_cost == 0
+
+    def test_a_held_view_is_never_served_to_the_other_preference(self, tmp_path):
+        """Two browsers, one cache: the flag is in the key for this reason."""
+        app = self._mixed(tmp_path)
+        shown = dashboard.cached_build(app.state.db, 30, NOW)
+        hidden = dashboard.cached_build(app.state.db, 30, NOW, hide_redacted=True)
+        assert hidden.total_cost < shown.total_cost
+        assert dashboard.cached_build(app.state.db, 30, NOW).total_cost == shown.total_cost
+
+
 class TestTogglesInTheURL:
     """Which breakdown and which chart series the page opens on."""
 

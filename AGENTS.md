@@ -302,6 +302,19 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   and local date `cached_build` does but evicts: the index has one entry per
   range toggle, where an entity page has one per model, project, machine,
   account, day, week and month, and a new day arrives every day
+- `GET /settings` is the one page under that prefix that stores nothing on the
+  server: a cookie (`pages.HIDE_REDACTED_COOKIE`) says whether this browser
+  wants redacted spend left out, because which spend a person wants drawn is a
+  property of their screen and there is no login to hang it off. What it drops
+  is `reports.MergedRecord.redacted`, the record's own NULL project column
+  rather than a match on the bucket name, which a project called
+  `foo-aggregated` would answer to as well, and `dashboard.build` drops those
+  records at the load so the fold, the axis and every breakdown see one set.
+  `hide_redacted` is in both view cache keys, or one browser's cookie answers
+  another's request. `/limits` and the `/settings/*` lists count them either
+  way — a window is priced from `load_spend`, which stops at five columns and
+  carries no project, and hiding a bucket from the page that names its account
+  is how you lose the way back
 - The three `dashboard.PERIODS` — day, week, month — are their own range and
   print no toggle: the span is the page. A day charts by hour, so it is the one
   build that calls `reports.load`; a week and a month chart by day and take
