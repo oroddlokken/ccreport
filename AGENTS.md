@@ -314,8 +314,11 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   that date's Monday, so its seven URLs draw one page, and a key the period
   cannot parse is a 404 rather than an empty page that reads as an idle month
 - A detail page draws four charts rather than one with a toggle, and each has
-  one scale: cost, cost by model, tokens by kind and calls do not share an
-  axis. Series colours come from `static/palette.js` in fixed order, so a
+  one scale: cost by account, cost by model, tokens by kind and calls do not
+  share an axis. A cost chart whose split leaves one trace is dropped — an
+  account page's cost by account, and a project one account worked on — so a
+  page draws at most four and never redraws its headline figure under a second
+  title. Series colours come from `static/palette.js` in fixed order, so a
   filter that drops one series never repaints the others, and the six hues are
   validated as a set against the dark surface — re-run the dataviz validator
   before changing a value. A seventh series folds into `Other` at

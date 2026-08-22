@@ -1013,7 +1013,8 @@ class TestCoveredAxis:
 
     def test_every_record_still_lands_on_the_axis(self, app):
         view = self._scoped(app, "project", "projB")
-        drawn = sum(value or 0.0 for trace in view.charts[3].traces for value in trace.values)
+        calls = next(chart for chart in view.charts if chart.key == "calls")
+        drawn = sum(value or 0.0 for trace in calls.traces for value in trace.values)
         assert drawn == 2.0
 
     def test_the_days_between_are_kept(self, app):

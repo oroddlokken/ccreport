@@ -189,6 +189,23 @@ class TestCharts:
             assert dropped not in keys
             assert len(keys) == 3
 
+    def test_a_project_one_account_worked_on_drops_the_account_chart(self, tmp_path):
+        """One trace under a second title is the headline figure again."""
+        app = create_app(sf.config(tmp_path))
+        client = TestClient(app)
+        records = [
+            _rec(1, 12, "work", "solo", "claude-opus-4-5-20251101"),
+            _rec(1, 13, "work", "shared", "claude-opus-4-5-20251101"),
+            _rec(1, 14, "home", "shared", "claude-haiku-4-5"),
+        ]
+        token = sf.mint_for(app, "neo", "neo")
+        client.post("/v1/ingest", json=sf.batch(records, path="/p/n.jsonl", label="neo"),
+                    headers=sf.auth(token))
+        solo = [c["key"] for c in _charts(client.get("/project/solo").text)]
+        assert solo == ["tokens-kind", "calls"]
+        shared = [c["key"] for c in _charts(client.get("/project/shared").text)]
+        assert shared == ["cost-account", "cost-model", "tokens-kind", "calls"]
+
     def test_a_trace_carries_one_value_per_bucket(self, client):
         for chart in _charts(client.get("/project/infrastructure").text):
             assert all(len(t["values"]) == len(chart["axis"]) for t in chart["traces"])

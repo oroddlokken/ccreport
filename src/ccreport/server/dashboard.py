@@ -495,8 +495,7 @@ def token_pairs(item: reports.MergedRecord) -> list[tuple[str, float]]:
     ]
 
 
-def _charts(merged: list[reports.MergedRecord], axis: list[str], position_of,
-            dimension: str | None = None) -> list[Chart]:
+def _charts(merged: list[reports.MergedRecord], axis: list[str], position_of) -> list[Chart]:
     """The plots a detail page draws over one axis, at most four.
 
     Four rather than one with a toggle: cost, what it went on, what shape the
@@ -505,9 +504,11 @@ def _charts(merged: list[reports.MergedRecord], axis: list[str], position_of,
     dollar axis and a token axis on one plot would be two charts drawn over
     each other.
 
-    Three on a page split by what the page is already about: an account page's
-    cost by account is one trace, and the tables drop their own dimension for
-    the same reason.
+    A cost chart with one trace is dropped: it redraws the headline figure
+    under a second title. That covers the page split by what it is already
+    about — an account page's cost by account — and the project worked on by
+    one account, which is the same chart from the other side. Calls is one
+    trace by design and is not a cost split.
     """
     charts = [
         Chart(key="cost-account", title="Cost by account", unit="usd", axis=axis,
@@ -522,7 +523,8 @@ def _charts(merged: list[reports.MergedRecord], axis: list[str], position_of,
               traces=traced(merged, axis, position_of,
                              lambda item: [("Calls", float(item.record.count))])),
     ]
-    return [chart for chart in charts if chart.key != f"cost-{dimension}"]
+    return [chart for chart in charts
+            if not (chart.key.startswith("cost-") and len(chart.traces) == 1)]
 
 
 def breakdown(merged: list[reports.MergedRecord], dimension: str,
@@ -833,6 +835,5 @@ def build(conn, days: int, now: datetime | None = None,
         breakdowns=breakdowns,
         machines=sorted({item.machine for item in merged}),
         scope=scope,
-        charts=_charts(merged, axis, position_of, scope.dimension)
-        if scope is not None else [],
+        charts=_charts(merged, axis, position_of) if scope is not None else [],
     )
