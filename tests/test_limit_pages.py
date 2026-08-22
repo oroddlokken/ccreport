@@ -89,6 +89,19 @@ class TestTheWindowList:
         """5000 written and 30000 read of 36000 shown is 83%."""
         assert "83%" in client.get("/limits").text
 
+    def test_the_newest_window_leads_each_table(self, app):
+        """Three session windows a day apart, listed the way they are read."""
+        token = sf.mint_for(app, "laptop-1", "Laptop")
+        TestClient(app).post("/v1/ingest", headers=sf.auth(token), json=sf.sample_batch([
+            sf.sample(ts=_ts(24 * ago + 1), used_pct=30.0, resets_at=RESET - 86_400 * ago)
+            for ago in (1, 2)
+        ]))
+        [group] = limits.build(app.state.db.connect(), 30, NOW).groups
+        resets = [row.instance.resets_at for row in group.rows]
+        assert len(resets) == 3
+        assert resets == sorted(resets, reverse=True)
+        assert resets[0] == RESET
+
     def test_an_empty_server_says_why_it_is_empty(self, tmp_path):
         empty = TestClient(create_app(sf.config(tmp_path / "other")))
         body = empty.get("/limits").text

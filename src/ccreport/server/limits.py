@@ -224,8 +224,20 @@ def _instance_extra(
     return answer
 
 
+def _row_order(row: WindowRow) -> tuple[int, str, float, str, str]:
+    """`windows.instance_order` with the reset reversed, then the account."""
+    rank, name, resets_at, model = windows.instance_order(row.instance)
+    return (rank, name, -resets_at, model, row.account)
+
+
 def _rows(conn, samples: list[dict], now: float) -> list[WindowRow]:
-    """Every window the samples describe, priced, in the CLI's printed order."""
+    """Every window the samples describe, priced, newest reset first.
+
+    The reverse of the CLI's printed order, which `windows.instance_order`
+    still sets: a page is opened for the window that is filling now, and an
+    all-time toggle puts hundreds of finished ones above it. The rest of that
+    key is kept, so two windows resetting at one instant still order.
+    """
     aliases = db.account_aliases(conn)
     instances = _merged_instances(samples, aliases)
     indexes = _spend_indexes(conn, instances)
@@ -242,7 +254,7 @@ def _rows(conn, samples: list[dict], now: float) -> list[WindowRow]:
         )
         for account, instance, machines in instances
     ]
-    rows.sort(key=lambda row: (windows.instance_order(row.instance), row.account))
+    rows.sort(key=_row_order)
     return rows
 
 
