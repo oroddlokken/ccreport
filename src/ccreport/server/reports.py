@@ -390,6 +390,40 @@ def account_overview(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
+def project_overview(conn: sqlite3.Connection) -> list[dict]:
+    """Every (machine, project) pair with records here, its spend and its alias.
+
+    Deduped through _dedup_clause, and here rather than in db.py for the reason
+    account_overview is: one call pushed under two file paths is one call, and
+    the raw sum drew 2.16x what the project page drew for the same rows.
+
+    The surviving copy is the lowest id per (account, dedup key) across the
+    whole table, so a call two machines both pushed lands on whichever one's
+    copy won. That is the trade account_overview already makes and what the
+    dashboard shows, and the Records column counts the same set the cost does.
+
+    A record whose project is NULL is left out: a restricted machine stripped
+    the name, and the bucket those rows fold into is named off the account.
+    """
+    dedup, params = _dedup_clause(Filters())
+    rows = conn.execute(f"""
+        SELECT a.machine_id, a.project,
+               (SELECT m.label FROM machines m WHERE m.machine_id = a.machine_id),
+               COUNT(*), COALESCE(SUM(a.cost), 0),
+               (SELECT p.alias FROM project_aliases p
+                 WHERE p.machine_id = a.machine_id AND p.project = a.project)
+          FROM server_records a
+         WHERE a.project IS NOT NULL AND {dedup}
+      GROUP BY a.machine_id, a.project
+      ORDER BY SUM(a.cost) DESC
+    """, params).fetchall()  # noqa: S608 - dedup is a literal clause; its filters bind parameters
+    return [
+        {"machine_id": row[0], "project": row[1], "machine": row[2] or row[0],
+         "records": row[3], "cost": row[4], "alias": row[5]}
+        for row in rows
+    ]
+
+
 def nok_context(merged: list[MergedRecord], *, mva: bool = True) -> NokCtx:
     """A NokCtx over the rates this server holds for the dates in *merged*.
 

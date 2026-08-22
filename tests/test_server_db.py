@@ -276,19 +276,6 @@ class TestProjectAliases:
         assert db.projects_with_alias(conn, None) == ()
         assert db.projects_with_alias(conn, "nobody") == ()
 
-    def test_the_overview_lists_every_pushed_pair_with_its_name(self, conn):
-        self._pushed(conn)
-        db.set_project_alias(conn, "m1", "proj", "shared", 700.0)
-        rows = db.project_overview(conn)
-        assert [(r["machine_id"], r["project"], r["alias"], r["records"]) for r in rows] == [
-            ("m1", "proj", "shared", 1),
-        ]
-
-    def test_a_redacted_record_is_not_a_row_to_name(self, conn):
-        """Its project was stripped; the bucket it folds into is named off the account."""
-        self._pushed(conn, project=None)
-        assert db.project_overview(conn) == []
-
     def test_only_a_pair_that_pushed_exists(self, conn):
         self._pushed(conn)
         assert db.project_exists(conn, "m1", "proj") is True

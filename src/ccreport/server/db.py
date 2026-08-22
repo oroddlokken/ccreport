@@ -631,30 +631,6 @@ def set_project_alias(
     )
 
 
-def project_overview(conn: sqlite3.Connection) -> list[dict]:
-    """Every (machine, project) pair with records here, its spend and its alias.
-
-    A record whose project is NULL is left out: a restricted machine stripped
-    the name, and the bucket those rows fold into is named off the account.
-    """
-    rows = conn.execute("""
-        SELECT r.machine_id, r.project,
-               (SELECT m.label FROM machines m WHERE m.machine_id = r.machine_id),
-               COUNT(*), COALESCE(SUM(r.cost), 0),
-               (SELECT p.alias FROM project_aliases p
-                 WHERE p.machine_id = r.machine_id AND p.project = r.project)
-          FROM server_records r
-         WHERE r.project IS NOT NULL
-      GROUP BY r.machine_id, r.project
-      ORDER BY SUM(r.cost) DESC
-    """).fetchall()
-    return [
-        {"machine_id": row[0], "project": row[1], "machine": row[2] or row[0],
-         "records": row[3], "cost": row[4], "alias": row[5]}
-        for row in rows
-    ]
-
-
 def project_exists(conn: sqlite3.Connection, machine_id: str, project: str) -> bool:
     """Whether that machine has pushed a record under that project name.
 

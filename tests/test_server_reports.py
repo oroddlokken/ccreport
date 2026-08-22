@@ -554,6 +554,76 @@ class TestAccountOverview:
         assert reports.account_overview(app.state.db.connect())[0]["records"] == 2
 
 
+class TestProjectOverview:
+    """The /settings/projects rows. Deduped, so a row matches its project page."""
+
+    def _push_again(self, app, path="/p/c.jsonl"):
+        """The laptop's own calls a second time, under a path it never used.
+
+        One machine with a synced home directory writes the same call to two
+        logs; the server keys a file on (machine, path) and stores both.
+        """
+        client = TestClient(app)
+        token = sf.mint_for(app, "laptop-1", "Laptop")
+        resp = client.post(
+            "/v1/ingest", json=sf.batch(LAPTOP_WORK, path=path, label="Laptop"),
+            headers=sf.auth(token),
+        )
+        assert resp.json()["files"][0]["status"] == "accepted", resp.json()
+
+    def test_one_machines_call_stored_twice_is_one_record(self, app):
+        conn = app.state.db.connect()
+        before = {(r["machine_id"], r["project"]): r for r in reports.project_overview(conn)}
+        self._push_again(app)
+        after = {(r["machine_id"], r["project"]): r for r in reports.project_overview(conn)}
+        assert after[("laptop-1", "projA")]["records"] == before[("laptop-1", "projA")]["records"]
+        assert after[("laptop-1", "projA")]["cost"] == pytest.approx(
+            before[("laptop-1", "projA")]["cost"],
+        )
+
+    def test_the_cost_is_what_the_project_page_draws(self, app):
+        """The number the two pages are read against each other on."""
+        conn = app.state.db.connect()
+        rows = {(r["machine_id"], r["project"]): r for r in reports.project_overview(conn)}
+        merged = reports.load(conn, reports.Filters(project="projB"))
+        assert rows[("desk-1", "projB")]["cost"] == pytest.approx(
+            sum(m.record.cost() for m in merged),
+        )
+        assert rows[("desk-1", "projB")]["records"] == len(merged)
+
+    def test_a_synced_call_lands_on_the_machine_whose_copy_won(self, app):
+        """projA is on both; a2's laptop copy has the lower id, so the desk row goes."""
+        rows = {
+            (r["machine_id"], r["project"]) for r in reports.project_overview(
+                app.state.db.connect())
+        }
+        assert ("laptop-1", "projA") in rows
+        assert ("desk-1", "projA") not in rows
+
+    def test_it_carries_the_machine_label_and_the_alias(self, app):
+        conn = app.state.db.connect()
+        db.set_project_alias(conn, "laptop-1", "projA", "shared", 700.0)
+        conn.commit()
+        rows = {(r["machine_id"], r["project"]): r for r in reports.project_overview(conn)}
+        assert rows[("laptop-1", "projA")]["alias"] == "shared"
+        assert rows[("laptop-1", "projA")]["machine"] == "Laptop"
+        assert rows[("desk-1", "projB")]["alias"] is None
+
+    def test_the_rows_are_ordered_by_the_deduped_cost(self, app):
+        costs = [r["cost"] for r in reports.project_overview(app.state.db.connect())]
+        assert costs == sorted(costs, reverse=True)
+
+    def test_a_redacted_record_is_not_a_row_to_name(self, tmp_path):
+        """Its project was stripped; the bucket it folds into is named off the account."""
+        app = create_app(sf.config(tmp_path))
+        client = TestClient(app)
+        token = sf.mint_for(app)
+        client.post(
+            "/v1/ingest", json=sf.batch([sf.record(project=None)]), headers=sf.auth(token),
+        )
+        assert reports.project_overview(app.state.db.connect()) == []
+
+
 class TestAccountAliases:
     """A screenshot of the dashboard leaks the login email; an alias is the fix."""
 

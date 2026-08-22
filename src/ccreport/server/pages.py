@@ -269,7 +269,7 @@ def projects(request: Request):
     """
     conn = request.app.state.db.connect()
     return templates.TemplateResponse(
-        request, "projects.html", {"projects": db.project_overview(conn)},
+        request, "projects.html", {"projects": reports.project_overview(conn)},
     )
 
 
