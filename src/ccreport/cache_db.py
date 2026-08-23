@@ -3893,7 +3893,7 @@ def _push_meta_key(name: str, server_url: str) -> str:
 
 
 _PUSH_META_NAMES = (
-    "samples_at", "extra_at", "policy",
+    "samples_at", "extra_at", "policy", "replacing", "allow",
     "attempt", "failures", "stopped", "reason", "success",
 )
 """Every name _push_meta_key is called with, so forget_server can take them all.
@@ -3935,6 +3935,29 @@ def save_push_state(
             "ON CONFLICT(server_url, file_path) DO UPDATE SET "
             "mtime_ns = excluded.mtime_ns, size = excluded.size, pushed_at = excluded.pushed_at",
             [(server_url, path, mtime_ns, size, now) for path, mtime_ns, size in acknowledged],
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        _rollback_if_open(conn)
+        raise
+
+
+def clear_push_state_for(server_url: str, paths: Iterable[str]) -> None:
+    """Forget what *server_url* holds for *paths* alone, leaving the rest.
+
+    What a change to `allow` needs, where clearing the whole watermark would
+    re-offer a corpus of which only the files naming the moved project have
+    different bytes to send.
+    """
+    listed = list(paths)
+    if not listed:
+        return
+    conn = get_connection()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.executemany(
+            "DELETE FROM push_state WHERE server_url = ? AND file_path = ?",
+            [(server_url, path) for path in listed],
         )
         conn.execute("COMMIT")
     except Exception:
@@ -4232,6 +4255,51 @@ def write_push_policy(server_url: str, policy: str) -> None:
     """Record the policy a completed push was built under."""
     conn = get_connection()
     _set_meta(conn, _push_meta_key("policy", server_url), policy)
+    conn.commit()
+
+
+def read_push_allow(server_url: str) -> tuple[str, ...] | None:
+    """The opt-in list the stored watermark was built under, or None.
+
+    Stored beside the policy digest, which cannot say which of its five inputs
+    moved. Substituting this list back into the hash is what tells an `allow`
+    edit apart from a change to the salt or the redaction shape, and only the
+    first can be answered with fewer files than all of them.
+    """
+    conn = get_connection()
+    raw = _get_meta(conn, _push_meta_key("allow", server_url))
+    if raw is None:
+        return None
+    try:
+        return tuple(json.loads(raw))
+    except (ValueError, TypeError):
+        return None
+
+
+def write_push_allow(server_url: str, allow: Iterable[str]) -> None:
+    """Record the opt-in list the server's copy now matches."""
+    conn = get_connection()
+    _set_meta(conn, _push_meta_key("allow", server_url), json.dumps(list(allow)))
+    conn.commit()
+
+
+def read_push_replacing(server_url: str) -> bool:
+    """Whether a re-push that must overwrite matching fingerprints is unfinished.
+
+    Set when a policy change clears the watermark, cleared when the last batch
+    of that run comes back. In between it is what tells a resumed run to keep
+    stamping `replace`: the policy is already stored by then, so without it the
+    remaining files would go out as an ordinary push and the server would skip
+    every one whose fingerprint had not moved.
+    """
+    conn = get_connection()
+    return _get_meta(conn, _push_meta_key("replacing", server_url)) == "1"
+
+
+def write_push_replacing(server_url: str, replacing: bool) -> None:
+    """Record whether the re-push in progress still has batches to send."""
+    conn = get_connection()
+    _set_meta(conn, _push_meta_key("replacing", server_url), "1" if replacing else "0")
     conn.commit()
 
 

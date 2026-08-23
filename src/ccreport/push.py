@@ -10,8 +10,8 @@ Nothing happens without ~/.config/ccreport/push.toml, which
 no config, no push, no spawn.
 
 The cache is opened read-only for everything except the watermark, which is one
-short write transaction at the end. A render must never wait on this process,
-and a long-held lock on cache.db is what would make it.
+short write transaction per batch. A render must never wait on this process, and
+a long-held lock on cache.db is what would make it.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import tomllib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from dataclasses import replace as _replace_fields
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -459,6 +460,65 @@ def changed_files(
     ]
 
 
+def files_naming(conn: sqlite3.Connection, projects: set[str], override) -> set[str]:
+    """Unarchived cached files holding a record that resolves to one of *projects*.
+
+    The resolved name, not the stored column: a merge rule can point a record
+    at a project it was never logged under, and that is the name `allow` is
+    matched against. DISTINCT because the question is per file and a file holds
+    thousands of records that answer it the same way.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT f.path, r.project, r.repo, r.cwd FROM ccreport_records r "
+        "JOIN ccreport_files f ON f.id = r.file_id WHERE f.archived = 0"
+    )
+    hit: set[str] = set()
+    for path, project, repo, cwd in rows:
+        if path in hit:
+            continue
+        if (override(repo, cwd, project) if override else project) in projects:
+            hit.add(path)
+    return hit
+
+
+@dataclass(frozen=True)
+class Repush:
+    """What a policy change costs this run: nothing, some files, or all of them."""
+
+    needed: bool = False
+    paths: frozenset[str] | None = None
+    """The files to re-offer, or None for every one of them."""
+
+
+def repush_scope(
+    conn: sqlite3.Connection, server: ServerConfig, policy: str, overrides, override,
+    *, full: bool = False,
+) -> Repush:
+    """Which files the stored policy no longer covers.
+
+    A digest cannot say which of its five inputs moved, so `allow` is stored
+    beside it. Substituting the stored list back into the hash is what tells the
+    two apart: reproduce the stored digest and `allow` was the only difference,
+    which changes the bytes of the files naming a project that entered or left
+    it and of nothing else. Any other input — restricted, the salt, the
+    redaction shape, the merge rules — re-points every record, and there the
+    answer is still the whole corpus.
+    """
+    from ccreport import cache_db
+
+    stored = cache_db.read_push_policy(server.url)
+    if not full and stored == policy:
+        return Repush()
+    stored_allow = cache_db.read_push_allow(server.url)
+    if full or stored_allow is None:
+        return Repush(needed=True)
+    was = _replace_fields(server, allow=tuple(stored_allow))
+    if policy_hash(was, overrides) != stored:
+        return Repush(needed=True)
+    moved = set(stored_allow) ^ set(server.allow)
+    return Repush(needed=True, paths=frozenset(files_naming(conn, moved, override)))
+
+
 def _records_for(conn: sqlite3.Connection, path: str) -> list[dict]:
     """One file's cached records, as the rows they were stored as."""
     from ccreport.cache_db import _CCR_COLS
@@ -860,35 +920,59 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
     round trip rather than two and the reply is computed after this run's own
     files are stored.
 
+    The watermark moves after each batch, so a run that dies partway through
+    resumes rather than starting over. That matters most on a re-push wide
+    enough to need many requests, where an end-of-run write would let one
+    failure cost every batch before it.
+
     Raises:
-        PushError: nothing was sent. A file the server rejected is reported in
-            the result instead, and left out of the watermark so the next run
-            offers it again.
+        PushError: a batch was refused. Whatever the earlier batches stored is
+            recorded, and a file the server rejected is reported in the result
+            instead, left out of the watermark so the next run offers it again.
     """
     from ccreport import cache_db
     from ccreport.accounts import AccountTimeline
     from ccreport.project_identity import build_override_fn
 
     override = build_override_fn()
-    # A policy change re-points what every past file should have sent, and the
-    # files that carried the old names are closed logs that will never change
-    # again. Nothing but a full re-push can take a name back off the server.
-    policy = policy_hash(server, cache_db.get_project_overrides())
-    # A file whose fingerprint has not moved is one the server skips, and after
-    # a policy change that is exactly the file whose names have to be replaced.
-    # So the re-push says so rather than relying on the fingerprint.
-    replace = full or cache_db.read_push_policy(server.url) != policy
-    if replace:
-        cache_db.clear_push_state(server.url)
-    watermark = cache_db.load_push_state(server.url)
-    timeline = AccountTimeline(cache_db.load_account_events())
-
-    # Cleared with the file watermark by --full and by a policy change, so a
-    # repaired server is offered the whole history of all three tables.
-    samples_at = cache_db.read_push_samples_at(server.url)
-    extra_at = cache_db.read_push_extra_at(server.url)
+    overrides = cache_db.get_project_overrides()
+    # A policy change re-points what past files should have sent, and the files
+    # that carried the old names are closed logs that will never change again.
+    # Nothing but a re-push can take a name back off the server.
+    policy = policy_hash(server, overrides)
     conn = _read_only(db_path or cache_db.DB_PATH)
     try:
+        repush = repush_scope(conn, server, policy, overrides, override, full=full)
+        # A file whose fingerprint has not moved is one the server skips, and
+        # after a policy change that is exactly the file whose names have to be
+        # replaced. So the re-push says so rather than relying on the
+        # fingerprint.
+        #
+        # The clear happens once and the stamping goes on until the last batch
+        # is acknowledged. Those are separate because the watermark moves per
+        # batch: a resumed run that cleared again would throw away the batches
+        # the interrupted one already got stored, which is the point of
+        # resuming.
+        if repush.needed:
+            if repush.paths is None:
+                cache_db.clear_push_state(server.url)
+            else:
+                cache_db.clear_push_state_for(server.url, repush.paths)
+            cache_db.write_push_policy(server.url, policy)
+        # Recorded whether or not anything moved: without it the next `allow`
+        # edit has nothing to diff against and goes wide.
+        cache_db.write_push_allow(server.url, server.allow)
+        replace = repush.needed or cache_db.read_push_replacing(server.url)
+        if replace:
+            cache_db.write_push_replacing(server.url, True)
+        watermark = cache_db.load_push_state(server.url)
+        timeline = AccountTimeline(cache_db.load_account_events())
+
+        # Cleared with the file watermark by --full and by a change no scoping
+        # covers, so a repaired server is offered the whole history of all three
+        # tables.
+        samples_at = cache_db.read_push_samples_at(server.url)
+        extra_at = cache_db.read_push_extra_at(server.url)
         pending = changed_files(conn, watermark)
         files = build_files(conn, pending, timeline, override)
         samples = build_samples(conn, timeline, samples_at)
@@ -901,7 +985,6 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
             item["replace"] = True
 
     result = PushResult(server=server.url)
-    acknowledged: list[tuple[str, int, int]] = []
     sent_samples_at = samples_at
     sent_extra_at = extra_at
     batches = pack_batches(files, server.label, server.max_body) + pack_samples(
@@ -922,13 +1005,10 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
         result.extra += reply.get("extra") or 0
         for reading in batch.get("extra", ()):
             sent_extra_at = max(sent_extra_at, reading["ts"])
-        # Accumulated across the run and written once at the end, so a batch
-        # that raises leaves the watermark where it was and the earlier ones are
-        # offered again. Re-sending a stored sample is a no-op: the server keys
-        # them on (machine, window, ts).
         for sample in batch.get("samples", ()):
             sent_samples_at = max(sent_samples_at, sample["ts"])
         prints = _fingerprints(batch["files"])
+        acknowledged: list[tuple[str, int, int]] = []
         for entry in reply.get("files", ()):
             path = entry["path"]
             status = entry.get("status")
@@ -942,13 +1022,18 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
         if reply.get("pull"):
             result.pulled = store_pull(server.url, reply, pulled_at)
             result.declared = store_tiers(reply)
+        # Per batch, and only for what the server said it stored. A rejected
+        # file stays unrecorded on purpose, so the next run offers it again,
+        # and a batch that raises leaves every earlier batch recorded rather
+        # than sending the whole corpus a second time. Re-offering a stored
+        # sample is a no-op: the server keys them on (machine, window, ts).
+        cache_db.save_push_state(server.url, acknowledged, time.time())
+        cache_db.write_push_samples_at(server.url, sent_samples_at)
+        cache_db.write_push_extra_at(server.url, sent_extra_at)
 
-    # The only writes, and only for what the server said it stored. A rejected
-    # file stays unrecorded on purpose, so the next run offers it again.
-    cache_db.save_push_state(server.url, acknowledged, time.time())
-    cache_db.write_push_samples_at(server.url, sent_samples_at)
-    cache_db.write_push_extra_at(server.url, sent_extra_at)
-    cache_db.write_push_policy(server.url, policy)
+    if replace:
+        # Last, because it is what says the re-push has no batches left to stamp.
+        cache_db.write_push_replacing(server.url, False)
     return result
 
 

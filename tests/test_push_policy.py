@@ -708,3 +708,208 @@ class TestStatusCommand:
         path = _write_config(tmp_path)
         out = self._run(monkeypatch, ["server", "status", "--config", str(path)])
         assert "unreachable" in out
+
+
+class TestAnInterruptedRepushResumes:
+    """A policy change offers the whole corpus, which is many requests. One that
+    fails must not cost the ones the server already stored."""
+
+    @pytest.fixture
+    def wired(self, tmp_path, monkeypatch):
+        app = create_app(sf.config(tmp_path / "server"))
+        client = TestClient(app)
+        self._token = sf.mint_for(app, "laptop-1", "Laptop")
+        self.sent: list[dict] = []
+        self.fail_on: int | None = None
+
+        def post(server_config, batch):
+            self.sent.append(batch)
+            if self.fail_on is not None and len(self.sent) == self.fail_on:
+                raise push.PushError("http://testserver: the second batch fell over")
+            resp = client.post(
+                "/v1/ingest", json={**batch, "client_version": "test"},
+                headers={"Authorization": f"Bearer {server_config.token}"},
+            )
+            return resp.json()
+
+        monkeypatch.setattr(push, "post_batch", post)
+        return app
+
+    def _config(self, **over):
+        fields = {"restricted": True, "allow": ("ccr-projA",), "salt": "s", "max_body": 1}
+        fields.update(over)
+        return push.ServerConfig(
+            url="http://testserver", token=self._token, label="Laptop", machine_id="",
+            **fields,
+        )
+
+    def _three_files(self):
+        for name in ("a", "b", "c"):
+            _cached_file(path=f"/p/{name}.jsonl")
+
+    def test_the_batches_before_the_failure_stay_acknowledged(self, wired):
+        self._three_files()
+        self.fail_on = 2
+        with pytest.raises(push.PushError):
+            push.push_to(self._config())
+        assert list(cache_db.load_push_state("http://testserver")) == ["/p/a.jsonl"]
+
+    def test_the_next_run_offers_only_what_is_left(self, wired):
+        self._three_files()
+        self.fail_on = 2
+        with pytest.raises(push.PushError):
+            push.push_to(self._config())
+        self.fail_on = None
+        result = push.push_to(self._config())
+        assert result.accepted == ["/p/b.jsonl", "/p/c.jsonl"]
+
+    def test_the_resumed_run_still_replaces_rather_than_being_skipped(self, wired):
+        """The fingerprints have not moved, so without the flag the server skips
+        every remaining file and the old names stand."""
+        self._three_files()
+        push.push_to(self._config(allow=("ccr-projA",)))
+        self.sent.clear()
+        self.fail_on = 2
+        with pytest.raises(push.PushError):
+            push.push_to(self._config(allow=()))
+        self.fail_on = None
+        self.sent.clear()
+        push.push_to(self._config(allow=()))
+        assert all(f["replace"] for batch in self.sent for f in batch["files"])
+        assert {r["project"] for r in sf.stored(wired, "laptop-1")} == {None}
+
+    def test_a_finished_repush_stops_stamping_replace(self, wired):
+        self._three_files()
+        push.push_to(self._config())
+        assert not cache_db.read_push_replacing("http://testserver")
+        self.sent.clear()
+        _cached_file(path="/p/d.jsonl")
+        push.push_to(self._config())
+        assert not any("replace" in f for batch in self.sent for f in batch["files"])
+
+    def test_an_uninterrupted_push_records_the_policy(self, wired):
+        self._three_files()
+        config = self._config()
+        push.push_to(config)
+        assert cache_db.read_push_policy(config.url) == push.policy_hash(
+            config, cache_db.get_project_overrides(),
+        )
+
+
+class TestAnAllowEditReoffersOnlyWhatItMoved:
+    """The digest cannot say which input changed, so `allow` is stored beside it.
+    A project entering or leaving it changes the bytes of the files that name it
+    and of nothing else."""
+
+    @pytest.fixture
+    def wired(self, tmp_path, monkeypatch):
+        app = create_app(sf.config(tmp_path / "server"))
+        client = TestClient(app)
+        self._token = sf.mint_for(app, "laptop-1", "Laptop")
+        self.sent: list[dict] = []
+
+        def post(server_config, batch):
+            self.sent.append(batch)
+            resp = client.post(
+                "/v1/ingest", json={**batch, "client_version": "test"},
+                headers={"Authorization": f"Bearer {server_config.token}"},
+            )
+            return resp.json()
+
+        monkeypatch.setattr(push, "post_batch", post)
+        return app
+
+    def _config(self, **over):
+        fields = {"restricted": True, "allow": ("projA",), "salt": "s"}
+        fields.update(over)
+        return push.ServerConfig(
+            url="http://testserver", token=self._token, label="Laptop", machine_id="",
+            **fields,
+        )
+
+    def _two_projects(self):
+        for name in ("projA", "projB"):
+            _cached_file(path=f"/p/{name}.jsonl", records=[{
+                "mid": f"msg_{name}", "model": "claude-haiku-4-5", "ts": TS,
+                "sid": "sess-1", "project": name, "cwd": f"/tmp/{name}",
+                "repo": f"github.com/o/{name}", "dk": f"msg_{name}:req_1", "cost": None,
+                "t": [1000, 200, 5000, 30000],
+            }])
+
+    def test_only_the_moved_project_is_resent(self, wired):
+        self._two_projects()
+        push.push_to(self._config(allow=("projA",)))
+        result = push.push_to(self._config(allow=("projA", "projB")))
+        assert result.accepted == ["/p/projB.jsonl"]
+
+    def test_the_untouched_file_keeps_its_watermark(self, wired):
+        self._two_projects()
+        push.push_to(self._config(allow=("projA",)))
+        push.push_to(self._config(allow=("projA", "projB")))
+        assert set(cache_db.load_push_state("http://testserver")) == {
+            "/p/projA.jsonl", "/p/projB.jsonl",
+        }
+
+    def _names(self, app) -> dict[str, str | None]:
+        return {
+            name: sf.stored(app, "laptop-1", f"/p/{name}.jsonl")[0]["project"]
+            for name in ("projA", "projB")
+        }
+
+    def test_the_newly_allowed_name_reaches_the_server(self, wired):
+        self._two_projects()
+        push.push_to(self._config(allow=("projA",)))
+        assert self._names(wired) == {"projA": "projA", "projB": None}
+        push.push_to(self._config(allow=("projA", "projB")))
+        assert self._names(wired) == {"projA": "projA", "projB": "projB"}
+
+    def test_a_project_leaving_loses_its_name_and_the_other_is_untouched(self, wired):
+        self._two_projects()
+        push.push_to(self._config(allow=("projA", "projB")))
+        result = push.push_to(self._config(allow=("projB",)))
+        assert result.accepted == ["/p/projA.jsonl"]
+        assert self._names(wired) == {"projA": None, "projB": "projB"}
+
+    def test_a_salt_change_still_reoffers_everything(self, wired):
+        self._two_projects()
+        push.push_to(self._config(salt="s"))
+        result = push.push_to(self._config(salt="different"))
+        assert sorted(result.accepted) == ["/p/projA.jsonl", "/p/projB.jsonl"]
+
+    def test_leaving_restricted_still_reoffers_everything(self, wired):
+        self._two_projects()
+        push.push_to(self._config(restricted=True))
+        result = push.push_to(self._config(restricted=False))
+        assert sorted(result.accepted) == ["/p/projA.jsonl", "/p/projB.jsonl"]
+
+    def test_a_first_push_has_nothing_to_diff_and_sends_everything(self, wired):
+        self._two_projects()
+        result = push.push_to(self._config())
+        assert sorted(result.accepted) == ["/p/projA.jsonl", "/p/projB.jsonl"]
+
+    def test_a_merge_rule_change_still_reoffers_everything(self, wired, monkeypatch):
+        self._two_projects()
+        push.push_to(self._config())
+        monkeypatch.setattr(cache_db, "get_project_overrides", lambda: [
+            {"match_kind": "repo", "match_value": "github.com/o/projA", "target": "merged"},
+        ])
+        result = push.push_to(self._config())
+        assert sorted(result.accepted) == ["/p/projA.jsonl", "/p/projB.jsonl"]
+
+    def test_the_resolved_name_is_what_decides(self, wired, monkeypatch):
+        """A merge rule can point a record at a project it was never logged
+        under, and that is the name `allow` is matched against."""
+        self._two_projects()
+        monkeypatch.setattr(
+            "ccreport.project_identity.build_override_fn",
+            lambda: (lambda repo, cwd, project: "projB" if project == "projA" else project),
+        )
+        push.push_to(self._config(allow=()))
+        result = push.push_to(self._config(allow=("projB",)))
+        assert sorted(result.accepted) == ["/p/projA.jsonl", "/p/projB.jsonl"]
+
+    def test_an_unchanged_policy_still_sends_nothing(self, wired):
+        self._two_projects()
+        config = self._config()
+        push.push_to(config)
+        assert push.push_to(config).accepted == []

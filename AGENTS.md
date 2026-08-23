@@ -370,7 +370,25 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   sets `replace` on every file — the server's skip is keyed on (mtime_ns, size),
   and the logs that carried the old names are closed and will never change
   again. REDACTION_SHAPE is what a change to `redact` has to move: the salt no
-  longer varies with the redaction, so nothing else in that material would
+  longer varies with the redaction, so nothing else in that material would.
+  How wide the re-push is, is `push.repush_scope`. A digest cannot say which of
+  its five inputs moved, so the `allow` list is stored beside it and
+  substituting it back into the hash is what tells the two apart: reproduce the
+  stored digest and `allow` was the only difference, and then the files whose
+  records *resolve* to a project that entered or left it are the only ones
+  whose bytes change — the resolved name, because a merge rule can point a
+  record at a project it was never logged under and that is the name `allow` is
+  matched against. Anything else — restricted, the salt, REDACTION_SHAPE, the
+  merge rules — re-points every record and is still the whole corpus, as is a
+  server with no `allow` recorded yet. `clear_push_state_for` is the narrow
+  clear that goes with the narrow offer
+- A wide re-push is many requests, which is why `push_state` moves after each
+  batch rather than after the loop and the new policy is stored before the
+  first one goes out. The clear and the `replace` stamping are separate for
+  that reason: `read_push_replacing` carries the stamp across a run that died
+  partway, where clearing again would throw away the batches the server already
+  stored, and dropping the stamp would offer the rest as an ordinary push that
+  the server's (mtime_ns, size) skip then ignores
 - What the server calls an account is `reports.account_display`: the
   `account_aliases` row, then `server_records.account_label`, then the uuid. The
   /settings/accounts page writes it and `server_records` is never rewritten, so
