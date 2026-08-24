@@ -47,7 +47,7 @@ def isolate_environment(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def isolate_cache_db(tmp_path, monkeypatch, isolate_environment):
-    """Keep every test off the real ~/.cache/ccreport/cache.db.
+    """Keep every test off the real ~/.local/share/ccreport/cache.db.
 
     The modules under test reach cache_db through helpers that open the
     singleton connection on demand, several levels below what a test thinks
@@ -66,8 +66,9 @@ def isolate_cache_db(tmp_path, monkeypatch, isolate_environment):
 
     monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_DISABLE", "1")
     monkeypatch.setattr(cache_db, "DB_PATH", tmp_path / "isolated-cache.db")
-    monkeypatch.setattr(cache_db, "_CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(cache_db, "_DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(cache_db, "_LEGACY_CACHE_DIR", tmp_path / "legacy-cache")
+    monkeypatch.setattr(cache_db, "_LEGACY_XDG_CACHE_DIR", tmp_path / "legacy-xdg-cache")
     monkeypatch.setattr(cache_db, "_DEFAULT_SNAPSHOT_DIR", tmp_path / "snapshots")
     monkeypatch.setattr(cache_db, "_LEGACY_SNAPSHOT_DIR", tmp_path / "legacy-snapshots")
     monkeypatch.setattr(project_identity, "CONFIG_PATH", tmp_path / "ccreport.toml")

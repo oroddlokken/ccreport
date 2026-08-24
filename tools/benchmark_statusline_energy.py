@@ -192,7 +192,7 @@ def _bench_home() -> str:
     """A private HOME with the three interval gates cold, and a push target.
 
     All three gates are state under the user's home: the usage row's age and
-    push_next_at in ~/.cache/ccreport/cache.db, update_checked_at beside them,
+    push_next_at in ~/.local/share/ccreport/cache.db, update_checked_at beside them,
     and ~/.config/ccreport/push.toml, whose absence stops the push before any
     gate is read. A HOME of its own resets all three for one render without
     writing anything into the cache the machine actually reports from. The

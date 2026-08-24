@@ -1,6 +1,6 @@
 """Unified SQLite cache for Claude Code usage, costs, and reporting.
 
-Single database at ~/.cache/ccreport/cache.db.
+Single database at ~/.local/share/ccreport/cache.db.
 
 Consumers:
   - usage_api.py   (usage data + cost cache)
@@ -17,6 +17,7 @@ import sqlite3
 import sys
 import time
 from collections.abc import Callable, Iterable
+from contextlib import suppress
 from datetime import UTC, date, datetime
 from itertools import groupby
 from operator import itemgetter
@@ -30,12 +31,17 @@ from ccreport.pricing import project_key, rolling_cost_keys
 from ccreport.windows import RL_MAX_LOOKAHEAD_S as _RL_MAX_LOOKAHEAD_S
 from ccreport.windows import rl_window_key as _rl_window_key
 
-_CACHE_DIR = Path.home() / ".cache" / "ccreport"
-DB_PATH = _CACHE_DIR / "cache.db"
+_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
 
-# Snapshots live outside ~/.cache so aggressive cache cleanup can't take out
-# the live DB and all its backups in one sweep.
-_DEFAULT_SNAPSHOT_DIR = Path.home() / ".local" / "share" / "ccreport" / "snapshots"
+# Durable data, not a cache, whatever the file is called: ccreport_archive,
+# account_events, rate_limit_snapshots, extra_usage_snapshots,
+# project_overrides, project_scopes, account_budgets and push_state hold what
+# no re-parse of the session logs can rebuild. A cleaner emptying the directory
+# XDG declares disposable would take that history with it, which is the reason
+# the snapshots were kept out here first and the DB now sits beside them.
+_DATA_DIR = _DATA_HOME / "ccreport"
+DB_PATH = _DATA_DIR / "cache.db"
+_DEFAULT_SNAPSHOT_DIR = _DATA_DIR / "snapshots"
 
 # Retention is two bands: the newest _SNAPSHOT_KEEP_DEFAULT snapshots stay one
 # per day, and older ones thin to the last snapshot of each ISO week,
@@ -64,6 +70,11 @@ _SNAPSHOT_PLAIN = 2
 # function to do it on demand and report what it found.
 _LEGACY_CACHE_DIR = Path.home() / ".cache" / "macsetup" / "claude"
 _LEGACY_SNAPSHOT_DIR = Path.home() / ".local" / "share" / "macsetup" / "claude" / "snapshots"
+
+# The generation between: named ccreport already, still under ~/.cache. It is
+# offered ahead of the macsetup directory, so a machine that held both keeps
+# the newer of the two databases.
+_LEGACY_XDG_CACHE_DIR = Path.home() / ".cache" / "ccreport"
 
 _conn: sqlite3.Connection | None = None
 
@@ -629,13 +640,43 @@ def _move(src: Path, dst: Path) -> None:
         shutil.move(str(src), str(dst))
 
 
-def relocate_legacy_paths() -> list[str]:
-    """Move the cache, its snapshots and the config out of their macsetup paths.
+def _relocate_db(src_dir: Path, dst: Path) -> str | None:
+    """Move cache.db out of *src_dir* to *dst*, sidecars included.
 
-    All three were named after the repo this tooling used to live in. The cache
-    *directory* is renamed whole rather than cache.db alone, which is what keeps
-    the file together with its -wal and -shm sidecars: a DB moved without its
-    WAL loses every transaction still sitting in it.
+    File by file, where the snapshots and the config below are moved whole:
+    the destination directory already holds server.db and the snapshots, so
+    renaming a directory onto it would find it occupied and skip for good.
+
+    The -wal and -shm travel in the same pass, because a DB moved without its
+    WAL loses every transaction still sitting in it, and they go *first* — a
+    run that dies between the two leaves DB_PATH absent, which is what makes
+    the next process try again and reunite them.
+
+    Returns the line to report, or None when there was nothing to move.
+    """
+    src = src_dir / dst.name
+    if not src.exists() or dst.exists():
+        return None
+    try:
+        for suffix in ("-wal", "-shm", ""):
+            side = src.with_name(src.name + suffix)
+            if side.exists():
+                _move(side, dst.with_name(dst.name + suffix))
+    except OSError as e:
+        return f"could not move {src} -> {dst}: {e}"
+    # Only when the move emptied it: a directory holding anything else is
+    # somebody else's, and this function has no view on what.
+    with suppress(OSError):
+        src_dir.rmdir()
+    return f"{src} -> {dst}"
+
+
+def relocate_legacy_paths() -> list[str]:
+    """Move the cache, its snapshots and the config off the paths they had.
+
+    Two generations of them: the macsetup repo this tooling was a directory in,
+    and ~/.cache, which the database outgrew once it was clear that nothing
+    re-parses an archived day or a rate-limit sample.
 
     A destination that already exists wins and the legacy path is left where it
     is — it is then stale leftovers rather than the live data, and guessing
@@ -646,8 +687,11 @@ def relocate_legacy_paths() -> list[str]:
     from ccreport.project_identity import CONFIG_PATH, LEGACY_CONFIG_PATH
 
     moved: list[str] = []
+    for src_dir in (_LEGACY_XDG_CACHE_DIR, _LEGACY_CACHE_DIR):
+        line = _relocate_db(src_dir, DB_PATH)
+        if line:
+            moved.append(line)
     for src, dst in (
-        (_LEGACY_CACHE_DIR, _CACHE_DIR),
         (_LEGACY_SNAPSHOT_DIR, _DEFAULT_SNAPSHOT_DIR),
         (LEGACY_CONFIG_PATH, CONFIG_PATH),
     ):
@@ -667,9 +711,9 @@ def get_connection() -> sqlite3.Connection:
     global _conn
     if _conn is not None:
         return _conn
-    # Costs one stat, and only on the open that finds no DB: every later run
+    # Costs two stats, and only on the open that finds no DB: every later run
     # takes the branch below and never looks at the legacy paths at all.
-    if not DB_PATH.exists() and _LEGACY_CACHE_DIR.exists():
+    if not DB_PATH.exists() and (_LEGACY_XDG_CACHE_DIR.exists() or _LEGACY_CACHE_DIR.exists()):
         relocate_legacy_paths()
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db_existed = DB_PATH.exists() and DB_PATH.stat().st_size > 0
@@ -1098,8 +1142,7 @@ the corpus.
 # ---------------------------------------------------------------------------
 #
 # One daily snapshot of the live DB, written with SQLite's online backup API so
-# WAL-mode writers can't corrupt it, into a directory outside ~/.cache/ where a
-# cache-cleanup sweep can't take the backups out with the original. Rotation
+# WAL-mode writers can't corrupt it, into a sibling directory of the DB. Rotation
 # keeps the recent copies one per day, thins the rest to one per ISO week, and
 # stores everything below the newest two as .db.xz.
 #
@@ -3893,7 +3936,7 @@ def _push_meta_key(name: str, server_url: str) -> str:
 
 
 _PUSH_META_NAMES = (
-    "samples_at", "extra_at", "policy", "replacing", "allow",
+    "samples_at", "extra_at", "policy", "replacing", "allow", "exclude",
     "attempt", "failures", "stopped", "reason", "success",
 )
 """Every name _push_meta_key is called with, so forget_server can take them all.
@@ -4261,7 +4304,7 @@ def write_push_policy(server_url: str, policy: str) -> None:
 def read_push_allow(server_url: str) -> tuple[str, ...] | None:
     """The opt-in list the stored watermark was built under, or None.
 
-    Stored beside the policy digest, which cannot say which of its five inputs
+    Stored beside the policy digest, which cannot say which of its six inputs
     moved. Substituting this list back into the hash is what tells an `allow`
     edit apart from a change to the salt or the redaction shape, and only the
     first can be answered with fewer files than all of them.
@@ -4280,6 +4323,31 @@ def write_push_allow(server_url: str, allow: Iterable[str]) -> None:
     """Record the opt-in list the server's copy now matches."""
     conn = get_connection()
     _set_meta(conn, _push_meta_key("allow", server_url), json.dumps(list(allow)))
+    conn.commit()
+
+
+def read_push_exclude(server_url: str) -> tuple[str, ...] | None:
+    """The redact list the stored watermark was built under, or None.
+
+    The other half of what read_push_allow answers, and the same substitution.
+    None is a server nothing has been pushed to under either key; a server
+    pushed to before this key existed excluded nothing, which the caller reads
+    as the empty list rather than as an unknown.
+    """
+    conn = get_connection()
+    raw = _get_meta(conn, _push_meta_key("exclude", server_url))
+    if raw is None:
+        return None
+    try:
+        return tuple(json.loads(raw))
+    except (ValueError, TypeError):
+        return None
+
+
+def write_push_exclude(server_url: str, exclude: Iterable[str]) -> None:
+    """Record the redact list the server's copy now matches."""
+    conn = get_connection()
+    _set_meta(conn, _push_meta_key("exclude", server_url), json.dumps(list(exclude)))
     conn.commit()
 
 

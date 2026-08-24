@@ -51,6 +51,11 @@ REQUEST_TIMEOUT_S = 120
 """A first push is a machine's whole history, which the server prices as it
 stores. Later pushes are the handful of files that changed."""
 
+_EXCLUDE_MARK = "\x01"
+"""What separates the two project lists inside the policy digest. A byte no
+project name holds, so a name cannot straddle the boundary and read as a move
+between the lists that never happened."""
+
 DEFAULT_MAX_BODY = 8 * 1024 * 1024
 """What one request may carry before a file is held back for the next one.
 Under the server's own default, so the limit that bites is this one, where the
@@ -88,6 +93,17 @@ class ServerConfig:
     allow: tuple[str, ...] = ()
     """Projects that keep their names, already resolved through this machine's
     merge rules so an alias matches the way a report groups it."""
+    exclude: tuple[str, ...] = ()
+    """Projects that lose their names whatever *restricted* says.
+
+    The other direction from *allow*, and the one an open server needs: name
+    every project but these. A machine pushing to its own server wants the
+    whole picture except the two repos it cannot show anyone, and listing the
+    other hundred to get there is a list that goes stale on the next clone.
+
+    Resolved through the merge rules like *allow*, and stripped the same way,
+    so an excluded project lands in the account's aggregated bucket rather
+    than a bucket of its own."""
     salt: str = ""
     """What a pseudonym would be hashed against. Generated when restricted is
     first set and never leaves the machine. Nothing derives from it since
@@ -137,13 +153,114 @@ class PushResult:
 
 
 def _marker_path(path: Path) -> Path:
-    """Where "this machine has been restricted" is recorded.
+    """Where "this machine has been restricted, for these servers" is recorded.
 
     Beside push.toml rather than in cache.db, and read before the file it
     guards: a wiped cache must not be able to unredact a restricted machine,
     and a push.toml that stopped parsing must not either.
     """
     return path.parent / ".restricted"
+
+
+MARKER_PROSE = (
+    "Every server below is one this machine pushes to under a restriction, and\n"
+    "a file with no URLs claims all of them. An `exclude <url> <project>` line\n"
+    "names one project that server redacts however open it is otherwise.\n"
+    "Deleting a line lifts neither: push.toml is what says so, and this only\n"
+    "stops a lost setting from reading as permission to send real names.\n"
+)
+"""The marker's header. A bare URL per restricted server follows it, then an
+`exclude <url> <project>` line per excluded project."""
+
+MARKER_EXCLUDE = "exclude "
+"""What an exclusion line starts with. The URL and the project name follow it,
+space separated, the name running to the end of the line so one holding a space
+survives the round trip."""
+
+
+def _restricted_urls(path: Path) -> frozenset[str] | None:
+    """Which servers the marker claims, or None where it claims every one of them.
+
+    A restriction is declared per server, so the guard behind it is recorded
+    per server: one URL per line under the prose. None is the marker written
+    before the scope existed — it names nothing and means everything, so a
+    machine restricted under the old format keeps redacting until something
+    narrows it. An absent marker is the empty set, which claims no server.
+
+    So is a marker holding exclusion lines and no bare URL, which is what an
+    open server with an `exclude` writes. Nothing predating the scope could
+    have written one, so it is a file that names the servers it claims and
+    claims none of them — reading it as the whole machine would restrict every
+    server the moment one project was hidden on one of them.
+    """
+    try:
+        text = _marker_path(path).read_text()
+    except OSError:
+        return frozenset()
+    lines = [line.strip() for line in text.splitlines()]
+    urls = frozenset(line for line in lines if line.startswith(("http://", "https://")))
+    if urls or any(line.startswith(MARKER_EXCLUDE) for line in lines):
+        return urls
+    return None
+
+
+def _marker_excludes(path: Path) -> dict[str, frozenset[str]]:
+    """Which projects the marker redacts, per server.
+
+    Empty for every server the marker names no exclusion for, including one it
+    claims a whole restriction over: the two guards answer different questions
+    and neither implies the other. There is no unscoped form here — the format
+    arrived with the key, so a line always carries its URL.
+    """
+    try:
+        text = _marker_path(path).read_text()
+    except OSError:
+        return {}
+    found: dict[str, set[str]] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith(MARKER_EXCLUDE):
+            continue
+        url, _, project = line[len(MARKER_EXCLUDE):].partition(" ")
+        if url and project:
+            found.setdefault(url, set()).add(project)
+    return {url: frozenset(names) for url, names in found.items()}
+
+
+def _write_marker(path: Path, entries: dict, url: str, *, replace_exclude: bool = False) -> None:
+    """Record what *url* redacts in the marker, keeping every other server's claim.
+
+    An unscoped marker is narrowed here and nowhere else, to every URL push.toml
+    declares `restricted = true` for. That reads the file the marker exists to
+    distrust, so it takes a connect or an allow someone typed, and the only
+    server it can release is one whose own entry claims no restriction.
+
+    *url*'s exclusions are narrowed on the same terms, and *replace_exclude* is
+    what says a person typed them: an `exclude` in the fields being written is
+    the list as they meant it, so it replaces what the marker held. Anything
+    else — a connect, an allow, a network change — carries no opinion about the
+    exclusions, and there the marker's names are added to rather than dropped.
+    """
+    scope = _restricted_urls(path)
+    declared = {
+        name for name, entry in entries.items()
+        if isinstance(entry, dict) and entry.get("restricted")
+    }
+    claims = {url} if entries.get(url, {}).get("restricted") else set()
+    urls = sorted((declared if scope is None else set(scope)) | claims)
+    excludes = {one: set(names) for one, names in _marker_excludes(path).items()}
+    named = {str(name) for name in (entries.get(url, {}).get("exclude") or ())}
+    if replace_exclude:
+        excludes[url] = named
+    else:
+        excludes.setdefault(url, set()).update(named)
+    lines = [f"{one}\n" for one in urls]
+    lines += [
+        f"{MARKER_EXCLUDE}{one} {name}\n"
+        for one in sorted(excludes)
+        for name in sorted(excludes[one])
+    ]
+    _marker_path(path).write_text(MARKER_PROSE + "".join(lines))
 
 
 def read_raw(path: Path | None = None) -> dict:
@@ -170,16 +287,21 @@ def load_config(path: Path | None = None) -> list[ServerConfig]:
 
     What is not safe to read as open is a file that parses but has lost its
     `restricted = true` — an edit, a partial write, a restore of an older copy.
-    The marker beside it says this machine has been restricted before, and it
-    wins: the entry redacts everything rather than falling back to real names.
+    The marker beside it names the servers this machine has been restricted
+    for, and for those it wins: the entry redacts everything rather than
+    falling back to real names. An `exclude` lost the same way is restored the
+    same way, from the marker's own lines: the union of the two, never the
+    entry alone, so a deletion nobody typed cannot name a project.
     """
     path = path or CONFIG_PATH
-    was_restricted = _marker_path(path).exists()
+    marked = _restricted_urls(path)
+    marked_exclude = _marker_excludes(path)
     servers = []
     for url, entry in read_raw(path).items():
         if not isinstance(entry, dict) or not entry.get("token"):
             continue
         states_restriction = bool(entry.get("restricted"))
+        was_restricted = marked is None or url in marked
         # An entry the marker had to correct is an entry that lost a field, so
         # its allow list is not trustworthy either: nothing keeps its name.
         allow = tuple(str(name) for name in (entry.get("allow") or ())) \
@@ -193,6 +315,10 @@ def load_config(path: Path | None = None) -> list[ServerConfig]:
             interval_s=_interval_seconds(entry.get("interval_minutes")),
             restricted=states_restriction or was_restricted,
             allow=allow,
+            exclude=tuple(sorted(
+                {str(name) for name in (entry.get("exclude") or ())}
+                | set(marked_exclude.get(url, ()))
+            )),
             salt=str(entry.get("salt") or ""),
             networks=tuple(str(net) for net in (entry.get("networks") or ())),
         ))
@@ -243,12 +369,9 @@ def write_server(path: Path, url: str, fields: dict) -> None:
     entries = read_raw(path)
     entries[url] = {**entries.get(url, {}), **fields}
     _write_entries(path, entries)
-    if entries[url].get("restricted"):
-        _marker_path(path).write_text(
-            "This machine pushes under a restriction. Deleting this file does not\n"
-            "lift it: push.toml is what says so, and this only stops a lost\n"
-            "`restricted = true` from reading as permission to send real names.\n",
-        )
+    guarded = entries[url].get("restricted") or entries[url].get("exclude")
+    if guarded or url in _marker_excludes(path):
+        _write_marker(path, entries, url, replace_exclude="exclude" in fields)
 
 
 def remove_server(path: Path, url: str) -> bool:
@@ -258,9 +381,9 @@ def remove_server(path: Path, url: str) -> bool:
     merges rather than replaces: a config you can only rewrite wholesale is one
     people edit by hand and get wrong.
 
-    The `.restricted` marker is deliberately left alone. It is a claim about
-    this machine having pushed under a restriction, not about one server, and
-    clearing it here is how a later reconnect would read as open.
+    The `.restricted` marker is deliberately left alone. Disconnecting is not
+    a decision about what this machine may name, and taking the URL out here is
+    how a later reconnect to the same server would read as open.
     """
     entries = read_raw(path)
     if url not in entries:
@@ -270,16 +393,34 @@ def remove_server(path: Path, url: str) -> bool:
     return True
 
 
+_MAX_LINE = 110
+"""Where an array stops fitting on one line, the project's own line length."""
+
+
 def _write_entries(path: Path, entries: dict) -> None:
     """Write the whole `[server."URL"]` set at mode 0600, because it holds tokens."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = []
     for server_url, entry in entries.items():
         lines.append(f'[server."{server_url}"]')
-        lines += [f"{key} = {_toml_value(value)}" for key, value in entry.items()]
+        lines += [_toml_line(key, value) for key, value in entry.items()]
         lines.append("")
     path.write_text("\n".join(lines))
     path.chmod(0o600)
+
+
+def _toml_line(key: str, value) -> str:
+    """`key = value`, stacking an array whose flat form runs past _MAX_LINE.
+
+    A long `allow` list is otherwise a 140-character line no editor wraps. The
+    file is hand-edited, so re-running connect leaves the stacked shape as it
+    stands.
+    """
+    flat = f"{key} = {_toml_value(value)}"
+    if not isinstance(value, (list, tuple)) or len(flat) <= _MAX_LINE:
+        return flat
+    stacked = "".join(f"    {json.dumps(str(item))},\n" for item in value)
+    return f"{key} = [\n{stacked}]"
 
 
 def _toml_value(value) -> str:
@@ -335,7 +476,12 @@ re-push a shape change needs. Change what redact() strips, change this.
 
 
 def redact(rec: dict, server: ServerConfig) -> dict:
-    """Strip a record's identity unless its project is opted in.
+    """Strip a record's identity unless its project is named on this server.
+
+    Two lists decide that, and they compose rather than take precedence over
+    each other: *exclude* strips whatever else is true, and *allow* is what
+    survives a restriction. A project in both is stripped, which is the only
+    reading that keeps `exclude` meaning what it says.
 
     What survives is everything the money is made of: model, timestamps and
     token counts. What goes is project, cwd, repo and session id, all four to
@@ -347,7 +493,8 @@ def redact(rec: dict, server: ServerConfig) -> dict:
     count per bucket says how much hidden work there was. All of it lands in one
     bucket per account instead, which the server names.
     """
-    if not server.restricted or rec["project"] in server.allow:
+    project = rec["project"]
+    if project not in server.exclude and (not server.restricted or project in server.allow):
         return rec
     return {**rec, "project": None, "cwd": None, "repo": None, "sid": None}
 
@@ -366,15 +513,19 @@ def policy_hash(server: ServerConfig, override_rules: object = "") -> str:
     REDACTION_SHAPE covers the third: what redact() leaves behind. A code edit
     moves nothing else here, so without it the rows a previous shape wrote would
     stand on the server until their files changed, which they never will.
+
+    *exclude* is in it on the same terms as *allow*, behind a separator rather
+    than concatenated: a project moved from one list to the other changes what
+    is sent, and a digest that could not tell the lists apart would call that
+    no change at all. An empty *exclude* contributes nothing, separator
+    included, so the key arriving did not move any existing machine's digest
+    and cost every one of them a corpus it had already pushed.
     """
-    material = "\x00".join([
-        "1" if server.restricted else "0",
-        *sorted(server.allow),
-        server.salt,
-        REDACTION_SHAPE,
-        repr(override_rules),
-    ])
-    return hashlib.sha256(material.encode()).hexdigest()[:16]
+    parts = ["1" if server.restricted else "0", *sorted(server.allow)]
+    if server.exclude:
+        parts += [_EXCLUDE_MARK, *sorted(server.exclude)]
+    parts += [server.salt, REDACTION_SHAPE, repr(override_rules)]
+    return hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:16]
 
 
 def _probe_source_address(network: ipaddress.IPv4Network | ipaddress.IPv6Network) -> str | None:
@@ -496,13 +647,23 @@ def repush_scope(
 ) -> Repush:
     """Which files the stored policy no longer covers.
 
-    A digest cannot say which of its five inputs moved, so `allow` is stored
-    beside it. Substituting the stored list back into the hash is what tells the
-    two apart: reproduce the stored digest and `allow` was the only difference,
-    which changes the bytes of the files naming a project that entered or left
-    it and of nothing else. Any other input — restricted, the salt, the
-    redaction shape, the merge rules — re-points every record, and there the
-    answer is still the whole corpus.
+    A digest cannot say which of its six inputs moved, so the two project lists
+    are stored beside it. Substituting them back into the hash is what tells
+    them from the rest: reproduce the stored digest and `allow`, `exclude` or
+    both were the only difference, which changes the bytes of the files naming
+    a project that entered or left either list and of nothing else. Any other
+    input — restricted, the salt, the redaction shape, the merge rules —
+    re-points every record, and there the answer is still the whole corpus.
+
+    Both lists are substituted together rather than one at a time. A project
+    that moved from `allow` to `exclude` moved in two lists at once, and
+    holding either at its stored value would leave a digest that matches
+    neither and read the whole corpus as changed.
+
+    An unstored `exclude` beside a stored `allow` is the empty list, not an
+    unknown: the key arrived after the watermark did, and before it every
+    server excluded nothing. Reading it as unknown would charge the first
+    exclusion a whole corpus that nothing in it needs.
     """
     from ccreport import cache_db
 
@@ -510,12 +671,13 @@ def repush_scope(
     if not full and stored == policy:
         return Repush()
     stored_allow = cache_db.read_push_allow(server.url)
+    stored_exclude = cache_db.read_push_exclude(server.url) or ()
     if full or stored_allow is None:
         return Repush(needed=True)
-    was = _replace_fields(server, allow=tuple(stored_allow))
+    was = _replace_fields(server, allow=tuple(stored_allow), exclude=tuple(stored_exclude))
     if policy_hash(was, overrides) != stored:
         return Repush(needed=True)
-    moved = set(stored_allow) ^ set(server.allow)
+    moved = (set(stored_allow) ^ set(server.allow)) | (set(stored_exclude) ^ set(server.exclude))
     return Repush(needed=True, paths=frozenset(files_naming(conn, moved, override)))
 
 
@@ -959,9 +1121,10 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
             else:
                 cache_db.clear_push_state_for(server.url, repush.paths)
             cache_db.write_push_policy(server.url, policy)
-        # Recorded whether or not anything moved: without it the next `allow`
-        # edit has nothing to diff against and goes wide.
+        # Recorded whether or not anything moved: without them the next `allow`
+        # or `exclude` edit has nothing to diff against and goes wide.
         cache_db.write_push_allow(server.url, server.allow)
+        cache_db.write_push_exclude(server.url, server.exclude)
         replace = repush.needed or cache_db.read_push_replacing(server.url)
         if replace:
             cache_db.write_push_replacing(server.url, True)

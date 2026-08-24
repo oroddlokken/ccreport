@@ -379,7 +379,8 @@ def _bad_cidr(networks: str) -> str | None:
 
 @router.post("/settings/machines/mint", response_class=HTMLResponse)
 def mint(request: Request, machine_id: str = Form(...), label: str = Form(""),
-         networks: str = Form(""), restricted: str = Form(""), allow: str = Form("")):
+         networks: str = Form(""), restricted: str = Form(""), allow: str = Form(""),
+         exclude: str = Form("")):
     """Mint a token and show it once, with the command that consumes it.
 
     The push policy is written into that command and stored nowhere: it lives
@@ -399,7 +400,8 @@ def mint(request: Request, machine_id: str = Form(...), label: str = Form(""),
             request, "machines.html",
             {"machines": db.machine_overview(conn), "error": error,
              "form": {"machine_id": machine_id, "label": label.strip(),
-                      "networks": networks, "restricted": bool(restricted), "allow": allow}},
+                      "networks": networks, "restricted": bool(restricted), "allow": allow,
+                      "exclude": exclude}},
             status_code=400,
         )
     token = tokens.mint(conn, machine_id, label.strip() or machine_id, time.time())
@@ -409,7 +411,7 @@ def mint(request: Request, machine_id: str = Form(...), label: str = Form(""),
         "token": token,
         "command": tokens.connect_command(
             str(request.base_url), token,
-            networks=networks, restricted=bool(restricted), allow=allow,
+            networks=networks, restricted=bool(restricted), allow=allow, exclude=exclude,
         ),
     })
 

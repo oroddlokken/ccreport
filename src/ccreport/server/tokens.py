@@ -62,7 +62,7 @@ def mint(conn: sqlite3.Connection, machine_id: str, label: str, now: float) -> s
 
 
 def connect_command(base_url: str, token: str, *, networks: str = "",
-                    restricted: bool = False, allow: str = "") -> str:
+                    restricted: bool = False, allow: str = "", exclude: str = "") -> str:
     """The line to paste on the new machine.
 
     Rendered on the mint page because that is the one moment both halves are
@@ -73,11 +73,15 @@ def connect_command(base_url: str, token: str, *, networks: str = "",
 
     `--opt-in-repos` goes last and unquoted when *allow* is empty. It takes an
     optional value, so a bare one earlier in the line would swallow whatever
-    followed it.
+    followed it. `--exclude-repos` is placed before it for that reason alone,
+    and it is emitted whether or not the checkbox is set: redacting a project
+    on an otherwise-open server is the case the checkbox does not cover.
     """
     parts = [f"ccreport server connect {base_url.rstrip('/')} --token {token}"]
     if networks.strip():
         parts.append(f"--only-on-network {shlex.quote(csv_list(networks))}")
+    if (hidden := csv_list(exclude)):
+        parts.append(f"--exclude-repos {shlex.quote(hidden)}")
     if restricted:
         names = csv_list(allow)
         parts.append(f"--opt-in-repos {shlex.quote(names)}" if names else "--opt-in-repos")

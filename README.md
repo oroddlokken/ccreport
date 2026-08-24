@@ -233,7 +233,11 @@ The token and the push policy land in `~/.config/ccreport/push.toml` at mode
 0600. `--opt-in-repos work,ccreport` restricts that policy to the named
 projects: every other project still sends its counts, but its name, session,
 cwd and repo are stripped before the push and report as one aggregated row per
-account. `--interval-minutes 5` sets how often the status line's detached push
+account. `--exclude-repos kantine` is the other direction, and needs no
+restriction: those projects are stripped into the same aggregated row while
+every other project keeps its name. `ccreport server allow` and `deny` edit the
+first list afterwards, `exclude` and `unexclude` the second.
+`--interval-minutes 5` sets how often the status line's detached push
 runs; the default is 30. A metered link wants a longer interval, a wired desktop
 a shorter one.
 
@@ -287,14 +291,18 @@ check: the stored count is tied to the commit it was measured against.
 
 | Path | What |
 |---|---|
-| `~/.cache/ccreport/cache.db` | Parsed records, costs, usage row, rate-limit samples |
+| `~/.local/share/ccreport/cache.db` | Parsed records, costs, usage row, rate-limit samples |
 | `~/.local/share/ccreport/snapshots/` | One daily copy of the above, 14 kept |
 | `~/.config/ccreport/ccreport.toml` | Optional `repo_roots` for project grouping |
 
-Snapshots survive a `~/.cache` wipe.
+Not `~/.cache`, despite the file's name: the archive, the account log, the
+rate-limit samples and the push watermarks are not rebuildable from the session
+logs, and a cleanup sweep over `~/.cache` would take them. `XDG_DATA_HOME`
+overrides the first two paths, `XDG_CONFIG_HOME` the third.
 
-These three used to live under `macsetup/claude` names. Any command migrates
-them for itself on the first run that finds the old cache:
+The DB used to sit in `~/.cache/ccreport`, and all three under `macsetup/claude`
+names before that. Any command migrates them for itself on the first run that
+finds no DB where it now belongs:
 
 ```bash
 ccreport migrate --dry-run

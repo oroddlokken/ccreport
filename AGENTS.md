@@ -40,7 +40,11 @@ close issue [id] '[title]'?", and run `dcat close <id>` after they confirm.
 
 ## What is here
 
-Two tools over one SQLite cache at `~/.cache/ccreport/cache.db`:
+Two tools over one SQLite database at `~/.local/share/ccreport/cache.db`
+(`$XDG_DATA_HOME/ccreport/cache.db`), beside the snapshots and the server's own
+file — not in `~/.cache`, because `ccreport_archive`, `account_events`, the two
+snapshot series, the merge rules and `push_state` outlive the JSONL logs and
+nothing rebuilds them:
 
 - `src/ccreport/ccreport.py` — the CLI. Reads Claude Code's JSONL session logs,
   prices them, and reports by day, month, project, session and account.
@@ -167,8 +171,9 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   line's merged windows go on adding a server nobody pushes to. It previews
   what will go and confirms first (`--yes` skips), because the token's plaintext
   is nowhere else and reconnecting needs one minted afresh. Nothing on the
-  server is touched, and the `.restricted` marker survives: it claims this
-  machine has pushed under a restriction, not that one server did
+  server is touched, and the server's line in the `.restricted` marker survives:
+  disconnecting says nothing about what this machine may name, and taking the
+  line out is how a later reconnect to the same server would read as open
 - What the client and the server agree on over the wire is
   `protocol.PROTOCOL_VERSION`, one integer bumped by hand when the bytes change:
   a new payload section, a renamed or retyped field, a response key a client
@@ -351,16 +356,39 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   machine's UTC offset at that instant, which is what makes `server_records.day`
   the machine's calendar day rather than the server's
 - `~/.config/ccreport/push.toml` is the machine's whole push policy — server,
-  token, `restricted`, `allow`, `salt`, `networks`, `interval_minutes` — written by
+  token, `restricted`, `allow`, `exclude`, `salt`, `networks`,
+  `interval_minutes` — written by
   `ccreport server connect` at mode 0600, one `[server."URL"]` table each.
   There are no environment variables for any of it. The mint page types the
-  networks and the opt-in list into the connect command it prints and stores
+  networks and both project lists into the connect command it prints and stores
   neither: the server never holds a machine's policy, only the line that sets
   it. A `.restricted` marker
-  sits beside it and wins: a push.toml that lost its `restricted = true` to an
-  edit or an old backup redacts everything rather than reading as open
+  sits beside it, one URL per line, and for a server it names it wins: an entry
+  that lost its `restricted = true` to an edit or an old backup redacts
+  everything rather than reading as open. It is scoped per server because the
+  restriction is — one machine pushes redacted to a work server and named to
+  its own — and a marker with no URLs is the whole-machine claim written before
+  the scope existed, which still restricts every entry. `push._write_marker` is
+  the one place that claim is narrowed, to the URLs push.toml declares
+  `restricted = true` for, and only under a `connect` or an `allow` someone
+  typed
+- The marker guards `exclude` the same way, as `exclude <url> <project>` lines
+  under the same prose, and `load_config` takes the union of those and the
+  entry's own list. Only a write carrying an `exclude` key narrows them, which
+  is `ccreport server unexclude` and a `connect` that names the flag — a
+  `connect` about the networks says nothing about which projects are hidden and
+  must not drop one. A marker holding exclusion lines and no bare URL claims no
+  restriction: nothing predating the per-server scope could have written one,
+  so unlike a file with no lines at all it is a marker that names what it
+  claims. The name runs to the end of the line, so one holding a space survives
 - A restricted machine sends every record's counts and strips the identity of
   any project outside `allow`: project, session, cwd and repo all become null.
+  `exclude` is the other direction and needs no restriction: the projects it
+  names lose the same four fields however open the server is, so a machine can
+  name every project but the two it cannot show. The two lists compose rather
+  than order each other — a project in both is stripped, or `exclude` would
+  mean nothing on the server it is most needed on — and an excluded project
+  lands in the same per-account bucket a restricted one does.
   A pseudonym per project would have drawn a row each, and the count of private
   projects with a price on each is the shape of the work. `reports.project_display`
   folds every null project into one bucket per account instead —
@@ -369,23 +397,31 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   the whole account segment, slash included. `push.pseudonym` and
   `pseudo_session` are kept with no caller, as is `salt`, so re-introducing a
   grouping key needs no config migration
-- Changing `restricted`, `allow`, the local merge rules or
+- Changing `restricted`, `allow`, `exclude`, the local merge rules or
   `push.REDACTION_SHAPE` moves `policy_hash`, which clears the watermark *and*
   sets `replace` on every file — the server's skip is keyed on (mtime_ns, size),
   and the logs that carried the old names are closed and will never change
   again. REDACTION_SHAPE is what a change to `redact` has to move: the salt no
   longer varies with the redaction, so nothing else in that material would.
   How wide the re-push is, is `push.repush_scope`. A digest cannot say which of
-  its five inputs moved, so the `allow` list is stored beside it and
-  substituting it back into the hash is what tells the two apart: reproduce the
-  stored digest and `allow` was the only difference, and then the files whose
-  records *resolve* to a project that entered or left it are the only ones
-  whose bytes change — the resolved name, because a merge rule can point a
-  record at a project it was never logged under and that is the name `allow` is
-  matched against. Anything else — restricted, the salt, REDACTION_SHAPE, the
-  merge rules — re-points every record and is still the whole corpus, as is a
-  server with no `allow` recorded yet. `clear_push_state_for` is the narrow
-  clear that goes with the narrow offer
+  its six inputs moved, so both project lists are stored beside it and
+  substituting them back into the hash is what tells them from the rest:
+  reproduce the stored digest and the lists were the only difference, and then
+  the files whose records *resolve* to a project that entered or left either
+  are the only ones whose bytes change — the resolved name, because a merge
+  rule can point a record at a project it was never logged under and that is
+  the name both lists are matched against. Both are substituted at once, or a
+  project moved from `allow` to `exclude` reproduces neither digest and reads
+  as the whole corpus. Anything else — restricted, the salt, REDACTION_SHAPE,
+  the merge rules — re-points every record and is still the whole corpus, as is
+  a server with no `allow` recorded yet. An unrecorded `exclude` beside a
+  recorded `allow` is not that case: the key arrived after the watermark did,
+  and before it every server excluded nothing, so it reads as the empty list.
+  An empty `exclude` is also left out of the digest material entirely, which is
+  what kept the key's arrival from charging every configured machine a corpus
+  it had already pushed. `clear_push_state_for` is the narrow clear that goes
+  with the narrow offer, and `ccreport server exclude` leaves the watermark to
+  it rather than clearing the lot the way `allow` does
 - A wide re-push is many requests, which is why `push_state` moves after each
   batch rather than after the loop and the new policy is stored before the
   first one goes out. The clear and the `replace` stamping are separate for

@@ -21,7 +21,14 @@
       </label>
       <p class="hint">The rest still push their counts, and land in one unnamed row per account with no project, session, cwd or repo. Blank sends no name at all.</p>
     </div>
+    <div>
+      <label>Always redact these
+        <input name="exclude" autocomplete="off" placeholder="kantine, lonn"
+               value="{{ form.exclude if form else '' }}">
+      </label>
+      <p class="hint">Redacted whatever the checkbox says, so a server that names every other project still hides these. Their counts push into the same unnamed row.</p>
+    </div>
   </div>
 
-  <p class="hint note">This policy lands in that machine's <span class="mono">~/.config/ccreport/push.toml</span> and nowhere on this server. <span class="mono">ccreport server allow</span> and <span class="mono">deny</span> edit the project list there later; the networks and this checkbox need connect run again.</p>
+  <p class="hint note">This policy lands in that machine's <span class="mono">~/.config/ccreport/push.toml</span> and nowhere on this server. <span class="mono">ccreport server allow</span> and <span class="mono">deny</span> edit the first project list there later, <span class="mono">exclude</span> and <span class="mono">unexclude</span> the second; the networks and this checkbox need connect run again.</p>
 </fieldset>

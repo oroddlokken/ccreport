@@ -1511,6 +1511,8 @@ def cmd_server_connect(args) -> None:
         # project already on the server, so the old rows would never merge with
         # the new ones.
         fields["salt"] = existing.get("salt") or push.new_salt()
+    if args.exclude_repos is not None:
+        fields["exclude"] = _resolved_projects(args.exclude_repos.split(","))
     if args.only_on_network is not None:
         fields["networks"] = [
             cidr.strip() for cidr in args.only_on_network.split(",") if cidr.strip()
@@ -1530,6 +1532,10 @@ def cmd_server_connect(args) -> None:
     if fields.get("restricted"):
         allowed = ", ".join(fields["allow"]) or "nothing"
         console.print(f"Restricted: only {allowed} will be identified by name.")
+    if "exclude" in fields:
+        hidden = ", ".join(fields["exclude"])
+        console.print(f"Excluded: {hidden} will be redacted." if hidden
+                      else "Excluded: nothing; every project keeps its name.")
     if "interval_minutes" in fields:
         console.print(f"Pushing every {fields['interval_minutes']} min.")
 
@@ -1634,6 +1640,34 @@ def cmd_server_allow(args) -> None:
     console.print("The watermark was cleared; the next push re-sends everything.")
 
 
+def cmd_server_exclude(args) -> None:
+    """Add or remove projects from a server's exclude list.
+
+    The watermark is left alone, unlike `allow`, which clears it. The next push
+    reads the moved names out of the policy digest and re-offers the files that
+    resolve to them, which is every file whose bytes this changes — see
+    push.repush_scope. A closed log still never changes on its own, so the
+    re-push is no less obligatory here; it is only narrower.
+    """
+    from ccreport import push
+
+    path = Path(args.config or push.CONFIG_PATH)
+    entries = push.read_raw(path)
+    url, projects = _split_allow_targets(args.targets, entries, path)
+    if not projects:
+        print(f"ccreport: name a project to {args.command} on {url}.", file=sys.stderr)
+        sys.exit(1)
+    current = list(entries[url].get("exclude") or ())
+    resolved = _resolved_projects(projects)
+    if args.command == "exclude":
+        updated = sorted(set(current) | set(resolved))
+    else:
+        updated = sorted(set(current) - set(resolved))
+    push.write_server(path, url, {"exclude": updated})
+    console.print(f"{url}: now redacting {', '.join(updated) or 'nothing'}.")
+    console.print("The next push re-sends the files naming what moved.")
+
+
 def cmd_server_status(args) -> None:
     """Print what each configured server knows this machine as, and under what policy.
 
@@ -1671,6 +1705,8 @@ def cmd_server_status(args) -> None:
         console.print(f"  restricted   {'yes' if server.restricted else 'no'}")
         if server.restricted:
             console.print(f"  identifying  {', '.join(server.allow) or 'nothing'}")
+        if server.exclude:
+            console.print(f"  redacting    {', '.join(server.exclude)}")
         console.print(f"  network gate {', '.join(server.networks) or 'none'}")
         if server.networks and not push.on_allowed_network(server.networks):
             console.print("               [yellow]off-network: pushes are held[/yellow]")
@@ -1932,7 +1968,7 @@ def _warn_unreachable_history(kind: str, value: str, target: str) -> None:
 
 
 def cmd_migrate(args) -> None:
-    """Move the cache, snapshots and config off their legacy macsetup paths.
+    """Move the cache, snapshots and config off the paths they used to have.
 
     Every command does this for itself the first time it opens a DB that isn't
     there yet, so this exists to make the move explicit and to say what it did.
@@ -1944,7 +1980,8 @@ def cmd_migrate(args) -> None:
         pending = [
             (src, dst)
             for src, dst in (
-                (cache_db._LEGACY_CACHE_DIR, cache_db._CACHE_DIR),  # noqa: SLF001
+                (cache_db._LEGACY_XDG_CACHE_DIR / "cache.db", cache_db.DB_PATH),  # noqa: SLF001
+                (cache_db._LEGACY_CACHE_DIR / "cache.db", cache_db.DB_PATH),  # noqa: SLF001
                 (cache_db._LEGACY_SNAPSHOT_DIR, cache_db._DEFAULT_SNAPSHOT_DIR),  # noqa: SLF001
                 (project_identity.LEGACY_CONFIG_PATH, project_identity.CONFIG_PATH),
             )
@@ -3017,6 +3054,8 @@ def main() -> None:
         ("connect", "Set up this machine against a server"),
         ("allow", "Identify more projects by name"),
         ("deny", "Stop identifying projects by name"),
+        ("exclude", "Redact projects however open the server is"),
+        ("unexclude", "Stop redacting projects the server would otherwise name"),
         ("status", "What each server knows this machine as"),
         ("push", "Push this machine's records to a ccreport server"),
         ("pull", "Fetch what the account's other machines spent"),
@@ -3033,12 +3072,16 @@ def main() -> None:
             sp.add_argument("--opt-in-repos", metavar="NAMES", nargs="?", const="",
                             help="Comma-separated projects to identify by name; sets restricted. "
                                  "The flag with no names sets restricted and identifies nothing")
+            sp.add_argument("--exclude-repos", metavar="NAMES",
+                            help="Comma-separated projects to redact on this server whatever "
+                                 "--opt-in-repos says. The other direction: name everything "
+                                 "but these")
             sp.add_argument("--only-on-network", metavar="CIDRS",
                             help="Comma-separated CIDRs this machine must be inside to push")
             sp.add_argument("--interval-minutes", metavar="N", type=int,
                             help="Minutes between detached pushes from this machine "
                                  "(default 30)")
-        if name in ("allow", "deny"):
+        if name in ("allow", "deny", "exclude", "unexclude"):
             sp.add_argument("targets", nargs="+", metavar="TARGET",
                             help="Project names, before or after a merge rule, after an optional "
                                  "leading server URL as push.toml spells it. The URL may be left "
@@ -3150,6 +3193,9 @@ def main() -> None:
         elif args.server_command in ("allow", "deny"):
             args.command = args.server_command
             cmd_server_allow(args)
+        elif args.server_command in ("exclude", "unexclude"):
+            args.command = args.server_command
+            cmd_server_exclude(args)
         elif args.server_command in ("push", "sync"):
             cmd_push(args)
         elif args.server_command == "pull":

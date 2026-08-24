@@ -1,9 +1,9 @@
 """The merged SQLite database: schema, connections and the whole-file write.
 
-Separate from the client's ~/.cache/ccreport/cache.db on purpose. That one is a
-cache — delete it and the next run rebuilds it from the JSONL logs still on that
-machine. This one is the only copy of what a laptop pushed before its logs were
-rotated away, so it is a database, kept where a backup would find it.
+Separate from the client's cache.db on purpose, though both now sit in
+~/.local/share/ccreport: that one is per machine and mostly re-derivable from
+the JSONL logs beside it. This one is the only copy of what a laptop pushed
+before its logs were rotated away.
 
 Every column list here follows cache_db's rule: one tuple drives the CREATE
 TABLE order, the SELECT text, the INSERT text and the row mapping, because a

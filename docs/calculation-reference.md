@@ -349,7 +349,7 @@ For each `"type": "assistant"` record in a JSONL file:
 All caching lives in a single SQLite database managed by
 `src/ccreport/cache_db.py`:
 
-- **File**: `~/.cache/ccreport/cache.db`
+- **File**: `~/.local/share/ccreport/cache.db` (`$XDG_DATA_HOME/ccreport/cache.db`)
 - **Mode**: WAL (concurrent readers, single writer)
 - **PRAGMAs**: `synchronous=NORMAL`, `foreign_keys=ON`, `cache_size=-2000`
 
@@ -1509,7 +1509,7 @@ that wants it.
 `server/ingest.py`), stored in `rate_limit_samples` keyed on (machine, window,
 ts). Nothing is redacted on the way: a sample is a window name, a percentage, a
 reset time and a model, and none of those is a project or a session, so a
-restricted machine sends what an open one does.
+machine restricting or excluding its projects sends what an open one does.
 
 The merge is what the client cannot do. A quota belongs to an **account**, so
 `server/limits.py` groups on (account, window, model, reset) rather than on the

@@ -18,7 +18,7 @@ _READ = re.compile(r"""environ\.(?:get|setdefault)\(\s*["']([A-Z_]+)["']""")
 
 # Read by the code and left alone on purpose, for the reasons CONFIGURED_BY_ENV
 # states. Named here so a new variable cannot join them by accident.
-_EXEMPT = {"COLUMNS", "TMPDIR", "TZ", "XDG_CONFIG_HOME"}
+_EXEMPT = {"COLUMNS", "TMPDIR", "TZ", "XDG_CONFIG_HOME", "XDG_DATA_HOME"}
 
 
 class TestEnvironmentIsolation:

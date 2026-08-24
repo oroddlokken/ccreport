@@ -191,6 +191,7 @@ class TestMintedPolicy:
             assert 'name="networks"' in body
             assert 'name="restricted"' in body
             assert 'name="allow"' in body
+            assert 'name="exclude"' in body
 
     def test_a_plain_mint_carries_no_policy_flag(self, client):
         command = _command_from(self._mint(client).text)
@@ -213,6 +214,22 @@ class TestMintedPolicy:
     def test_names_without_the_checkbox_send_nothing(self, client):
         """Unchecked is an open machine, whatever is left in the names field."""
         assert "--opt-in-repos" not in _command_from(self._mint(client, allow="ccreport").text)
+
+    def test_the_exclude_field_needs_no_checkbox(self, client):
+        command = _command_from(self._mint(client, exclude="kantine, lonn").text)
+        assert "--exclude-repos kantine,lonn" in command
+        assert "--opt-in-repos" not in command
+
+    def test_both_lists_reach_one_command(self, client):
+        page = self._mint(client, restricted="1", allow="ccreport", exclude="kantine").text
+        command = _command_from(page)
+        assert "--exclude-repos kantine" in command
+        assert command.endswith("--opt-in-repos ccreport")
+
+    def test_a_refused_mint_echoes_the_exclusions_too(self, client):
+        resp = self._mint(client, networks="nope", exclude="kantine")
+        assert resp.status_code == 400
+        assert 'value="kantine"' in resp.text
 
     def test_a_typo_in_a_cidr_refuses_to_mint(self, app, client):
         resp = self._mint(client, networks="10.0.0.0/8, not-a-network")
@@ -278,6 +295,21 @@ class TestConnectCommand:
             "http://x/", "t", networks="10.0.0.0/8", restricted=True,
         )
         assert command.endswith("--opt-in-repos")
+
+    def test_an_exclusion_reaches_the_command_without_the_checkbox(self):
+        """Redacting one project on an open server is what the checkbox misses."""
+        command = tokens.connect_command("http://x/", "t", exclude="kantine, lonn")
+        assert command.endswith("--exclude-repos kantine,lonn")
+        assert "--opt-in-repos" not in command
+
+    def test_the_bare_opt_in_flag_still_goes_last_beside_one(self):
+        command = tokens.connect_command(
+            "http://x/", "t", restricted=True, exclude="kantine",
+        )
+        assert command.endswith("--exclude-repos kantine --opt-in-repos")
+
+    def test_an_empty_exclusion_adds_no_flag(self):
+        assert "--exclude-repos" not in tokens.connect_command("http://x/", "t", exclude="  ")
 
     def test_csv_list_takes_commas_or_spaces(self):
         assert tokens.csv_list(" a, b  c,,d ") == "a,b,c,d"

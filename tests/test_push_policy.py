@@ -35,6 +35,17 @@ def _server(**over) -> push.ServerConfig:
     return push.ServerConfig(**fields)
 
 
+def _two_server_config(tmp_path):
+    """One server that declares a restriction and one that does not."""
+    path = tmp_path / "push.toml"
+    path.write_text(
+        '[server."https://ccr.example.net"]\n'
+        'token = "tok"\nrestricted = true\nallow = ["ccr-projA"]\nsalt = "s41t"\n\n'
+        '[server."http://127.0.0.1:8787"]\ntoken = "tok2"\n',
+    )
+    return path
+
+
 def _record(**over) -> dict:
     rec = {
         "mid": "m1", "model": "claude-haiku-4-5", "ts": TS, "utc_offset": 0,
@@ -122,12 +133,101 @@ class TestFailClosed:
         push.write_server(path, "https://ccr.example.net", {"token": "t"})
         assert not push._marker_path(path).exists()
 
+    def test_a_marker_naming_one_server_leaves_the_other_open(self, tmp_path):
+        """The restriction is per server, so the guard behind it is too."""
+        path = _two_server_config(tmp_path)
+        push._marker_path(path).write_text(push.MARKER_PROSE + "https://ccr.example.net\n")
+        restricted, local = push.load_config(path)
+        assert restricted.restricted
+        assert not local.restricted
+
+    def test_a_named_server_is_restricted_without_the_flag(self, tmp_path):
+        path = _two_server_config(tmp_path)
+        push._marker_path(path).write_text(push.MARKER_PROSE + "http://127.0.0.1:8787\n")
+        local = push.load_config(path)[1]
+        assert local.restricted
+        assert local.allow == ()
+
+    def test_an_unscoped_marker_still_claims_every_server(self, tmp_path):
+        """What a machine restricted before the scope existed keeps doing."""
+        path = _two_server_config(tmp_path)
+        push._marker_path(path).write_text("no urls here")
+        assert [server.restricted for server in push.load_config(path)] == [True, True]
+
+    def test_the_marker_names_the_server_it_was_written_for(self, tmp_path):
+        path = tmp_path / "push.toml"
+        push.write_server(path, "https://ccr.example.net", {
+            "token": "t", "restricted": True, "allow": ["a"], "salt": "s",
+        })
+        assert push._restricted_urls(path) == frozenset({"https://ccr.example.net"})
+
+    def test_a_second_restricted_server_keeps_the_first(self, tmp_path):
+        path = tmp_path / "push.toml"
+        for url in ("https://one.example.net", "https://two.example.net"):
+            push.write_server(path, url, {"token": "t", "restricted": True, "salt": "s"})
+        assert push._restricted_urls(path) == frozenset(
+            {"https://one.example.net", "https://two.example.net"},
+        )
+
+    def test_a_write_narrows_an_unscoped_marker_to_what_push_toml_declares(self, tmp_path):
+        """The one path off the whole-machine claim, and it releases only an
+        entry that declares no restriction of its own."""
+        path = _two_server_config(tmp_path)
+        push._marker_path(path).write_text("no urls here")
+        push.write_server(path, "https://ccr.example.net", {"allow": ["b"]})
+        assert push._restricted_urls(path) == frozenset({"https://ccr.example.net"})
+        assert not push.load_config(path)[1].restricted
+
+    def test_a_write_for_an_open_server_narrows_nothing(self, tmp_path):
+        path = _two_server_config(tmp_path)
+        push._marker_path(path).write_text("no urls here")
+        push.write_server(path, "http://127.0.0.1:8787", {"label": "Laptop"})
+        assert push._restricted_urls(path) is None
+
     def test_a_broken_file_pushes_nothing_at_all(self, tmp_path):
         """No server means no request, which is already the closed state."""
         path = tmp_path / "push.toml"
         path.write_text("= = not toml")
         push._marker_path(path).write_text("x")
         assert push.load_config(path) == []
+
+
+class TestConfigFileShape:
+    """A file people edit by hand, so what connect writes has to stay readable."""
+
+    _LONG = [
+        "ccreport", "macsetup", "py_project_template", "dogcat", "claude",
+        "deploy_2", "statusline", "quota_guard", "exchange_rates",
+    ]
+
+    def test_a_long_array_is_stacked_one_element_per_line(self, tmp_path):
+        path = tmp_path / "push.toml"
+        push.write_server(path, "https://ccr.example.net", {
+            "token": "t", "restricted": True, "salt": "s", "allow": self._LONG,
+        })
+        text = path.read_text()
+        assert 'allow = [\n    "ccreport",\n' in text
+        assert max(len(line) for line in text.splitlines()) <= push._MAX_LINE
+
+    def test_a_short_array_stays_on_one_line(self, tmp_path):
+        path = tmp_path / "push.toml"
+        push.write_server(path, "https://ccr.example.net", {
+            "token": "t", "networks": ["10.172.0.0/22"],
+        })
+        assert 'networks = ["10.172.0.0/22"]' in path.read_text()
+
+    def test_the_stacked_form_round_trips(self, tmp_path):
+        path = tmp_path / "push.toml"
+        fields = {"token": "t", "restricted": True, "salt": "s", "allow": self._LONG}
+        push.write_server(path, "https://ccr.example.net", fields)
+        assert push.read_raw(path) == {"https://ccr.example.net": fields}
+
+    def test_a_second_write_keeps_the_first_server_and_the_mode(self, tmp_path):
+        path = tmp_path / "push.toml"
+        push.write_server(path, "https://one.example.net", {"token": "t", "allow": self._LONG})
+        push.write_server(path, "https://two.example.net", {"token": "u"})
+        assert list(push.read_raw(path)) == ["https://one.example.net", "https://two.example.net"]
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 class TestPolicyHash:
@@ -430,6 +530,51 @@ class TestConnectCommand:
         self._run(monkeypatch, argv)
         assert push.load_config(path)[0].salt == first
 
+    def test_exclude_repos_writes_the_list_without_restricting(self, tmp_path, monkeypatch,
+                                                               health):
+        path = tmp_path / "push.toml"
+        self._run(monkeypatch, [
+            "server", "connect", "https://ccr.example.net", "--token", "good",
+            "--exclude-repos", "kantine,lonn", "--config", str(path),
+        ])
+        server = push.load_config(path)[0]
+        assert server.exclude == ("kantine", "lonn")
+        assert not server.restricted
+
+    def test_it_takes_both_lists_at_once(self, tmp_path, monkeypatch, health):
+        path = tmp_path / "push.toml"
+        self._run(monkeypatch, [
+            "server", "connect", "https://ccr.example.net", "--token", "good",
+            "--opt-in-repos", "ccr-projA", "--exclude-repos", "kantine",
+            "--config", str(path),
+        ])
+        server = push.load_config(path)[0]
+        assert (server.allow, server.exclude) == (("ccr-projA",), ("kantine",))
+
+    def test_the_excluded_names_resolve_through_a_merge_rule(self, tmp_path, monkeypatch, health):
+        cache_db.add_project_override("name", "ccr-old", "ccr-new")
+        path = tmp_path / "push.toml"
+        self._run(monkeypatch, [
+            "server", "connect", "https://ccr.example.net", "--token", "good",
+            "--exclude-repos", "ccr-old", "--config", str(path),
+        ])
+        assert push.load_config(path)[0].exclude == ("ccr-new",)
+
+    def test_omitting_it_excludes_nothing(self, tmp_path, monkeypatch, health):
+        path = tmp_path / "push.toml"
+        self._run(monkeypatch, [
+            "server", "connect", "https://ccr.example.net", "--token", "good",
+            "--config", str(path),
+        ])
+        assert push.load_config(path)[0].exclude == ()
+
+    def test_it_says_what_will_be_redacted(self, tmp_path, monkeypatch, health):
+        out = self._run(monkeypatch, [
+            "server", "connect", "https://ccr.example.net", "--token", "good",
+            "--exclude-repos", "kantine", "--config", str(tmp_path / "push.toml"),
+        ])
+        assert "kantine will be redacted" in out
+
     def test_only_on_network_writes_the_cidrs(self, tmp_path, monkeypatch, health):
         path = tmp_path / "push.toml"
         self._run(monkeypatch, [
@@ -643,6 +788,23 @@ class TestStatusCommand:
         assert "ccr-projA" in out
         assert "192.0.2.0/24" in out
         assert "off-network" in out, "it should explain why nothing is being sent"
+
+    def test_it_names_the_exclusions_on_an_open_server(self, tmp_path, monkeypatch, reachable):
+        path = tmp_path / "push.toml"
+        push.write_server(path, "http://127.0.0.1:8787", {
+            "token": "t", "exclude": ["kantine"],
+        })
+        out = self._run(monkeypatch, ["server", "status", "--config", str(path)])
+        assert "restricted   no" in out
+        assert "redacting    kantine" in out
+
+    def test_a_server_excluding_nothing_prints_no_line_for_it(self, tmp_path, monkeypatch,
+                                                              reachable):
+        path = tmp_path / "push.toml"
+        push.write_server(path, "http://127.0.0.1:8787", {"token": "t"})
+        assert "redacting" not in self._run(
+            monkeypatch, ["server", "status", "--config", str(path)],
+        )
 
     def test_a_refused_token_is_shown_as_stopped(self, tmp_path, monkeypatch, reachable):
         path = _write_config(tmp_path)
@@ -913,3 +1075,296 @@ class TestAnAllowEditReoffersOnlyWhatItMoved:
         config = self._config()
         push.push_to(config)
         assert push.push_to(config).accepted == []
+
+
+class TestExclusion:
+    """The other direction from `allow`: name every project but these."""
+
+    def _open(self, **over) -> push.ServerConfig:
+        return _server(restricted=False, allow=(), salt="", **over)
+
+    def test_an_excluded_project_loses_its_identity_on_an_open_server(self):
+        out = push.redact(_record(), self._open(exclude=("ccr-projB",)))
+        assert out["project"] is None
+        assert out["cwd"] is None
+        assert out["repo"] is None
+        assert out["sid"] is None
+
+    def test_every_other_project_keeps_its_name(self):
+        rec = _record(project="ccr-projA")
+        assert push.redact(rec, self._open(exclude=("ccr-projB",))) == rec
+
+    def test_the_counts_survive_the_strip(self):
+        out = push.redact(_record(), self._open(exclude=("ccr-projB",)))
+        assert (out["input_tokens"], out["output_tokens"]) == (1000, 200)
+        assert (out["cache_create"], out["cache_read"]) == (5000, 30000)
+
+    def test_an_empty_list_redacts_nothing(self):
+        rec = _record()
+        assert push.redact(rec, self._open()) == rec
+
+    def test_it_beats_the_allow_list_on_a_restricted_server(self):
+        """A project in both lists is hidden, or `exclude` means nothing."""
+        server = _server(allow=("ccr-projB",), exclude=("ccr-projB",))
+        assert push.redact(_record(), server)["project"] is None
+
+    def test_a_restriction_still_bites_outside_the_exclude_list(self):
+        server = _server(allow=("ccr-projA",), exclude=("ccr-projC",))
+        assert push.redact(_record(), server)["project"] is None
+
+    def test_two_excluded_projects_fold_into_the_same_nothing(self):
+        server = self._open(exclude=("ccr-projA", "ccr-projB"))
+        first = push.redact(_record(project="ccr-projA", cwd="/tmp/a"), server)
+        second = push.redact(_record(project="ccr-projB", cwd="/tmp/b"), server)
+        assert (first["project"], first["cwd"]) == (second["project"], second["cwd"])
+
+
+class TestExclusionFailsClosed:
+    """A lost `exclude` is an edit nobody typed, and the marker overrules it."""
+
+    def _configured(self, tmp_path):
+        path = tmp_path / "push.toml"
+        push.write_server(path, "http://127.0.0.1:8787", {
+            "token": "t", "exclude": ["kantine"],
+        })
+        return path
+
+    def test_writing_one_records_it_in_the_marker(self, tmp_path):
+        path = self._configured(tmp_path)
+        assert push._marker_excludes(path) == {"http://127.0.0.1:8787": frozenset({"kantine"})}
+
+    def test_an_exclusion_alone_claims_no_restriction(self, tmp_path):
+        path = self._configured(tmp_path)
+        assert push._restricted_urls(path) == frozenset()
+        assert not push.load_config(path)[0].restricted
+
+    def test_a_key_deleted_by_hand_still_redacts(self, tmp_path):
+        path = self._configured(tmp_path)
+        path.write_text('[server."http://127.0.0.1:8787"]\ntoken = "t"\n')
+        assert push.load_config(path)[0].exclude == ("kantine",)
+
+    def test_the_marker_and_the_entry_are_unioned(self, tmp_path):
+        path = self._configured(tmp_path)
+        path.write_text(
+            '[server."http://127.0.0.1:8787"]\ntoken = "t"\nexclude = ["lonn"]\n',
+        )
+        assert push.load_config(path)[0].exclude == ("kantine", "lonn")
+
+    def test_an_exclusion_is_scoped_to_its_own_server(self, tmp_path):
+        path = self._configured(tmp_path)
+        push.write_server(path, "https://ccr.example.net", {"token": "t2"})
+        by_url = {server.url: server.exclude for server in push.load_config(path)}
+        assert by_url == {
+            "http://127.0.0.1:8787": ("kantine",), "https://ccr.example.net": (),
+        }
+
+    def test_a_second_server_keeps_the_first_server_names(self, tmp_path):
+        path = self._configured(tmp_path)
+        push.write_server(path, "https://ccr.example.net", {"token": "t2",
+                                                            "exclude": ["hemmelig"]})
+        assert push._marker_excludes(path) == {
+            "http://127.0.0.1:8787": frozenset({"kantine"}),
+            "https://ccr.example.net": frozenset({"hemmelig"}),
+        }
+
+    def test_a_typed_list_replaces_what_the_marker_held(self, tmp_path):
+        """`unexclude` is the one way back, and it carries the key to say so."""
+        path = self._configured(tmp_path)
+        push.write_server(path, "http://127.0.0.1:8787", {"exclude": []})
+        assert push.load_config(path)[0].exclude == ()
+
+    def test_a_write_carrying_no_exclude_leaves_the_names_alone(self, tmp_path):
+        path = self._configured(tmp_path)
+        push.write_server(path, "http://127.0.0.1:8787", {"label": "Laptop"})
+        assert push.load_config(path)[0].exclude == ("kantine",)
+
+    def test_a_restriction_and_an_exclusion_coexist_in_one_marker(self, tmp_path):
+        path = self._configured(tmp_path)
+        push.write_server(path, "https://ccr.example.net", {
+            "token": "t2", "restricted": True, "allow": ["a"], "salt": "s",
+        })
+        assert push._restricted_urls(path) == frozenset({"https://ccr.example.net"})
+        assert push._marker_excludes(path) == {"http://127.0.0.1:8787": frozenset({"kantine"})}
+
+    def test_a_name_holding_a_space_survives_the_round_trip(self, tmp_path):
+        path = tmp_path / "push.toml"
+        push.write_server(path, "http://127.0.0.1:8787", {
+            "token": "t", "exclude": ["two words"],
+        })
+        assert push.load_config(path)[0].exclude == ("two words",)
+
+    def test_the_prose_header_names_nothing_of_its_own(self, tmp_path):
+        """It talks about both line formats, and must parse as neither."""
+        path = self._configured(tmp_path)
+        push._marker_path(path).write_text(push.MARKER_PROSE)
+        assert push._marker_excludes(path) == {}
+        assert push._restricted_urls(path) is None, "a marker with no lines is the old claim"
+
+
+class TestExcludeInThePolicyHash:
+    def test_it_moves_the_hash(self):
+        assert push.policy_hash(_server()) != push.policy_hash(_server(exclude=("x",)))
+
+    def test_the_order_does_not_matter(self):
+        assert push.policy_hash(_server(exclude=("a", "b"))) == push.policy_hash(
+            _server(exclude=("b", "a")),
+        )
+
+    def test_a_project_moving_between_the_lists_is_not_the_same_policy(self):
+        """Concatenated lists would hash one move as no change at all."""
+        assert push.policy_hash(_server(allow=("a",), exclude=())) != push.policy_hash(
+            _server(allow=(), exclude=("a",)),
+        )
+
+    def test_an_empty_list_leaves_an_existing_digest_where_it_was(self):
+        """The key arriving must not charge every configured machine a corpus."""
+        assert push.policy_hash(_server(exclude=())) == "23ba203fcb6c1e97"
+
+
+class TestAnExcludeEditReoffersOnlyWhatItMoved:
+    """The same narrow re-push `allow` gets, from the same stored-list trick."""
+
+    @pytest.fixture
+    def wired(self, tmp_path, monkeypatch):
+        app = create_app(sf.config(tmp_path / "server"))
+        client = TestClient(app)
+        self._token = sf.mint_for(app, "laptop-1", "Laptop")
+
+        def post(server_config, batch):
+            resp = client.post(
+                "/v1/ingest", json={**batch, "client_version": "test"},
+                headers={"Authorization": f"Bearer {server_config.token}"},
+            )
+            return resp.json()
+
+        monkeypatch.setattr(push, "post_batch", post)
+        return app
+
+    def _config(self, **over):
+        return push.ServerConfig(
+            url="http://testserver", token=self._token, label="Laptop", machine_id="",
+            **over,
+        )
+
+    def _two_projects(self):
+        for name in ("projA", "projB"):
+            _cached_file(path=f"/p/{name}.jsonl", records=[{
+                "mid": f"msg_{name}", "model": "claude-haiku-4-5", "ts": TS,
+                "sid": "sess-1", "project": name, "cwd": f"/tmp/{name}",
+                "repo": f"github.com/o/{name}", "dk": f"msg_{name}:req_1", "cost": None,
+                "t": [1000, 200, 5000, 30000],
+            }])
+
+    def _names(self, app) -> dict[str, str | None]:
+        return {
+            name: sf.stored(app, "laptop-1", f"/p/{name}.jsonl")[0]["project"]
+            for name in ("projA", "projB")
+        }
+
+    def test_the_first_exclusion_resends_only_the_file_it_names(self, wired):
+        """An unstored list is the empty one, not an unknown."""
+        self._two_projects()
+        push.push_to(self._config())
+        result = push.push_to(self._config(exclude=("projB",)))
+        assert result.accepted == ["/p/projB.jsonl"]
+
+    def test_the_excluded_name_is_gone_and_the_other_is_untouched(self, wired):
+        self._two_projects()
+        push.push_to(self._config())
+        assert self._names(wired) == {"projA": "projA", "projB": "projB"}
+        push.push_to(self._config(exclude=("projB",)))
+        assert self._names(wired) == {"projA": "projA", "projB": None}
+
+    def test_lifting_an_exclusion_takes_the_name_back(self, wired):
+        self._two_projects()
+        push.push_to(self._config(exclude=("projB",)))
+        result = push.push_to(self._config())
+        assert result.accepted == ["/p/projB.jsonl"]
+        assert self._names(wired) == {"projA": "projA", "projB": "projB"}
+
+    def test_a_project_moving_from_allow_to_exclude_resends_that_file_alone(self, wired):
+        """Both lists moved at once, and substituting one at a time would go wide."""
+        self._two_projects()
+        push.push_to(self._config(restricted=True, allow=("projA", "projB"), salt="s"))
+        result = push.push_to(self._config(
+            restricted=True, allow=("projB",), exclude=("projA",), salt="s",
+        ))
+        assert result.accepted == ["/p/projA.jsonl"]
+
+    def test_an_unchanged_exclusion_sends_nothing(self, wired):
+        self._two_projects()
+        config = self._config(exclude=("projB",))
+        push.push_to(config)
+        assert push.push_to(config).accepted == []
+
+    def test_a_salt_change_beside_it_still_reoffers_everything(self, wired):
+        self._two_projects()
+        push.push_to(self._config(exclude=("projB",), salt="s"))
+        result = push.push_to(self._config(exclude=("projB",), salt="different"))
+        assert sorted(result.accepted) == ["/p/projA.jsonl", "/p/projB.jsonl"]
+
+    def test_the_stored_list_is_recorded_even_when_nothing_moved(self, wired):
+        self._two_projects()
+        push.push_to(self._config(exclude=("projB",)))
+        assert cache_db.read_push_exclude("http://testserver") == ("projB",)
+
+
+class TestExcludeCommands:
+    def _run(self, monkeypatch, argv) -> str:
+        buf = io.StringIO()
+        monkeypatch.setattr(ccr, "console", Console(file=buf, width=200, no_color=True))
+        monkeypatch.setattr(ccr.sys, "argv", ["ccreport", *argv])
+        ccr.main()
+        return buf.getvalue()
+
+    @pytest.fixture
+    def configured(self, tmp_path):
+        path = tmp_path / "push.toml"
+        push.write_server(path, "http://127.0.0.1:8787", {"token": "t"})
+        return path
+
+    def test_exclude_adds_a_project(self, configured, monkeypatch):
+        self._run(monkeypatch, [
+            "server", "exclude", "kantine", "--config", str(configured),
+        ])
+        assert push.load_config(configured)[0].exclude == ("kantine",)
+
+    def test_unexclude_removes_one(self, configured, monkeypatch):
+        self._run(monkeypatch, ["server", "exclude", "a", "b", "--config", str(configured)])
+        self._run(monkeypatch, ["server", "unexclude", "a", "--config", str(configured)])
+        assert push.load_config(configured)[0].exclude == ("b",)
+
+    def test_it_leaves_the_watermark_for_the_next_push_to_narrow(self, configured, monkeypatch):
+        """`allow` clears the lot here; the narrow scope belongs to the push."""
+        cache_db.save_push_state("http://127.0.0.1:8787", [("/p/a.jsonl", 1, 2)], TS)
+        self._run(monkeypatch, ["server", "exclude", "kantine", "--config", str(configured)])
+        assert cache_db.load_push_state("http://127.0.0.1:8787") == {"/p/a.jsonl": (1, 2)}
+
+    def test_it_says_what_is_now_redacted(self, configured, monkeypatch):
+        out = self._run(monkeypatch, [
+            "server", "exclude", "kantine", "--config", str(configured),
+        ])
+        assert "now redacting kantine" in out
+
+    def test_the_names_resolve_through_a_merge_rule(self, configured, monkeypatch):
+        """A name has to match what a record carries after merging, or the
+        project stays named under the one name every record uses."""
+        cache_db.add_project_override("name", "kantine", "lunsj")
+        self._run(monkeypatch, ["server", "exclude", "kantine", "--config", str(configured)])
+        assert push.load_config(configured)[0].exclude == ("lunsj",)
+
+    def test_it_leaves_the_allow_list_alone(self, tmp_path, monkeypatch):
+        path = tmp_path / "push.toml"
+        push.write_server(path, "https://ccr.example.net", {
+            "token": "t", "restricted": True, "allow": ["ccr-projA"], "salt": "s",
+        })
+        self._run(monkeypatch, ["server", "exclude", "ccr-projB", "--config", str(path)])
+        server = push.load_config(path)[0]
+        assert (server.allow, server.exclude) == (("ccr-projA",), ("ccr-projB",))
+
+    def test_a_url_with_no_project_is_an_error(self, configured, monkeypatch, capsys):
+        with pytest.raises(SystemExit):
+            self._run(monkeypatch, [
+                "server", "exclude", "http://127.0.0.1:8787", "--config", str(configured),
+            ])
+        assert "name a project to exclude" in capsys.readouterr().err
