@@ -135,9 +135,13 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   row. Each source carries its own budget, `NATIVE_MAX_AGE_S` against a render's
   cadence and `API_MAX_AGE_S` against `statusline.USAGE_HEARTBEAT_S`; past it the
   window is unknown and blocks, while a null column on a row inside the budget is
-  the plan not having that quota and is not watched. `read_windows` opens its own
-  read-only connection rather than `cache_db.get_connection`, whose bootstrap and
-  daily snapshot do not belong before every tool call
+  the plan not having that quota and is not watched. A percent whose reset time
+  the response omitted — a scoped window at 0% that has not started counting —
+  is a reading and not an unknown, at the cost of the rolled-window zero check
+  and of a warning that dedupes per session rather than per window instance.
+  `read_windows` opens its own read-only connection rather than
+  `cache_db.get_connection`, whose bootstrap and daily snapshot do not belong
+  before every tool call
 - The update line comes from `update_check.py`, spawned detached on slow renders
   when the stored stamp is older than `UPDATE_CHECK_INTERVAL_S` (36 h). The child
   writes that stamp on every outcome, failures included, so an unreachable API

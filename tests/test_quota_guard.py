@@ -223,6 +223,19 @@ class TestReadWindows:
         pcts = {s.window: s.percent for s in qg.read_windows(SESSION, NOW)}
         assert pcts["session"] == 0.0
 
+    def test_a_percent_with_no_reset_time_is_still_a_reading(self):
+        """The API sends a weekly_scoped limit at 0% with no resets_at, and a
+        window nobody has touched must not be the one that stops the turn."""
+        _usage_row(scoped_percent=0)
+        states = {s.window: (s.percent, s.resets_at) for s in qg.read_windows(SESSION, NOW)}
+        assert states == {"scoped": (0.0, None)}
+
+    def test_a_reading_with_no_reset_time_still_stops_over_the_line(self):
+        _usage_row(scoped_percent=97)
+        v = qg.verdict(qg.read_windows(SESSION, NOW), 85.0, 95.0)
+        assert v.kind == "stop"
+        assert "weekly scoped window is at 97%" in v.message
+
     def test_no_session_id_still_reads_the_database(self):
         _usage_row(week_percent=70, week_reset=_iso(NOW + 3600))
         pcts = {s.window: s.percent for s in qg.read_windows("", NOW)}
@@ -293,6 +306,18 @@ class TestHookOutput:
         _usage_row(session_percent=96, session_reset=_iso(NOW + 3600))
         out = qg.hook_output({"session_id": SESSION}, NOW, self.ENV) or {}
         assert f"Unset {qg.STOP_ENV}" in out["stopReason"]
+
+    def test_a_scoped_window_at_zero_lets_the_turn_through(self):
+        """The API sends no resets_at for a scoped window nobody has spent
+        against, which used to read as unknown and stop every prompt."""
+        _usage_row(session_percent=1, session_reset=_iso(NOW + 3600), scoped_percent=0)
+        assert qg.hook_output({"session_id": SESSION}, NOW, self.ENV) is None
+
+    def test_a_warning_with_no_reset_time_is_sent_once(self):
+        _usage_row(scoped_percent=87)
+        first = qg.hook_output({"session_id": SESSION}, NOW, self.ENV) or {}
+        assert set(first) == {"systemMessage"}
+        assert qg.hook_output({"session_id": SESSION}, NOW, self.ENV) is None
 
     def test_a_warning_is_a_system_message(self):
         _usage_row(session_percent=87, session_reset=_iso(NOW + 3600))

@@ -63,10 +63,14 @@ DB_TIMEOUT_S = 2.0
 
 
 class Reading(NamedTuple):
-    """One window's utilization as one source last saw it."""
+    """One window's utilization as one source last saw it.
+
+    resets_at is None when the source sent a percent and no reset time — the
+    API omits one for a window at 0% that has not started counting.
+    """
 
     percent: float
-    resets_at: float
+    resets_at: float | None
     age_s: float
     budget_s: float
 
@@ -82,6 +86,11 @@ class WindowState(NamedTuple):
     percent: float | None
     resets_at: float | None
     budget_s: float
+
+
+# Stands in for a warning whose window sent no reset time, so it dedupes under
+# one key for the session instead of once per tool call.
+_NO_RESET_KEY = 0.0
 
 
 class Verdict(NamedTuple):
@@ -139,15 +148,20 @@ def _parse_iso_epoch(iso: str) -> float | None:
 
 
 def _reading(pct: Any, resets_at: Any, ts: Any, now: float, budget_s: float) -> Reading | None:
-    """A candidate, or None when any of the three values is unusable.
+    """A candidate, or None when the percent or the stamp is unusable.
+
+    A missing resets_at is carried rather than rejected: it costs the warning
+    its dedupe key and the rolled-window check, and neither is worth discarding
+    a percent the source did send.
 
     Negative age is clamped to zero: a file written by a render a fraction of a
     second ahead of this clock is fresh, not from the future.
     """
-    if pct is None or resets_at is None or ts is None:
+    if pct is None or ts is None:
         return None
     try:
-        return Reading(float(pct), float(resets_at), max(0.0, now - float(ts)), budget_s)
+        reset = None if resets_at is None else float(resets_at)
+        return Reading(float(pct), reset, max(0.0, now - float(ts)), budget_s)
     except (TypeError, ValueError):
         return None
 
@@ -289,9 +303,13 @@ def read_windows(session_id: str, now: float) -> list[WindowState]:
                 states.append(WindowState(window, None, None, budget))
             continue
         # A reset already passed means the window rolled and utilization
-        # restarted, which is a reading of zero rather than a missing one.
-        percent = max(0.0 if r.resets_at <= now else r.percent for r in fresh)
-        states.append(WindowState(window, percent, max(r.resets_at for r in fresh), budget))
+        # restarted, which is a reading of zero rather than a missing one. A
+        # reading with no reset time keeps its percent and cannot roll.
+        percent = max(
+            0.0 if r.resets_at is not None and r.resets_at <= now else r.percent for r in fresh
+        )
+        resets = [r.resets_at for r in fresh if r.resets_at is not None]
+        states.append(WindowState(window, percent, max(resets, default=None), budget))
     return states
 
 
@@ -405,14 +423,16 @@ def warning_is_new(session_id: str, v: Verdict) -> bool:
     """Whether this warning is the first for its window instance.
 
     Keyed on resets_at, so the next window earns its own warning and the rest
-    of this one stays quiet.
+    of this one stays quiet. A window with no reset time cannot tell one
+    instance from the next, so its warning lasts the session.
     """
-    if v.key is None:
+    if not v.window:
         return True
+    key = _NO_RESET_KEY if v.key is None else v.key
     warned = _load_warned(session_id)
-    if warned.get(v.window) == v.key:
+    if warned.get(v.window) == key:
         return False
-    warned[v.window] = v.key
+    warned[v.window] = key
     _save_warned(session_id, warned)
     return True
 
