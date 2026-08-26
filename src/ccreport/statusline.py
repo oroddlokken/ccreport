@@ -77,6 +77,12 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
                                               twice a day against GitHub's API
 
 Other environment variables:
+  CLAUDE_STATUSLINE_LINE<n>_MSG             — text appended to rendered line n (n is 1-4) after
+                                              the usual ' · ' separator; a slot past the last
+                                              line becomes a line of its own
+    CLAUDE_STATUSLINE_LINE<n>_COLOR         — that text's color by name: red, green, yellow,
+                                              blue, magenta, cyan, white, grey, orange
+                                              (default and fallback grey)
   CCQUOTA_STOP                              — the quota guard's stop percentage; while it is
                                               set, the rate-limit group carries a Q segment
   CCQUOTA_WARN                              — its warn percentage, rendered before the stop one
@@ -238,6 +244,43 @@ def _force_red(text: str) -> str:
     for i, badge in enumerate(badges):
         out = out.replace(f"\0{i}\0", f"{RST}{badge}\033[1;91m")
     return out
+
+
+# Colors CLAUDE_STATUSLINE_LINE<n>_COLOR accepts, as the codes the rest of the
+# file already writes. A name outside this map renders in SUBDUED rather than
+# failing: a typo in a shell rc must not cost the whole line.
+_MSG_COLORS = {
+    "red":     "0;31",
+    "green":   "0;32",
+    "yellow":  "0;33",
+    "blue":    "0;34",
+    "magenta": "0;35",
+    "cyan":    "0;36",
+    "white":   "0;97",
+    "grey":    "38;5;242",
+    "gray":    "38;5;242",
+    "orange":  "38;5;208",
+}
+
+
+def _append_custom_msgs(lines: list[str], dot: str) -> None:
+    """Append CLAUDE_STATUSLINE_LINE<n>_MSG to line n, for n in 1..4.
+
+    A slot past the last rendered line becomes a line of its own instead of
+    padding the gap — the layout is 2 to 5 lines deep depending on width, so
+    LINE4 on a two-line render would otherwise print two blank lines to reach
+    its number.
+    """
+    for idx in range(1, 5):
+        msg = _env(f"LINE{idx}_MSG", "")
+        if not msg:
+            continue
+        code = _MSG_COLORS.get(_env(f"LINE{idx}_COLOR", "").strip().lower(), "38;5;242")
+        text = _c(code, msg)
+        if idx <= len(lines):
+            lines[idx - 1] = f"{lines[idx - 1]}{dot}{text}"
+        else:
+            lines.append(text)
 
 
 # Levels whose own name doesn't capitalize into a word.
@@ -2348,6 +2391,9 @@ def _layout_and_print(
     last_parts = [s for s in (account, battery_str, elapsed) if s]
     if last_parts:
         lines.append(DOT.join(last_parts))
+    # Before the red pass, so CLAUDE_STATUSLINE_RED still recolors the whole
+    # line the way its name says.
+    _append_custom_msgs(lines, DOT)
     if force_red:
         lines = [_force_red(line) for line in lines]
     print("\n".join(lines))

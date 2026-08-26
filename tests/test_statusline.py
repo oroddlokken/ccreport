@@ -2309,3 +2309,58 @@ class TestQuotaGuardSegment:
         """A per-render import costs every frame the tokenizing of that module."""
         src = Path(sl.__file__).read_text(encoding="utf-8")
         assert re.search(r"^\s*(?:from|import)\b.*quota_guard", src, re.MULTILINE) is None
+
+
+class TestCustomLineMessages:
+    """CLAUDE_STATUSLINE_LINE<n>_MSG appended to the nth rendered line."""
+
+    DOT = f"{sl.SUBDUED} · {sl.RST}"
+
+    def _plain(self, text: str) -> str:
+        return re.sub(r"\033\[[0-9;]*m", "", text)
+
+    def _run(self, monkeypatch, lines, **env):
+        for name, value in env.items():
+            monkeypatch.setenv(f"CLAUDE_STATUSLINE_{name}", value)
+        out = list(lines)
+        sl._append_custom_msgs(out, self.DOT)
+        return out
+
+    def test_a_message_trails_its_line_after_the_dot(self, monkeypatch):
+        out = self._run(monkeypatch, ["one", "two"], LINE2_MSG="hello")
+        assert self._plain(out[1]) == "two · hello"
+        assert self._plain(out[0]) == "one"
+
+    def test_a_colour_name_renders_that_code(self, monkeypatch):
+        out = self._run(monkeypatch, ["one"], LINE1_MSG="hi", LINE1_COLOR="red")
+        assert out[0] == f"one{self.DOT}\033[0;31mhi\033[0m"
+
+    def test_an_unknown_name_falls_back_to_subdued(self, monkeypatch):
+        out = self._run(monkeypatch, ["one"], LINE1_MSG="hi", LINE1_COLOR="chartreuse")
+        assert out[0] == f"one{self.DOT}{sl.SUBDUED}hi\033[0m"
+
+    def test_no_colour_set_renders_subdued(self, monkeypatch):
+        out = self._run(monkeypatch, ["one"], LINE1_MSG="hi")
+        assert out[0] == f"one{self.DOT}{sl.SUBDUED}hi\033[0m"
+
+    def test_a_slot_past_the_last_line_takes_a_line_of_its_own(self, monkeypatch):
+        """LINE4 on a two-line render is line 3, not line 4 after two blanks."""
+        out = self._run(monkeypatch, ["one", "two"], LINE4_MSG="tail")
+        assert [self._plain(line) for line in out] == ["one", "two", "tail"]
+
+    def test_two_overflowing_slots_keep_their_order(self, monkeypatch):
+        out = self._run(monkeypatch, ["one", "two"], LINE3_MSG="three", LINE4_MSG="four")
+        assert [self._plain(line) for line in out] == ["one", "two", "three", "four"]
+
+    def test_an_unset_message_changes_nothing(self, monkeypatch):
+        assert self._run(monkeypatch, ["one", "two"]) == ["one", "two"]
+
+    def test_an_empty_message_changes_nothing(self, monkeypatch):
+        assert self._run(monkeypatch, ["one"], LINE1_MSG="") == ["one"]
+
+    def test_the_red_pass_swallows_the_message_colour(self, monkeypatch):
+        """CLAUDE_STATUSLINE_RED says entire status line, so it covers this too."""
+        out = self._run(monkeypatch, ["one"], LINE1_MSG="hi", LINE1_COLOR="green")
+        red = sl._force_red(out[0])
+        assert "\033[0;32m" not in red
+        assert self._plain(red) == f"one{self._plain(self.DOT)}hi"
