@@ -86,6 +86,9 @@ Other environment variables:
   CCQUOTA_STOP                              — the quota guard's stop percentage; while it is
                                               set, the rate-limit group carries a Q segment
   CCQUOTA_WARN                              — its warn percentage, rendered before the stop one
+  CCQUOTA_STOP_SESSION, CCQUOTA_WARN_SESSION,
+  CCQUOTA_STOP_WEEK, CCQUOTA_WARN_WEEK      — lines for the 5-hour and weekly windows alone,
+                                              each rendered after the global pair as S or W
   CLAUDE_CODE_PACE_DAYS                     — pace window in days (1-7, default 7)
   CF_BADGE                                  — badge text after the model name, rendered cyan
                                               (set to CF/CO by the cf/co wrappers; legacy
@@ -1757,8 +1760,15 @@ def _scoped_model_in_use(usage: dict, scoped_model: str) -> bool:
     return isinstance(families, (list, tuple, set, frozenset)) and family in families
 
 
-# The four windows quota_guard.WINDOW_LABELS names, as this render holds them.
-_QUOTA_PERCENT_KEYS = ("session_percent", "week_percent", "sonnet_percent", "scoped_percent")
+# The four windows quota_guard.WINDOW_LABELS names, as this render holds them:
+# the usage key, the tag an override renders under, and the two variables
+# quota_guard.WINDOW_ENV reads for it. Sonnet and scoped take no override.
+_QUOTA_WINDOWS = (
+    ("session_percent", "S", "CCQUOTA_WARN_SESSION", "CCQUOTA_STOP_SESSION"),
+    ("week_percent", "W", "CCQUOTA_WARN_WEEK", "CCQUOTA_STOP_WEEK"),
+    ("sonnet_percent", "", "", ""),
+    ("scoped_percent", "", "", ""),
+)
 
 
 def _quota_threshold(raw: str | None) -> float | None:
@@ -1776,26 +1786,81 @@ def _quota_threshold(raw: str | None) -> float | None:
         return None
 
 
-def _quota_peak(usage: dict) -> float | None:
-    """The fullest window this render has a reading for, or None where it has none.
+def _quota_override(name: str, fallback: float | None) -> tuple[float | None, bool]:
+    """One per-window line and whether it parses, as quota_guard._override does.
 
-    The guard blocks on the highest of the four, so the colour follows the same
-    one.
+    An unset variable falls back to the global line; an unusable one blocks
+    every prompt in the guard, which the caller renders as Q:!.
     """
-    percents = []
-    for key in _QUOTA_PERCENT_KEYS:
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return fallback, True
+    value = _quota_threshold(raw)
+    return (value, True) if value is not None else (fallback, False)
+
+
+class _QuotaLine(NamedTuple):
+    """One window's two lines, its render tag and where its percent is read."""
+
+    tag: str
+    warn: float | None
+    stop: float
+    key: str
+
+
+def _quota_lines(warn: float | None, stop: float) -> tuple[list[_QuotaLine], bool]:
+    """Each window's two lines with the tag an override renders under.
+
+    The tag is empty for a window on the global pair, which is what keeps the
+    segment to one token until somebody caps a window on its own.
+    """
+    out: list[_QuotaLine] = []
+    for key, tag, warn_env, stop_env in _QUOTA_WINDOWS:
+        window_warn, warn_ok = _quota_override(warn_env, warn) if tag else (warn, True)
+        window_stop, stop_ok = _quota_override(stop_env, stop) if tag else (stop, True)
+        if not (warn_ok and stop_ok) or window_stop is None:
+            return [], False
+        overridden = tag if (window_warn, window_stop) != (warn, stop) else ""
+        out.append(_QuotaLine(overridden, window_warn, window_stop, key))
+    return out, True
+
+
+def _quota_severity(usage: dict, lines: list[_QuotaLine]) -> int:
+    """0 under both lines, 1 past a warn, 2 at or over a stop.
+
+    Each window is weighed against its own lines, the way the guard weighs it.
+    """
+    worst = 0
+    for _, window_warn, window_stop, key in lines:
         try:
-            percents.append(float(_pct_str(usage, key)))
+            pct = float(_pct_str(usage, key))
         except ValueError:
             continue
-    return max(percents) if percents else None
+        if pct >= window_stop:
+            worst = 2
+        elif window_warn is not None and pct >= window_warn and worst < 1:
+            worst = 1
+    return worst
+
+
+def _quota_label(warn: float | None, stop: float, lines: list[_QuotaLine]) -> str:
+    parts = [f"Q:{warn:g}/{stop:g}" if warn is not None else f"Q:{stop:g}"]
+    for tag, window_warn, window_stop, _ in lines:
+        if not tag:
+            continue
+        parts.append(
+            f"{tag}{window_warn:g}/{window_stop:g}"
+            if window_warn is not None
+            else f"{tag}{window_stop:g}",
+        )
+    return " ".join(parts)
 
 
 def _render_quota_guard(usage: dict) -> str:
-    """The armed guard's thresholds, empty while CCQUOTA_STOP is unset.
+    """The armed guard's lines, empty while CCQUOTA_STOP is unset.
 
-    A stop line that does not parse blocks every prompt in the guard, which is
-    what the red Q:! says.
+    A line that does not parse blocks every prompt in the guard, which is what
+    the red Q:! says — for a per-window variable as much as for the global one.
     """
     raw_stop = os.environ.get("CCQUOTA_STOP", "")
     if not raw_stop.strip():
@@ -1804,13 +1869,15 @@ def _render_quota_guard(usage: dict) -> str:
     if stop is None:
         return _c("0;31", "Q:!")
     warn = _quota_threshold(os.environ.get("CCQUOTA_WARN", ""))
-    label = f"Q:{warn:g}/{stop:g}" if warn is not None else f"Q:{stop:g}"
-    peak = _quota_peak(usage)
-    if peak is not None:
-        if peak >= stop:
-            return _c("0;31", label)
-        if warn is not None and peak >= warn:
-            return _c("0;33", label)
+    lines, ok = _quota_lines(warn, stop)
+    if not ok:
+        return _c("0;31", "Q:!")
+    label = _quota_label(warn, stop, lines)
+    severity = _quota_severity(usage, lines)
+    if severity == 2:
+        return _c("0;31", label)
+    if severity == 1:
+        return _c("0;33", label)
     return f"{SUBDUED}{label}{RST}"
 
 

@@ -40,6 +40,14 @@ WINDOW_LABELS = {
     "scoped": "weekly scoped",
 }
 
+# The two windows a launcher caps on their own, and the (warn, stop) variables
+# that do it. Sonnet and scoped keep the global pair: they are the API's to
+# report and nobody sets a separate line for them.
+WINDOW_ENV = {
+    "session": (f"{WARN_ENV}_SESSION", f"{STOP_ENV}_SESSION"),
+    "week": (f"{WARN_ENV}_WEEK", f"{STOP_ENV}_WEEK"),
+}
+
 # Which budget a window's absence is measured against, for the message alone:
 # S and W have a native source, Sonnet and scoped are the API's to supply.
 _DEFAULT_BUDGET = {
@@ -86,6 +94,20 @@ class WindowState(NamedTuple):
     percent: float | None
     resets_at: float | None
     budget_s: float
+
+
+class Limits(NamedTuple):
+    """The two lines one window is measured against, and what named them.
+
+    The variable names travel with the numbers so a message points at what the
+    person set — the per-window variable where there is an override, and the
+    global one everywhere else.
+    """
+
+    warn: float | None
+    stop: float
+    warn_env: str = WARN_ENV
+    stop_env: str = STOP_ENV
 
 
 # Stands in for a warning whose window sent no reset time, so it dedupes under
@@ -328,6 +350,59 @@ def threshold(raw: str | None) -> float | None:
         return None
 
 
+def _override(env: dict[str, str], name: str) -> tuple[float | None, bool]:
+    """One per-window value, and whether it is usable.
+
+    threshold() answers None for unset and for unusable alike; here the two
+    part ways, because an unset override falls back and an unusable one blocks.
+    """
+    raw = env.get(name, "")
+    if not raw.strip():
+        return None, True
+    value = threshold(raw)
+    return value, value is not None
+
+
+def uniform_limits(warn: float | None, stop: float) -> dict[str, Limits]:
+    """The global pair applied to every window, which is where each one starts."""
+    return {window: Limits(warn, stop) for window in WINDOW_LABELS}
+
+
+def window_limits(
+    env: dict[str, str], warn: float | None, stop: float,
+) -> tuple[dict[str, Limits], str]:
+    """Each window's own lines, and the first variable that did not parse.
+
+    An override sets one line and leaves the other on the global value, so
+    CCQUOTA_STOP_WEEK alone caps the weekly window while every warning still
+    comes off CCQUOTA_WARN.
+    """
+    limits = uniform_limits(warn, stop)
+    for window, (warn_env, stop_env) in WINDOW_ENV.items():
+        warn_value, warn_ok = _override(env, warn_env)
+        if not warn_ok:
+            return limits, warn_env
+        stop_value, stop_ok = _override(env, stop_env)
+        if not stop_ok:
+            return limits, stop_env
+        if warn_value is None and stop_value is None:
+            continue
+        limits[window] = Limits(
+            warn if warn_value is None else warn_value,
+            stop if stop_value is None else stop_value,
+            WARN_ENV if warn_value is None else warn_env,
+            STOP_ENV if stop_value is None else stop_env,
+        )
+    return limits, ""
+
+
+def _not_a_percentage(name: str, raw: str) -> dict:
+    return {
+        "continue": False,
+        "stopReason": f"Quota guard: {name}={raw!r} is not a percentage. {_way_out()}",
+    }
+
+
 def _way_out() -> str:
     return f"Unset {STOP_ENV} and relaunch claude to continue."
 
@@ -336,11 +411,25 @@ def _minutes(seconds: float) -> str:
     return f"{int(seconds // 60)} minutes"
 
 
-def verdict(states: list[WindowState], warn: float | None, stop: float) -> Verdict:
+def _furthest_past(
+    crossed: list[tuple[WindowState, Limits, float]],
+) -> tuple[WindowState, Limits]:
+    """The window furthest past its own line, which is the one to name.
+
+    Distance rather than percent: with two lines in play, a window at 86% over
+    a line of 85 is spent further than one at 91% over a line of 95.
+    """
+    worst = max(crossed, key=lambda c: (c[0].percent or 0.0) - c[2])
+    return worst[0], worst[1]
+
+
+def verdict(states: list[WindowState], limits: dict[str, Limits]) -> Verdict:
     """Whether this prompt or tool call may proceed.
 
-    An over-stop reading outranks an unknown window, because naming the quota
-    that is actually spent tells the person more than naming a stale one.
+    Each window answers to its own two lines, so one window over its stop halts
+    the turn whatever the others read. An over-stop reading outranks an unknown
+    window, because naming the quota that is actually spent tells the person
+    more than naming a stale one.
     """
     if not states:
         return Verdict(
@@ -349,14 +438,15 @@ def verdict(states: list[WindowState], warn: float | None, stop: float) -> Verdi
             "",
             None,
         )
-    known = [s for s in states if s.percent is not None]
-    over = [s for s in known if s.percent is not None and s.percent >= stop]
+    known = [(s, limits[s.window]) for s in states if s.percent is not None]
+    over = [(s, lim, lim.stop) for s, lim in known if (s.percent or 0.0) >= lim.stop]
     if over:
-        worst = max(over, key=lambda s: s.percent or 0.0)
+        worst, lim = _furthest_past(over)
         return Verdict(
             "stop",
             f"Quota guard: the {WINDOW_LABELS[worst.window]} window is at "
-            f"{worst.percent:.0f}%, at or over the {STOP_ENV} line of {stop:g}. {_way_out()}",
+            f"{worst.percent:.0f}%, at or over the {lim.stop_env} line of "
+            f"{lim.stop:g}. {_way_out()}",
             worst.window,
             worst.resets_at,
         )
@@ -370,16 +460,18 @@ def verdict(states: list[WindowState], warn: float | None, stop: float) -> Verdi
             s.window,
             None,
         )
-    if warn is None:
-        return Verdict("ok", "", "", None)
-    warned = [s for s in known if s.percent is not None and s.percent >= warn]
+    warned = [
+        (s, lim, lim.warn)
+        for s, lim in known
+        if lim.warn is not None and (s.percent or 0.0) >= lim.warn
+    ]
     if warned:
-        worst = max(warned, key=lambda s: s.percent or 0.0)
+        worst, lim = _furthest_past(warned)
         return Verdict(
             "warn",
             f"Quota guard: the {WINDOW_LABELS[worst.window]} window is at "
-            f"{worst.percent:.0f}%, past the {WARN_ENV} line of {warn:g}. "
-            f"The session stops at {stop:g}.",
+            f"{worst.percent:.0f}%, past the {lim.warn_env} line of {lim.warn:g}. "
+            f"The session stops at {lim.stop:g}.",
             worst.window,
             worst.resets_at,
         )
@@ -454,13 +546,12 @@ def hook_output(payload: dict, now: float, env: dict[str, str]) -> dict | None:
         return None
     stop = threshold(raw_stop)
     if stop is None:
-        return {
-            "continue": False,
-            "stopReason": f"Quota guard: {STOP_ENV}={raw_stop!r} is not a percentage. "
-            f"{_way_out()}",
-        }
+        return _not_a_percentage(STOP_ENV, raw_stop)
+    limits, unparsed = window_limits(env, threshold(env.get(WARN_ENV, "")), stop)
+    if unparsed:
+        return _not_a_percentage(unparsed, env.get(unparsed, ""))
     session_id = str(payload.get("session_id") or "")
-    v = verdict(read_windows(session_id, now), threshold(env.get(WARN_ENV, "")), stop)
+    v = verdict(read_windows(session_id, now), limits)
     if v.kind == "stop":
         return {"continue": False, "stopReason": v.message}
     if v.kind == "warn" and warning_is_new(session_id, v):

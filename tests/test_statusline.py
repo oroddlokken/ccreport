@@ -2305,6 +2305,56 @@ class TestQuotaGuardSegment:
 
         assert sl._quota_threshold(raw) == quota_guard.threshold(raw)
 
+    def test_a_window_override_renders_beside_the_global_pair(self, monkeypatch):
+        monkeypatch.setenv("CCQUOTA_WARN_SESSION", "89")
+        monkeypatch.setenv("CCQUOTA_STOP_SESSION", "99")
+        assert self._plain(self._segment(monkeypatch, warn="85")) == "Q:85/95 S89/99"
+
+    def test_both_overrides_render_in_window_order(self, monkeypatch):
+        monkeypatch.setenv("CCQUOTA_STOP_SESSION", "99")
+        monkeypatch.setenv("CCQUOTA_STOP_WEEK", "80")
+        monkeypatch.setenv("CCQUOTA_WARN_WEEK", "70")
+        assert self._plain(self._segment(monkeypatch, warn="85")) == "Q:85/95 S85/99 W70/80"
+
+    def test_a_window_on_the_global_pair_adds_nothing(self, monkeypatch):
+        monkeypatch.setenv("CCQUOTA_STOP_WEEK", "95")
+        assert self._plain(self._segment(monkeypatch, warn="85")) == "Q:85/95"
+
+    def test_a_raised_stop_keeps_its_window_out_of_the_red(self, monkeypatch):
+        monkeypatch.setenv("CCQUOTA_STOP_WEEK", "99")
+        segment = self._segment(monkeypatch, warn="85", week_percent="96")
+        assert segment.startswith(self.YELLOW)
+
+    def test_a_lowered_stop_turns_its_window_red(self, monkeypatch):
+        monkeypatch.setenv("CCQUOTA_STOP_WEEK", "80")
+        segment = self._segment(monkeypatch, warn="85", week_percent="81")
+        assert segment.startswith(self.RED)
+
+    def test_an_override_leaves_the_other_windows_on_the_global_stop(self, monkeypatch):
+        monkeypatch.setenv("CCQUOTA_STOP_SESSION", "99")
+        segment = self._segment(monkeypatch, warn="85", sonnet_percent="97")
+        assert segment.startswith(self.RED)
+
+    @pytest.mark.parametrize(
+        "name",
+        ["CCQUOTA_WARN_SESSION", "CCQUOTA_STOP_SESSION",
+         "CCQUOTA_WARN_WEEK", "CCQUOTA_STOP_WEEK"],
+    )
+    def test_an_unparseable_override_renders_red(self, monkeypatch, name):
+        """It blocks every prompt in the guard, exactly as a bad global line does."""
+        monkeypatch.setenv(name, "ninety")
+        segment = self._segment(monkeypatch, warn="85")
+        assert self._plain(segment) == "Q:!"
+        assert segment.startswith(self.RED)
+
+    def test_the_render_and_the_guard_read_the_same_variables(self):
+        """One list of per-window variables, checked against the guard's own."""
+        from ccreport import quota_guard
+
+        rendered = {key.split("_")[0]: (warn, stop)
+                    for key, tag, warn, stop in sl._QUOTA_WINDOWS if tag}
+        assert rendered == quota_guard.WINDOW_ENV
+
     def test_the_statusline_never_imports_the_guard(self):
         """A per-render import costs every frame the tokenizing of that module."""
         src = Path(sl.__file__).read_text(encoding="utf-8")

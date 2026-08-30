@@ -111,40 +111,104 @@ class TestVerdict:
     """The pure part: percentages and two lines against them."""
 
     def test_at_the_stop_line_stops(self):
-        v = qg.verdict([_state("session", 95.0)], 85.0, 95.0)
+        v = qg.verdict([_state("session", 95.0)], qg.uniform_limits(85.0, 95.0))
         assert v.kind == "stop"
         assert "5-hour" in v.message
         assert qg.STOP_ENV in v.message
 
     def test_between_the_lines_warns(self):
-        v = qg.verdict([_state("week", 87.0)], 85.0, 95.0)
+        v = qg.verdict([_state("week", 87.0)], qg.uniform_limits(85.0, 95.0))
         assert v.kind == "warn"
         assert "weekly" in v.message
 
     def test_under_the_warn_line_passes(self):
-        assert qg.verdict([_state("week", 40.0)], 85.0, 95.0).kind == "ok"
+        assert qg.verdict([_state("week", 40.0)], qg.uniform_limits(85.0, 95.0)).kind == "ok"
 
     def test_no_warn_line_leaves_only_the_stop(self):
-        assert qg.verdict([_state("week", 94.0)], None, 95.0).kind == "ok"
+        assert qg.verdict([_state("week", 94.0)], qg.uniform_limits(None, 95.0)).kind == "ok"
 
     def test_the_fullest_window_is_the_one_named(self):
-        v = qg.verdict([_state("session", 96.0), _state("week", 99.0)], 85.0, 95.0)
+        states = [_state("session", 96.0), _state("week", 99.0)]
+        v = qg.verdict(states, qg.uniform_limits(85.0, 95.0))
         assert "weekly" in v.message
 
     def test_an_unknown_window_stops(self):
-        v = qg.verdict([_state("session", 10.0), _state("sonnet", None)], 85.0, 95.0)
+        states = [_state("session", 10.0), _state("sonnet", None)]
+        v = qg.verdict(states, qg.uniform_limits(85.0, 95.0))
         assert v.kind == "stop"
         assert "weekly Sonnet" in v.message
         assert qg.STOP_ENV in v.message
 
     def test_a_spent_window_outranks_an_unknown_one(self):
-        v = qg.verdict([_state("session", 97.0), _state("sonnet", None)], 85.0, 95.0)
+        states = [_state("session", 97.0), _state("sonnet", None)]
+        v = qg.verdict(states, qg.uniform_limits(85.0, 95.0))
         assert "5-hour" in v.message
 
     def test_nothing_readable_stops(self):
-        v = qg.verdict([], 85.0, 95.0)
+        v = qg.verdict([], qg.uniform_limits(85.0, 95.0))
         assert v.kind == "stop"
         assert qg.STOP_ENV in v.message
+
+
+class TestWindowLimits:
+    """Which lines each window answers to once an override is set."""
+
+    def test_no_override_leaves_every_window_on_the_global_pair(self):
+        limits, unparsed = qg.window_limits({}, 85.0, 95.0)
+        assert not unparsed
+        assert limits == qg.uniform_limits(85.0, 95.0)
+
+    def test_a_session_override_moves_only_that_window(self):
+        limits, _ = qg.window_limits({"CCQUOTA_STOP_SESSION": "99"}, 85.0, 95.0)
+        assert limits["session"].stop == 99.0
+        assert limits["session"].stop_env == "CCQUOTA_STOP_SESSION"
+        assert limits["week"] == qg.Limits(85.0, 95.0)
+        assert limits["sonnet"] == qg.Limits(85.0, 95.0)
+
+    def test_a_stop_override_keeps_the_global_warn(self):
+        limits, _ = qg.window_limits({"CCQUOTA_STOP_WEEK": "80"}, 85.0, 95.0)
+        assert limits["week"] == qg.Limits(85.0, 80.0, qg.WARN_ENV, "CCQUOTA_STOP_WEEK")
+
+    def test_both_windows_take_their_own_pair(self):
+        env = {
+            "CCQUOTA_WARN_SESSION": "89", "CCQUOTA_STOP_SESSION": "99",
+            "CCQUOTA_WARN_WEEK": "70", "CCQUOTA_STOP_WEEK": "80",
+        }
+        limits, _ = qg.window_limits(env, 85.0, 95.0)
+        assert (limits["session"].warn, limits["session"].stop) == (89.0, 99.0)
+        assert (limits["week"].warn, limits["week"].stop) == (70.0, 80.0)
+
+    @pytest.mark.parametrize(
+        "name", ["CCQUOTA_WARN_SESSION", "CCQUOTA_STOP_SESSION",
+                 "CCQUOTA_WARN_WEEK", "CCQUOTA_STOP_WEEK"],
+    )
+    def test_an_unparsable_override_names_itself(self, name):
+        _, unparsed = qg.window_limits({name: "most"}, 85.0, 95.0)
+        assert unparsed == name
+
+    def test_a_window_over_its_own_stop_is_the_one_named(self):
+        """The 5-hour window at 91 passes its 99; the weekly one at 86 does not
+        pass its 85, and the lower percentage is what stops the turn."""
+        limits, _ = qg.window_limits(
+            {"CCQUOTA_STOP_SESSION": "99", "CCQUOTA_STOP_WEEK": "85"}, 75.0, 95.0,
+        )
+        v = qg.verdict([_state("session", 91.0), _state("week", 86.0)], limits)
+        assert v.kind == "stop"
+        assert v.window == "week"
+        assert "CCQUOTA_STOP_WEEK line of 85" in v.message
+
+    def test_a_raised_stop_lets_a_window_through(self):
+        limits, _ = qg.window_limits({"CCQUOTA_STOP_SESSION": "99"}, 98.0, 95.0)
+        assert qg.verdict([_state("session", 96.0)], limits).kind == "ok"
+
+    def test_a_warning_names_the_window_variable_that_set_it(self):
+        limits, _ = qg.window_limits(
+            {"CCQUOTA_WARN_SESSION": "89", "CCQUOTA_STOP_SESSION": "99"}, 85.0, 95.0,
+        )
+        v = qg.verdict([_state("session", 90.0)], limits)
+        assert v.kind == "warn"
+        assert "CCQUOTA_WARN_SESSION line of 89" in v.message
+        assert "stops at 99" in v.message
 
 
 class TestThreshold:
@@ -205,7 +269,7 @@ class TestReadWindows:
     def test_the_unknown_message_names_the_budget_that_found_nothing(self):
         _usage_row(sonnet_percent=20, sonnet_reset=_iso(NOW + 7200))
         later = NOW + qg.API_MAX_AGE_S + 60
-        v = qg.verdict(qg.read_windows(SESSION, later), 85.0, 95.0)
+        v = qg.verdict(qg.read_windows(SESSION, later), qg.uniform_limits(85.0, 95.0))
         assert "60 minutes" in v.message
 
     def test_a_snapshot_row_stands_in_for_a_missing_file(self):
@@ -232,7 +296,7 @@ class TestReadWindows:
 
     def test_a_reading_with_no_reset_time_still_stops_over_the_line(self):
         _usage_row(scoped_percent=97)
-        v = qg.verdict(qg.read_windows(SESSION, NOW), 85.0, 95.0)
+        v = qg.verdict(qg.read_windows(SESSION, NOW), qg.uniform_limits(85.0, 95.0))
         assert v.kind == "stop"
         assert "weekly scoped window is at 97%" in v.message
 
@@ -344,6 +408,37 @@ class TestHookOutput:
         out = qg.hook_output({"session_id": SESSION}, NOW, {qg.STOP_ENV: "ninety"}) or {}
         assert out["continue"] is False
         assert "ninety" in out["stopReason"]
+
+    def test_a_raised_session_stop_warns_where_it_used_to_halt(self):
+        _usage_row(session_percent=96, session_reset=_iso(NOW + 3600))
+        env = {**self.ENV, "CCQUOTA_WARN_SESSION": "89", "CCQUOTA_STOP_SESSION": "99"}
+        out = qg.hook_output({"session_id": SESSION}, NOW, env) or {}
+        assert set(out) == {"systemMessage"}
+        assert "CCQUOTA_WARN_SESSION line of 89" in out["systemMessage"]
+
+    def test_a_raised_session_stop_lets_the_turn_through(self):
+        _usage_row(session_percent=88, session_reset=_iso(NOW + 3600))
+        env = {**self.ENV, "CCQUOTA_WARN_SESSION": "89", "CCQUOTA_STOP_SESSION": "99"}
+        assert qg.hook_output({"session_id": SESSION}, NOW, env) is None
+
+    def test_a_lowered_week_stop_halts_the_turn(self):
+        _usage_row(week_percent=86, week_reset=_iso(NOW + 86_400))
+        env = {**self.ENV, "CCQUOTA_STOP_WEEK": "85"}
+        out = qg.hook_output({"session_id": SESSION}, NOW, env) or {}
+        assert out["continue"] is False
+        assert "CCQUOTA_STOP_WEEK" in out["stopReason"]
+
+    def test_an_unparsable_window_override_blocks(self):
+        _usage_row(session_percent=12, session_reset=_iso(NOW + 3600))
+        env = {**self.ENV, "CCQUOTA_STOP_SESSION": "most"}
+        out = qg.hook_output({"session_id": SESSION}, NOW, env) or {}
+        assert out["continue"] is False
+        assert "CCQUOTA_STOP_SESSION" in out["stopReason"]
+        assert "most" in out["stopReason"]
+
+    def test_a_window_override_alone_arms_nothing(self):
+        _usage_row(session_percent=96, session_reset=_iso(NOW + 3600))
+        assert qg.hook_output({"session_id": SESSION}, NOW, {"CCQUOTA_STOP_SESSION": "90"}) is None
 
     def test_an_unparsable_warn_line_leaves_the_stop_alone(self):
         _usage_row(session_percent=96, session_reset=_iso(NOW + 3600))

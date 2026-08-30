@@ -139,6 +139,19 @@ way to use it:
 alias claude-capped='CCQUOTA_WARN=85 CCQUOTA_STOP=95 claude'
 ```
 
+The 5-hour and weekly windows take lines of their own, and every window without
+one stays on the global pair:
+
+```bash
+CCQUOTA_WARN_SESSION=89 CCQUOTA_STOP_SESSION=99 \
+CCQUOTA_WARN_WEEK=75    CCQUOTA_STOP_WEEK=85    claude-capped
+```
+
+`CCQUOTA_STOP` is still the whole switch — a per-window variable on its own arms
+nothing. Sonnet and the scoped model limit have no override; the global pair
+covers them. `ccap` in the macsetup checkout wraps this as `-s` and `-w`, each
+taking the stop percentage and deriving its warn ten points below.
+
 Over the warn line, one `systemMessage` lands per window instance rather than
 per prompt. Over the stop line the hook answers `continue: false`, which halts
 the turn and leaves the session open for input — `UserPromptSubmit` before the

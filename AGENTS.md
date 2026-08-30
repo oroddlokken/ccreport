@@ -54,7 +54,8 @@ nothing rebuilds them:
   and draws bars, reset countdowns and a weekly pace line from what it printed.
 - `src/ccreport/quota_guard.py` — the verdict the `UserPromptSubmit` and
   `PreToolUse` hooks in `bin/quota-guard.sh` share. Stops a session over
-  `CCQUOTA_STOP` and warns over `CCQUOTA_WARN`.
+  `CCQUOTA_STOP` and warns over `CCQUOTA_WARN`, or over the per-window pair in
+  `WINDOW_ENV` where the 5-hour or weekly window has one of its own.
 
 `src/ccreport/server/` is the merged database the machines push to: a FastAPI
 app over its own SQLite file, run by Granian (`just serve`), configured by
