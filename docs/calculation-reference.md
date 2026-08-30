@@ -1421,14 +1421,24 @@ week.
 A plan change restarts the percentage against the new allowance and leaves
 `resets_at` where it was, so one reset time can hold two fill curves. The
 instance key carries a **stretch** index for that reason: `rebase_stretches()`
-cuts a group wherever a reading falls by more than `REBASE_DROP_PP` (5.0), and
-each cut is a row of its own with its own peak, fill span, rate and priced
-spend.
+cuts a group where a reading falls by more than `REBASE_DROP_PP` (5.0) *and* the
+plan history records a change within `REBASE_CHANGE_TOLERANCE_S` (an hour) of
+the fall. Each cut is a row of its own with its own peak, fill span, rate and
+priced spend.
 
-Below that threshold a fall is a rounding step — every drop in this machine's
-stored history is exactly one point, bar the ten-point fall to zero on
-2026-08-30 when Max 20x became Pro. Nothing in a sample names the plan it was
-read under, so the cut is by drop size alone.
+Both halves, because neither is evidence alone. Readings fall that far without
+any plan change — two machines reading one account quota minutes out of step
+fall and recover — and on the merged corpus six of the eight falls past the
+threshold had no change behind them, four on an account whose plan never moved.
+A change on its own is not evidence either: nothing in a sample names the plan
+it was read under, and a window that opened after the switch never fell.
+
+The tolerance is an hour because a change is dated by the render that read the
+new config, or by the receipt date someone typed, neither of which is the
+instant the quota was rebased — and §9.7's own defect list aside, the falling
+sample can precede the capture within one render. An account with no recorded
+plan history has no changes and is never cut, which is what there is no
+evidence for rather than a guess at it.
 
 The table daggers the Reset of a stretch a rebase opened and dates the split in
 a caption, so two rows under one reset time read as what they are. `--json`
@@ -1535,9 +1545,10 @@ in left as null rather than 0. The merged group is then cut by
 `rebase_stretches` the way one machine's is, and the stretch rides in the query
 string beside the model and the account: a link carrying none opens the curve
 that opened the window, which is the only one a link written before the split
-could have named. Two machines read the same quota minutes out of step, so a
-merged series carries dips that a single one does not — the threshold is what
-tells those from the fall a plan change leaves. Spend, `$/pp` and Cache are the same
+could have named. The plan changes it cuts on are the *declared* timeline
+(`_tier_changes`, over `account_tiers`), because that is the only plan history
+the server has — an account nobody typed one for is never cut, however far its
+readings fall. Spend, `$/pp` and Cache are the same
 `windows.py` functions the CLI's columns read, over `reports.load` bounded to
 the window spans: the full record path, because a 5-hour window is priced over
 hours and a grouped row has folded the hour away. There is no Extra column —

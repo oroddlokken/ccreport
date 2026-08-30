@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from ccreport import pricing, windows
+from ccreport import pricing, tier_timeline, windows
 from ccreport.server import dashboard, db, reports
 
 BUCKET_SWITCH_S = 6 * 3600
@@ -110,8 +110,27 @@ def _account_of(sample: dict, aliases: dict[str, str]) -> str:
     )
 
 
+def _tier_changes(conn) -> dict[str, list[float]]:
+    """When each account's declared plan moved, oldest first, keyed by uuid.
+
+    A window is only cut where a plan change explains the fall, and the server's
+    tier history is declared rather than pushed: an account nobody typed a
+    timeline for has no changes and so is never cut. The first entry establishes
+    a tier rather than moving one — there is nothing before it to have moved
+    from.
+    """
+    moved: dict[str, list[float]] = {}
+    previous: dict[str, str | None] = {}
+    for entry in db.account_tiers(conn):
+        tier = tier_timeline.effective_tier(entry.tiers())
+        if entry.account in previous and tier != previous[entry.account]:
+            moved.setdefault(entry.account, []).append(entry.ts)
+        previous[entry.account] = tier
+    return moved
+
+
 def _merged_instances(
-    samples: list[dict], aliases: dict[str, str],
+    samples: list[dict], aliases: dict[str, str], changes: dict[str, list[float]],
 ) -> list[tuple[str, windows.WindowInstance, list[str]]]:
     """Group *samples* into one instance per (account, window, model, reset).
 
@@ -130,6 +149,7 @@ def _merged_instances(
     says who reported a reading of the row it sits on.
     """
     by_key: dict[tuple, list[dict]] = {}
+    uuids: dict[tuple, set[str]] = {}
     for sample in samples:
         if windows.implausible_reset(sample):
             continue
@@ -137,9 +157,16 @@ def _merged_instances(
         key = (account, sample["window"], sample["model"],
                windows.rl_window_key(sample["resets_at"]))
         by_key.setdefault(key, []).append(sample)
+        uuids.setdefault(key, set()).add(sample["account_uuid"])
     merged = []
-    for (account, window, model, reset), grouped in by_key.items():
-        for i, stretch in enumerate(windows.rebase_stretches(grouped)):
+    for key, grouped in by_key.items():
+        account, window, model, reset = key
+        # Keyed by display name, which an alias can point two uuids at, so the
+        # changes of every account behind this row are what may cut it.
+        moved = sorted(
+            ts for uuid in uuids[key] for ts in changes.get(uuid, ())
+        )
+        for i, stretch in enumerate(windows.rebase_stretches(grouped, moved)):
             machines: list[str] = []
             for sample in stretch:
                 if sample["machine"] not in machines:
@@ -264,7 +291,7 @@ def _rows(conn, samples: list[dict], now: float) -> list[WindowRow]:
     key is kept, so two windows resetting at one instant still order.
     """
     aliases = db.account_aliases(conn)
-    instances = _merged_instances(samples, aliases)
+    instances = _merged_instances(samples, aliases, _tier_changes(conn))
     indexes = _spend_indexes(conn, instances)
     extra = _extra_series(conn, aliases)
     rows = [

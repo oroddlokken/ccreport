@@ -2935,8 +2935,12 @@ def cmd_limits(args) -> None:
         print("No rate-limit samples match those filters.", file=sys.stderr)
         sys.exit(1)
 
-    instances = sorted(window_instances(samples), key=instance_order)
     accounts = AccountTimeline(load_account_events())
+    # The change log before the grouping: a plan change rebases a window's
+    # percentage under an unchanged reset time, and only the log dates it.
+    instances = sorted(
+        window_instances(samples, accounts.tier_changes()), key=instance_order,
+    )
     now = datetime.now(UTC).timestamp()
     if args.json:
         spends = _load_instance_spend(instances, now)

@@ -2424,9 +2424,14 @@ def _seed_extra(points):
     conn.commit()
 
 
-def _instances():
+def _instances(changes=()):
+    """The stored samples as instances, cut at *changes* the way cmd_limits cuts.
+
+    Empty by default: an account whose plan never moved is every test here bar
+    the ones about a rebase.
+    """
     return sorted(
-        ccr.window_instances(cache_db.load_rate_limit_snapshots()),
+        ccr.window_instances(cache_db.load_rate_limit_snapshots(), changes),
         key=ccr.instance_order,
     )
 
@@ -2524,9 +2529,15 @@ class TestRebasedWindows:
     OBSERVED = [4.0, 10.0, 0.0, 2.0, 5.0]
     """The 2026-08-30 downgrade's shape: a week window at 10% reading 0% next."""
 
-    def test_a_rebase_splits_one_reset_into_two_stretches(self):
+    CHANGED = (_W1_START + 2 * 3600,)
+    """When the plan moved, which is the third sample's instant."""
+
+    def _seed(self):
         _seed_samples("week", _W1_RESET, _W1_START, self.OBSERVED)
-        assert [(i.stretch, i.peak, len(i.samples)) for i in _instances()] == [
+
+    def test_a_rebase_splits_one_reset_into_two_stretches(self):
+        self._seed()
+        assert [(i.stretch, i.peak, len(i.samples)) for i in _instances(self.CHANGED)] == [
             (0, 10.0, 2),
             (1, 5.0, 3),
         ]
@@ -2534,41 +2545,54 @@ class TestRebasedWindows:
     def test_a_one_point_dip_is_a_rounding_step_and_not_a_rebase(self):
         """Every drop in the stored history bar the rebase is exactly one point."""
         _seed_samples("week", _W1_RESET, _W1_START, [4.0, 10.0, 9.0, 11.0])
-        (inst,) = _instances()
+        (inst,) = _instances(self.CHANGED)
         assert inst.peak == 11.0
         assert inst.rebased is False
 
     def test_the_live_stretch_fills_from_the_rebase_and_not_from_the_opening(self):
         """Folded, the fill span ran to the old quota's peak and stopped there."""
-        _seed_samples("week", _W1_RESET, _W1_START, self.OBSERVED)
-        live = _instances()[1]
+        self._seed()
+        live = _instances(self.CHANGED)[1]
         assert live.first_ts == _W1_START + 2 * 3600
         assert live.fill_s == 2 * 3600.0
         assert live.burn_pph == 2.5
 
     def test_the_stretch_that_opened_the_window_is_the_unmarked_one(self):
-        _seed_samples("week", _W1_RESET, _W1_START, self.OBSERVED)
-        opened, live = _instances()
+        self._seed()
+        opened, live = _instances(self.CHANGED)
         assert opened.rebased is False
         assert live.rebased is True
 
     def test_a_rebased_stretch_opens_at_its_own_reading_and_is_not_partial(self):
         """opening_pct is the new quota's first reading, which a downgrade makes 0."""
-        _seed_samples("week", _W1_RESET, _W1_START, self.OBSERVED)
-        live = _instances()[1]
+        self._seed()
+        live = _instances(self.CHANGED)[1]
         assert live.opening_pct == 0.0
         assert live.partial is False
 
     def test_the_two_stretches_key_apart_so_each_is_priced_over_its_own_span(self):
         """One key for both would price the live stretch over the old one's span."""
-        _seed_samples("week", _W1_RESET, _W1_START, self.OBSERVED)
-        opened, live = _instances()
+        self._seed()
+        opened, live = _instances(self.CHANGED)
         assert opened.key != live.key
         assert live.key == ("week", None, _W1_RESET, 1)
 
+    def test_a_fall_with_no_plan_change_behind_it_is_not_cut(self):
+        """Six of the eight falls this size on the merged corpus were this."""
+        self._seed()
+        (inst,) = _instances()
+        assert inst.peak == 10.0
+        assert len(inst.samples) == 5
+
+    def test_a_plan_change_far_from_the_fall_does_not_cut_it(self):
+        """The tolerance covers a render's lag, not a week of it."""
+        self._seed()
+        (inst,) = _instances((_W1_START - 5 * 86400,))
+        assert len(inst.samples) == 5
+
     def test_an_ordinary_window_is_one_stretch(self):
         _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
-        (inst,) = _instances()
+        (inst,) = _instances(self.CHANGED)
         assert inst.stretch == 0
         assert inst.key == ("session", None, _W1_RESET, 0)
 
@@ -3260,12 +3284,12 @@ class TestLimitsUntiered:
 class TestLimitsRendering:
     """The table's own decisions: the caption, and what a narrow terminal loses."""
 
-    def _render(self, monkeypatch, *, width=200, records=(), now=None, extra=()):
+    def _render(self, monkeypatch, *, width=200, records=(), now=None, extra=(), changes=()):
         buf = io.StringIO()
         monkeypatch.setattr(
             ccr, "console", Console(file=buf, width=width, no_color=True)
         )
-        instances = _instances()
+        instances = _instances(changes)
         stamp = _local_epoch(now) if now else _W1_START
         index, extras = ccr.SpendIndex(list(records)), ccr.ExtraIndex(list(extra))
         spends = {
@@ -3312,7 +3336,9 @@ class TestLimitsRendering:
 
     def test_a_rebased_window_is_daggered_and_read_out(self, monkeypatch):
         _seed_samples("week", _W1_RESET, _W1_START, [4.0, 10.0, 0.0, 2.0, 5.0])
-        out = self._reflowed(monkeypatch, now="2026-06-15T13:01")
+        out = self._reflowed(
+            monkeypatch, now="2026-06-15T13:01", changes=(_W1_START + 2 * 3600,),
+        )
         assert "†" in out
         assert "quota rebased at" in out
         assert "filled a different allowance" in out

@@ -130,7 +130,22 @@ def rebased(app):
     series carries a one-point dip that is interleaving and not a rebase. Desk
     stops reporting at the change, which is what the machine column has to
     notice.
+
+    The declared timeline is what makes the fall a rebase rather than a dip: an
+    account nobody typed a plan history for is never cut, however far its
+    readings fall.
     """
+    from ccreport import tier_timeline
+    from ccreport.server import db
+
+    conn = app.state.db.connect()
+    db.set_account_tiers(conn, "acct-1", [
+        tier_timeline.Entry(ts=_ts(240.0), account="acct-1",
+                            organization_rate_limit_tier="default_claude_max_20x"),
+        tier_timeline.Entry(ts=_ts(3.0), account="acct-1",
+                            organization_rate_limit_tier="default_claude_ai"),
+    ], NOW.timestamp())
+    conn.commit()
     client = TestClient(app)
     for machine, label, pcts in (
         ("laptop-1", "Laptop", [(8.0, 10.0), (6.0, 13.0), (4.0, 14.0),
@@ -187,6 +202,23 @@ class TestARebasedWindow:
         rows = {r.instance.stretch: r for r in self._week(rebased)}
         assert rows[0].spend.usd == 0.0
         assert rows[1].spend.usd == pytest.approx(0.0675)
+
+    def test_an_account_with_no_declared_plan_history_is_never_cut(self, app):
+        """The same fall, undeclared: six of eight cuts on the real corpus were this."""
+        client = TestClient(app)
+        for machine, label, pcts in (
+            ("laptop-1", "Laptop", [(8.0, 10.0), (6.0, 13.0), (4.0, 14.0),
+                                    (3.0, 0.0), (1.5, 5.0)]),
+            ("desk-1", "Desk", [(7.0, 11.0), (5.0, 12.0)]),
+        ):
+            token = sf.mint_for(app, machine, label)
+            client.post("/v1/ingest", headers=sf.auth(token), json=sf.sample_batch([
+                sf.sample(ts=_ts(ago), window="week", used_pct=pct, resets_at=WEEK_RESET)
+                for ago, pct in pcts
+            ], label=label))
+        [row] = self._week(app)
+        assert row.instance.peak == 14.0
+        assert row.instance.rebased is False
 
     def test_the_list_marks_the_rebased_row(self, rebased):
         body = TestClient(rebased).get("/limits").text

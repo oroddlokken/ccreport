@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from ccreport import pricing
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
 
     from ccreport.aggregate import UsageRecord
 
@@ -113,6 +113,12 @@ InstanceKey = tuple[str, str | None, float, int]
 # exactly one point, the step the write gate's whole-percent rule leaves room
 # for, bar a ten-point fall to zero on the day a plan changed.
 REBASE_DROP_PP = 5.0
+
+# How far a recorded plan change may sit from the fall it explains. A change is
+# dated by the render that read the new config, or by the receipt date someone
+# typed, neither of which is the instant the quota was rebased — and the falling
+# sample can precede the capture within one render.
+REBASE_CHANGE_TOLERANCE_S = 3600.0
 
 
 @dataclass
@@ -278,7 +284,9 @@ class WindowInstance:
         return self.latest_pct + rate * (self.resets_at - self.last_ts) / 3600
 
 
-def window_instances(samples: list[dict]) -> list[WindowInstance]:
+def window_instances(
+    samples: list[dict], changes: Sequence[float],
+) -> list[WindowInstance]:
     """Group *samples* into window instances, oldest instance first.
 
     Keyed on (window, model, resets_at) rather than resets_at alone: the scoped
@@ -300,27 +308,44 @@ def window_instances(samples: list[dict]) -> list[WindowInstance]:
     return [
         WindowInstance(window, model, resets, stretch, i)
         for (window, model, resets), grouped in by_key.items()
-        for i, stretch in enumerate(rebase_stretches(grouped))
+        for i, stretch in enumerate(rebase_stretches(grouped, changes))
     ]
 
 
-def rebase_stretches(samples: list[dict]) -> list[list[dict]]:
-    """*samples* cut wherever the reading fell far enough to be a new quota.
+def _change_between(changes: Sequence[float], before: float, after: float) -> bool:
+    """Whether a recorded plan change lands close enough to explain a fall between them."""
+    lo = bisect.bisect_left(changes, before - REBASE_CHANGE_TOLERANCE_S)
+    return lo < len(changes) and changes[lo] <= after + REBASE_CHANGE_TOLERANCE_S
+
+
+def rebase_stretches(samples: list[dict], changes: Sequence[float]) -> list[list[dict]]:
+    """*samples* cut where a recorded plan change explains a fall in the reading.
 
     One reset time can cover two fill curves: a plan change restarts the
-    percentage against the new allowance and leaves resets_at where it was, so
-    a peak, a fill span or a rate taken across the fall describes neither
-    quota. The cut is by drop size alone, since nothing in a sample says which
-    plan it was read under — see REBASE_DROP_PP for what separates one from the
-    rounding steps.
+    percentage against the new allowance and leaves resets_at where it was, so a
+    peak, a fill span or a rate taken across the fall describes neither quota.
 
-    *samples* must be in ts order. Always at least one stretch, so a caller can
-    enumerate the result without checking for the ordinary window.
+    Both halves are required, because neither is evidence on its own. Readings
+    fall past REBASE_DROP_PP without any plan change — two machines reading one
+    account quota minutes out of step fall and recover, and six of the eight
+    falls that size on the merged corpus had no change behind them. A change on
+    its own is not evidence either: nothing in a sample names the plan it was
+    read under, and a window that opened after the switch never fell.
+
+    *samples* must be in ts order and *changes* sorted. An account with no
+    recorded plan history has no changes and is never cut, which is what there
+    is no evidence for rather than a guess at it. Always at least one stretch,
+    so a caller can enumerate the result without checking for the ordinary
+    window.
     """
     stretches: list[list[dict]] = [[]]
     for s in samples:
-        prev = stretches[-1][-1]["used_pct"] if stretches[-1] else None
-        if prev is not None and prev - s["used_pct"] > REBASE_DROP_PP:
+        prev = stretches[-1][-1] if stretches[-1] else None
+        if (
+            prev is not None
+            and prev["used_pct"] - s["used_pct"] > REBASE_DROP_PP
+            and _change_between(changes, prev["ts"], s["ts"])
+        ):
             stretches.append([])
         stretches[-1].append(s)
     return stretches

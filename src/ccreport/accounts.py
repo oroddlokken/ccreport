@@ -110,6 +110,20 @@ class AccountTimeline:
         i = self._index_at(when)
         return self._tiers[i] if i >= 0 else None
 
+    def tier_changes(self) -> list[float]:
+        """When the effective tier moved, oldest first.
+
+        The instants a fill curve may be cut at: a plan change rebases the quota
+        under an unchanged reset time, and nothing in a rate-limit sample says
+        it happened. An event that carried the previous tier forward is no
+        change, so a render that caught an empty blob does not become one.
+        """
+        moved: list[float] = []
+        for i, tier in enumerate(self._tiers):
+            if i and tier != self._tiers[i - 1]:
+                moved.append(self._ts[i])
+        return moved
+
     def uuid_at(self, when: datetime) -> str | None:
         """The account uuid in force at *when*, None before the first event.
 
