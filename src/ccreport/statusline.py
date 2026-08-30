@@ -88,7 +88,9 @@ Other environment variables:
   CCQUOTA_WARN                              — its warn percentage, rendered before the stop one
   CCQUOTA_STOP_SESSION, CCQUOTA_WARN_SESSION,
   CCQUOTA_STOP_WEEK, CCQUOTA_WARN_WEEK      — lines for the 5-hour and weekly windows alone,
-                                              each rendered after the global pair as S or W
+                                              each rendered after the global pair as S or W;
+                                              with both set and no Sonnet or scoped reading,
+                                              the pair governs nothing and is dropped
   CLAUDE_CODE_PACE_DAYS                     — pace window in days (1-7, default 7)
   CF_BADGE                                  — badge text after the model name, rendered cyan
                                               (set to CF/CO by the cf/co wrappers; legacy
@@ -1820,8 +1822,11 @@ def _quota_lines(warn: float | None, stop: float) -> tuple[list[_QuotaLine], boo
         window_stop, stop_ok = _quota_override(stop_env, stop) if tag else (stop, True)
         if not (warn_ok and stop_ok) or window_stop is None:
             return [], False
-        overridden = tag if (window_warn, window_stop) != (warn, stop) else ""
-        out.append(_QuotaLine(overridden, window_warn, window_stop, key))
+        # Set, not different: ccap derives a warn ten under the stop, the same
+        # gap the default pair has, so `-s 90` lands on 80/90 and a window
+        # tagged by difference alone would hide the flag that capped it.
+        capped = any(os.environ.get(name, "").strip() for name in (warn_env, stop_env))
+        out.append(_QuotaLine(tag if capped else "", window_warn, window_stop, key))
     return out, True
 
 
@@ -1843,17 +1848,23 @@ def _quota_severity(usage: dict, lines: list[_QuotaLine]) -> int:
     return worst
 
 
-def _quota_label(warn: float | None, stop: float, lines: list[_QuotaLine]) -> str:
-    parts = [f"Q:{warn:g}/{stop:g}" if warn is not None else f"Q:{stop:g}"]
-    for tag, window_warn, window_stop, _ in lines:
-        if not tag:
-            continue
-        parts.append(
-            f"{tag}{window_warn:g}/{window_stop:g}"
-            if window_warn is not None
-            else f"{tag}{window_stop:g}",
-        )
-    return " ".join(parts)
+def _quota_pair(prefix: str, warn: float | None, stop: float) -> str:
+    return f"{prefix}{warn:g}/{stop:g}" if warn is not None else f"{prefix}{stop:g}"
+
+
+def _quota_label(warn: float | None, stop: float, lines: list[_QuotaLine], usage: dict) -> str:
+    """The armed lines, with the global pair dropped where it governs nothing.
+
+    Sonnet and scoped answer to the global pair and carry no tag of their own,
+    so it stays on screen while either reports a percent. Capping both tagged
+    windows on a plan that reports neither leaves the pair governing nothing,
+    and it goes.
+    """
+    tagged = [line for line in lines if line.tag]
+    fallback_read = any(not line.tag and _pct_str(usage, line.key) for line in lines)
+    parts = [] if tagged and not fallback_read else [_quota_pair("", warn, stop)]
+    parts += [_quota_pair(line.tag, line.warn, line.stop) for line in tagged]
+    return "Q:" + " ".join(parts)
 
 
 def _render_quota_guard(usage: dict) -> str:
@@ -1872,7 +1883,7 @@ def _render_quota_guard(usage: dict) -> str:
     lines, ok = _quota_lines(warn, stop)
     if not ok:
         return _c("0;31", "Q:!")
-    label = _quota_label(warn, stop, lines)
+    label = _quota_label(warn, stop, lines, usage)
     severity = _quota_severity(usage, lines)
     if severity == 2:
         return _c("0;31", label)

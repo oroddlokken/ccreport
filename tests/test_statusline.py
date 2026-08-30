@@ -2314,11 +2314,35 @@ class TestQuotaGuardSegment:
         monkeypatch.setenv("CCQUOTA_STOP_SESSION", "99")
         monkeypatch.setenv("CCQUOTA_STOP_WEEK", "80")
         monkeypatch.setenv("CCQUOTA_WARN_WEEK", "70")
-        assert self._plain(self._segment(monkeypatch, warn="85")) == "Q:85/95 S85/99 W70/80"
+        segment = self._segment(monkeypatch, warn="85", sonnet_percent="30")
+        assert self._plain(segment) == "Q:85/95 S85/99 W70/80"
 
-    def test_a_window_on_the_global_pair_adds_nothing(self, monkeypatch):
+    def test_a_window_capped_at_the_global_numbers_still_tags(self, monkeypatch):
+        """ccap derives a warn ten under the stop, which is the default gap, so
+        `-s 90` lands on the global pair and would otherwise vanish."""
         monkeypatch.setenv("CCQUOTA_STOP_WEEK", "95")
-        assert self._plain(self._segment(monkeypatch, warn="85")) == "Q:85/95"
+        monkeypatch.setenv("CCQUOTA_WARN_WEEK", "85")
+        segment = self._segment(monkeypatch, warn="85", sonnet_percent="30")
+        assert self._plain(segment) == "Q:85/95 W85/95"
+
+    def test_the_global_pair_goes_when_it_governs_nothing(self, monkeypatch):
+        """Both tagged windows capped and no Sonnet or scoped reading leaves the
+        pair applying to no window this plan reports."""
+        monkeypatch.setenv("CCQUOTA_STOP_SESSION", "99")
+        monkeypatch.setenv("CCQUOTA_STOP_WEEK", "80")
+        assert self._plain(self._segment(monkeypatch, warn="85")) == "Q:S85/99 W85/80"
+
+    def test_a_sonnet_reading_keeps_the_global_pair(self, monkeypatch):
+        monkeypatch.setenv("CCQUOTA_STOP_SESSION", "99")
+        monkeypatch.setenv("CCQUOTA_STOP_WEEK", "80")
+        segment = self._segment(monkeypatch, warn="85", scoped_percent="4")
+        assert self._plain(segment).startswith("Q:85/95 S85/99")
+
+    def test_one_flag_alone_keeps_the_global_pair(self, monkeypatch):
+        """The uncapped window still answers to it, so it stays whatever else
+        the plan reports."""
+        monkeypatch.setenv("CCQUOTA_STOP_SESSION", "99")
+        assert self._plain(self._segment(monkeypatch, warn="85")) == "Q:85/95 S85/99"
 
     def test_a_raised_stop_keeps_its_window_out_of_the_red(self, monkeypatch):
         monkeypatch.setenv("CCQUOTA_STOP_WEEK", "99")
