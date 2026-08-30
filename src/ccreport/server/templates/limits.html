@@ -43,7 +43,7 @@
       {% for row in group.rows %}
       {% set inst = row.instance %}
       <tr>
-        <td><a href="/limits/{{ group.window | urlencode }}/{{ row.key }}?model={{ (inst.model or '') | urlencode }}&amp;account={{ row.account | urlencode }}">{{ inst.resets_at | when }}</a></td>
+        <td><a href="/limits/{{ group.window | urlencode }}/{{ row.key }}?model={{ (inst.model or '') | urlencode }}&amp;account={{ row.account | urlencode }}&amp;stretch={{ row.stretch }}">{{ inst.resets_at | when }}{% if inst.rebased %}<span title="the quota was rebased here; the rows above filled a different allowance">&dagger;</span>{% endif %}</a></td>
         {% if group.scoped %}<td>{{ inst.model or "—" }}</td>{% endif %}
         <td>{{ row.account }}</td>
         <td class="num">{{ "%.1f" | format(inst.peak) }}%{% if inst.hit_limit %} <span class="hit">hit</span>{% endif %}</td>

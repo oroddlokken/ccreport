@@ -45,6 +45,16 @@ class WindowRow:
         """The path segment that opens this window's own page."""
         return f"{int(self.instance.resets_at)}"
 
+    @property
+    def stretch(self) -> int:
+        """Which fill curve under that reset, for the query string beside it.
+
+        In the query rather than the path so a link written before a rebase
+        existed still opens the stretch that opened the window, which is the
+        one it named.
+        """
+        return self.instance.stretch
+
 
 @dataclass
 class WindowGroup:
@@ -112,24 +122,34 @@ def _merged_instances(
     Samples arrive in ts order, so each instance's own list is already in fill
     order however many machines contributed to it, and the machine list is in
     the order each was first heard from.
+
+    A group is then cut into stretches the way `windows.window_instances` cuts
+    one machine's: a plan change restarts the percentage under an unchanged
+    reset time, and a curve drawn across that fall belongs to neither quota. The
+    machines are counted per stretch rather than per group, because the column
+    says who reported a reading of the row it sits on.
     """
-    by_key: dict[tuple, tuple[windows.WindowInstance, list[str]]] = {}
+    by_key: dict[tuple, list[dict]] = {}
     for sample in samples:
         if windows.implausible_reset(sample):
             continue
         account = _account_of(sample, aliases)
         key = (account, sample["window"], sample["model"],
                windows.rl_window_key(sample["resets_at"]))
-        entry = by_key.get(key)
-        if entry is None:
-            entry = by_key[key] = (
-                windows.WindowInstance(key[1], key[2], key[3], []), [],
-            )
-        instance, machines = entry
-        instance.samples.append(sample)
-        if sample["machine"] not in machines:
-            machines.append(sample["machine"])
-    return [(key[0], inst, machines) for key, (inst, machines) in by_key.items()]
+        by_key.setdefault(key, []).append(sample)
+    merged = []
+    for (account, window, model, reset), grouped in by_key.items():
+        for i, stretch in enumerate(windows.rebase_stretches(grouped)):
+            machines: list[str] = []
+            for sample in stretch:
+                if sample["machine"] not in machines:
+                    machines.append(sample["machine"])
+            merged.append((
+                account,
+                windows.WindowInstance(window, model, reset, stretch, i),
+                machines,
+            ))
+    return merged
 
 
 def _spend_indexes(
@@ -224,10 +244,15 @@ def _instance_extra(
     return answer
 
 
-def _row_order(row: WindowRow) -> tuple[int, str, float, str, str]:
-    """`windows.instance_order` with the reset reversed, then the account."""
-    rank, name, resets_at, model = windows.instance_order(row.instance)
-    return (rank, name, -resets_at, model, row.account)
+def _row_order(row: WindowRow) -> tuple[int, str, float, int, str, str]:
+    """`windows.instance_order` with the reset and the stretch reversed, then the account.
+
+    The stretch reverses with the reset it sits under, for the reason the reset
+    does: where a plan change split one window in two, the curve filling now is
+    the one a page is opened for.
+    """
+    rank, name, resets_at, model, stretch = windows.instance_order(row.instance)
+    return (rank, name, -resets_at, -stretch, model, row.account)
 
 
 def _rows(conn, samples: list[dict], now: float) -> list[WindowRow]:
@@ -321,7 +346,8 @@ def cached_build(database: db.Database, days: int, now: datetime | None = None) 
 
 
 def cached_window(database: db.Database, window: str, resets_at: float, model: str | None,
-                  account: str, now: datetime | None = None) -> WindowView:
+                  account: str, stretch: int = 0,
+                  now: datetime | None = None) -> WindowView:
     """build_window(), held the way `dashboard.cached_detail` holds an entity page.
 
     Keyed on the reset `windows.rl_window_key` rounds to rather than on the
@@ -332,10 +358,11 @@ def cached_window(database: db.Database, window: str, resets_at: float, model: s
     """
     conn = database.connect()
     now = now or datetime.now(tz=UTC).astimezone()
-    key = (str(database.path), window, windows.rl_window_key(resets_at), model, account)
+    key = (str(database.path), window, windows.rl_window_key(resets_at), model, account,
+           stretch)
     return _WINDOW_CACHE.get(
         key, dashboard.cache_stamp(conn, now),
-        lambda: build_window(conn, window, resets_at, model, account, now),
+        lambda: build_window(conn, window, resets_at, model, account, stretch, now),
     )
 
 
@@ -484,14 +511,19 @@ def _charts(merged: list[reports.MergedRecord], row: WindowRow,
 
 def build_window(
     conn, window: str, resets_at: float, model: str | None, account: str,
-    now: datetime | None = None,
+    stretch: int = 0, now: datetime | None = None,
 ) -> WindowView:
     """One window instance's page.
 
+    *stretch* picks the fill curve where a plan change split the reset time in
+    two; 0 is the one that opened the window, which is what a link written
+    before the split named.
+
     Raises:
-        LookupError: no stored sample describes that window. The URL named a
-            window this server has never been pushed a reading of, and an empty
-            page would read as a window nobody used.
+        LookupError: no stored sample describes that window, or none describes
+            that stretch of it. The URL named a window this server has never
+            been pushed a reading of, and an empty page would read as a window
+            nobody used.
     """
     now = now or datetime.now(tz=UTC).astimezone()
     reset = windows.rl_window_key(resets_at)
@@ -507,7 +539,10 @@ def build_window(
     ]
     if not wanted:
         raise LookupError(window)
-    [row] = _rows(conn, wanted, now.timestamp())
+    rows = [r for r in _rows(conn, wanted, now.timestamp()) if r.instance.stretch == stretch]
+    if not rows:
+        raise LookupError(window)
+    [row] = rows
     axis, first, step = _axis(row.instance, now.timestamp())
     merged = _window_records(conn, row, first, step)
     total = sum(item.record.cost() for item in merged)

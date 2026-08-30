@@ -103,6 +103,17 @@ LIMIT_WINDOW_SPAN_S = {
 # past this the peak counts a rise the spend columns never priced.
 PARTIAL_OPENING_PP = 5.0
 
+InstanceKey = tuple[str, str | None, float, int]
+"""What identifies one fill curve in a report: WindowInstance.key's shape."""
+
+# How far a reading must fall within one reset time before it reads as the quota
+# being rebased rather than a rounding step: a plan change restarts the
+# percentage against the new allowance without moving resets_at, so the samples
+# either side of it measure different quotas. Every drop in the stored history is
+# exactly one point, the step the write gate's whole-percent rule leaves room
+# for, bar a ten-point fall to zero on the day a plan changed.
+REBASE_DROP_PP = 5.0
+
 
 @dataclass
 class WindowInstance:
@@ -118,6 +129,8 @@ class WindowInstance:
     model: str | None
     resets_at: float
     samples: list[dict]
+    stretch: int = 0
+    """Which fill curve under this reset time, 0 for the one that opened it."""
 
     @property
     def peak(self) -> float:
@@ -159,9 +172,19 @@ class WindowInstance:
         return round(self.peak) >= 100
 
     @property
-    def key(self) -> tuple[str, str | None, float]:
-        """What window_instances grouped on, and so unique across a report."""
-        return (self.window, self.model, self.resets_at)
+    def key(self) -> InstanceKey:
+        """What window_instances grouped on, and so unique across a report.
+
+        The stretch is in it because a rebase puts two of these under one reset
+        time, and a caller keying spend on the first three would price one of
+        them over the other's span.
+        """
+        return (self.window, self.model, self.resets_at, self.stretch)
+
+    @property
+    def rebased(self) -> bool:
+        """Whether an earlier stretch filled a different allowance under this reset."""
+        return self.stretch > 0
 
     @property
     def last_ts(self) -> float:
@@ -270,28 +293,55 @@ def window_instances(samples: list[dict]) -> list[WindowInstance]:
     keep the float they were stored with; only the instance's identity is
     rounded, so nothing here rewrites what was recorded.
     """
-    by_key: dict[tuple[str, str | None, float], WindowInstance] = {}
+    by_key: dict[tuple[str, str | None, float], list[dict]] = {}
     for s in samples:
         resets = rl_window_key(s["resets_at"])
-        key = (s["window"], s["model"], resets)
-        inst = by_key.get(key)
-        if inst is None:
-            inst = by_key[key] = WindowInstance(s["window"], s["model"], resets, [])
-        inst.samples.append(s)
-    return list(by_key.values())
+        by_key.setdefault((s["window"], s["model"], resets), []).append(s)
+    return [
+        WindowInstance(window, model, resets, stretch, i)
+        for (window, model, resets), grouped in by_key.items()
+        for i, stretch in enumerate(rebase_stretches(grouped))
+    ]
 
 
-def instance_order(inst: WindowInstance) -> tuple[int, str, float, str]:
+def rebase_stretches(samples: list[dict]) -> list[list[dict]]:
+    """*samples* cut wherever the reading fell far enough to be a new quota.
+
+    One reset time can cover two fill curves: a plan change restarts the
+    percentage against the new allowance and leaves resets_at where it was, so
+    a peak, a fill span or a rate taken across the fall describes neither
+    quota. The cut is by drop size alone, since nothing in a sample says which
+    plan it was read under — see REBASE_DROP_PP for what separates one from the
+    rounding steps.
+
+    *samples* must be in ts order. Always at least one stretch, so a caller can
+    enumerate the result without checking for the ordinary window.
+    """
+    stretches: list[list[dict]] = [[]]
+    for s in samples:
+        prev = stretches[-1][-1]["used_pct"] if stretches[-1] else None
+        if prev is not None and prev - s["used_pct"] > REBASE_DROP_PP:
+            stretches.append([])
+        stretches[-1].append(s)
+    return stretches
+
+
+def instance_order(inst: WindowInstance) -> tuple[int, str, float, str, int]:
     """Sort key: window type as printed, then chronological, model breaking ties.
 
     Applied once, before a table and the JSON split, so the two agree on the
     order — the model tiebreak is what makes it total, since two scoped models'
     weekly windows reset at the same moment. An unlabelled window sorts after
     all four and by name, which is also the order window_types prints them.
+
+    The stretch comes last, so a rebased window prints under the one it
+    restarted: the two share every field before it.
     """
     known = inst.window in LIMIT_WINDOWS
     rank = LIMIT_WINDOWS.index(inst.window) if known else len(LIMIT_WINDOWS)
-    return (rank, "" if known else inst.window, inst.resets_at, inst.model or "")
+    return (
+        rank, "" if known else inst.window, inst.resets_at, inst.model or "", inst.stretch,
+    )
 
 
 def window_types(instances: list[WindowInstance]) -> list[str]:
@@ -560,7 +610,7 @@ def instance_spend(
 
 
 def group_cache_hit(
-    instances: list[WindowInstance], spends: dict[tuple[str, str | None, float], WindowSpend],
+    instances: list[WindowInstance], spends: dict[InstanceKey, WindowSpend],
 ) -> float | None:
     """A group's own cache-hit share: its total reads over its total input.
 

@@ -118,6 +118,104 @@ class TestTheWindowList:
         assert gated.get("/limits").status_code == 403
 
 
+WEEK_RESET = (NOW + timedelta(hours=1)).replace(second=0, microsecond=0).timestamp()
+"""One week window, resetting an hour from now, that a plan change rebased."""
+
+
+@pytest.fixture
+def rebased(app):
+    """A week window two machines watched, whose quota was rebased part-way.
+
+    Laptop and Desk read the same quota a few minutes out of step, so the merged
+    series carries a one-point dip that is interleaving and not a rebase. Desk
+    stops reporting at the change, which is what the machine column has to
+    notice.
+    """
+    client = TestClient(app)
+    for machine, label, pcts in (
+        ("laptop-1", "Laptop", [(8.0, 10.0), (6.0, 13.0), (4.0, 14.0),
+                                (3.0, 0.0), (1.5, 5.0)]),
+        ("desk-1", "Desk", [(7.0, 11.0), (5.0, 12.0)]),
+    ):
+        token = sf.mint_for(app, machine, label)
+        client.post("/v1/ingest", headers=sf.auth(token), json=sf.sample_batch([
+            sf.sample(ts=_ts(ago), window="week", used_pct=pct, resets_at=WEEK_RESET)
+            for ago, pct in pcts
+        ], label=label))
+    return app
+
+
+class TestARebasedWindow:
+    """A plan change restarts the percentage under an unchanged reset time."""
+
+    def _week(self, app):
+        groups = {g.window: g for g in limits.build(app.state.db.connect(), 30, NOW).groups}
+        return groups["week"].rows
+
+    def test_the_merged_window_is_two_rows(self, rebased):
+        rows = self._week(rebased)
+        assert [(r.instance.stretch, r.instance.peak) for r in rows] == [
+            (1, 5.0),
+            (0, 14.0),
+        ]
+
+    def test_the_interleaved_dip_is_not_a_second_rebase(self, rebased):
+        """Two machines a few minutes out of step read 13 then 12 of one quota."""
+        opened = next(r for r in self._week(rebased) if r.instance.stretch == 0)
+        assert [s["used_pct"] for s in opened.instance.samples] == [
+            10.0, 11.0, 13.0, 12.0, 14.0,
+        ]
+
+    def test_the_live_stretch_fills_from_the_rebase(self, rebased):
+        live = next(r for r in self._week(rebased) if r.instance.stretch == 1)
+        assert live.instance.opening_pct == 0.0
+        assert live.instance.first_ts == pytest.approx(_ts(3.0))
+        assert live.instance.fill_s == pytest.approx(1.5 * 3600)
+
+    def test_the_machines_are_counted_per_stretch(self, rebased):
+        """Desk stopped reporting at the change and is no part of the live row."""
+        rows = {r.instance.stretch: r for r in self._week(rebased)}
+        assert sorted(rows[0].machines) == ["Desk", "Laptop"]
+        assert rows[1].machines == ["Laptop"]
+
+    def test_each_stretch_is_priced_over_its_own_span(self, rebased):
+        """The fixture bills one record three hours ago, inside the live stretch.
+
+        Folded, both curves would have carried it. Split, the stretch that ran
+        from eight hours ago to four covers no record and prices at nothing.
+        """
+        rows = {r.instance.stretch: r for r in self._week(rebased)}
+        assert rows[0].spend.usd == 0.0
+        assert rows[1].spend.usd == pytest.approx(0.0675)
+
+    def test_the_list_marks_the_rebased_row(self, rebased):
+        body = TestClient(rebased).get("/limits").text
+        assert "&dagger;" in body or "†" in body
+        assert "stretch=1" in body
+
+    def test_each_stretch_opens_its_own_page(self, rebased):
+        client = TestClient(rebased)
+        opened = client.get(
+            f"/limits/week/{int(WEEK_RESET)}?model=&account=me@example.net&stretch=0")
+        live = client.get(
+            f"/limits/week/{int(WEEK_RESET)}?model=&account=me@example.net&stretch=1")
+        assert opened.status_code == 200
+        assert live.status_code == 200
+        assert "14.0%" in opened.text
+        assert "5.0%" in live.text
+
+    def test_a_stretch_nobody_pushed_is_a_404(self, rebased):
+        resp = TestClient(rebased).get(
+            f"/limits/week/{int(WEEK_RESET)}?model=&account=me@example.net&stretch=7")
+        assert resp.status_code == 404
+
+    def test_a_link_carrying_no_stretch_opens_the_one_that_opened_the_window(self, rebased):
+        """Every link written before the split named the curve numbered 0."""
+        body = TestClient(rebased).get(
+            f"/limits/week/{int(WEEK_RESET)}?model=&account=me@example.net").text
+        assert "14.0%" in body
+
+
 class TestTheExtraColumn:
     """Real billed credits, the one figure that is not an API-price valuation."""
 
@@ -309,21 +407,21 @@ class TestCachedWindows:
         assert limits.cached_build(app.state.db, dashboard.DEFAULT_RANGE) is view
 
     def test_a_second_render_of_one_window_reuses_the_first(self, app):
-        first = limits.cached_window(app.state.db, "session", RESET, None, "me@example.net", NOW)
+        first = limits.cached_window(app.state.db, "session", RESET, None, "me@example.net", now=NOW)
         assert limits.cached_window(
-            app.state.db, "session", RESET, None, "me@example.net", NOW,
+            app.state.db, "session", RESET, None, "me@example.net", now=NOW,
         ) is first
 
     def test_a_reset_a_rounding_apart_is_the_same_page(self, app):
         """Stored jitter would otherwise build the window once per link."""
-        first = limits.cached_window(app.state.db, "session", RESET, None, "me@example.net", NOW)
+        first = limits.cached_window(app.state.db, "session", RESET, None, "me@example.net", now=NOW)
         assert limits.cached_window(
-            app.state.db, "session", RESET + 20, None, "me@example.net", NOW,
+            app.state.db, "session", RESET + 20, None, "me@example.net", now=NOW,
         ) is first
 
     def test_a_window_nobody_pushed_stores_nothing(self, app):
         with pytest.raises(LookupError):
-            limits.cached_window(app.state.db, "session", 1.0, None, "nobody", NOW)
+            limits.cached_window(app.state.db, "session", 1.0, None, "nobody", now=NOW)
         assert len(limits._WINDOW_CACHE) == 0
 
     def test_the_oldest_window_goes_at_the_bound(self, app, monkeypatch):
@@ -334,11 +432,11 @@ class TestCachedWindows:
                       account_uuid="acct-2", account_label="other@example.net"),
         ]))
         monkeypatch.setattr(limits._WINDOW_CACHE, "limit", 1)
-        first = limits.cached_window(app.state.db, "session", RESET, None, "me@example.net", NOW)
-        limits.cached_window(app.state.db, "session", RESET, None, "other@example.net", NOW)
+        first = limits.cached_window(app.state.db, "session", RESET, None, "me@example.net", now=NOW)
+        limits.cached_window(app.state.db, "session", RESET, None, "other@example.net", now=NOW)
         assert len(limits._WINDOW_CACHE) == 1
         assert limits.cached_window(
-            app.state.db, "session", RESET, None, "me@example.net", NOW,
+            app.state.db, "session", RESET, None, "me@example.net", now=NOW,
         ) is not first
 
     def test_the_window_page_serves_the_cached_view(self, app, client):

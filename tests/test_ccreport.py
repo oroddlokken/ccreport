@@ -2492,7 +2492,8 @@ class TestWindowInstances:
         assert [i.window for i in _instances()] == ["session", "week"]
 
     def test_the_peak_is_the_fullest_reading_not_the_last(self):
-        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 88.4, 40.0])
+        """The dip stays under REBASE_DROP_PP: a larger one is a rebase, not a reading."""
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 88.4, 85.0])
         assert _instances()[0].peak == 88.4
 
     def test_the_fill_time_runs_to_the_peak_and_not_past_it(self):
@@ -2515,6 +2516,61 @@ class TestWindowInstances:
         """The write gate rounds, so 99.6 is the last sample a full window leaves."""
         _seed_samples("session", _W1_RESET, _W1_START, [2.0, peak])
         assert _instances()[0].hit_limit is hit
+
+
+class TestRebasedWindows:
+    """A plan change restarts the percentage and leaves the reset time alone."""
+
+    OBSERVED = [4.0, 10.0, 0.0, 2.0, 5.0]
+    """The 2026-08-30 downgrade's shape: a week window at 10% reading 0% next."""
+
+    def test_a_rebase_splits_one_reset_into_two_stretches(self):
+        _seed_samples("week", _W1_RESET, _W1_START, self.OBSERVED)
+        assert [(i.stretch, i.peak, len(i.samples)) for i in _instances()] == [
+            (0, 10.0, 2),
+            (1, 5.0, 3),
+        ]
+
+    def test_a_one_point_dip_is_a_rounding_step_and_not_a_rebase(self):
+        """Every drop in the stored history bar the rebase is exactly one point."""
+        _seed_samples("week", _W1_RESET, _W1_START, [4.0, 10.0, 9.0, 11.0])
+        (inst,) = _instances()
+        assert inst.peak == 11.0
+        assert inst.rebased is False
+
+    def test_the_live_stretch_fills_from_the_rebase_and_not_from_the_opening(self):
+        """Folded, the fill span ran to the old quota's peak and stopped there."""
+        _seed_samples("week", _W1_RESET, _W1_START, self.OBSERVED)
+        live = _instances()[1]
+        assert live.first_ts == _W1_START + 2 * 3600
+        assert live.fill_s == 2 * 3600.0
+        assert live.burn_pph == 2.5
+
+    def test_the_stretch_that_opened_the_window_is_the_unmarked_one(self):
+        _seed_samples("week", _W1_RESET, _W1_START, self.OBSERVED)
+        opened, live = _instances()
+        assert opened.rebased is False
+        assert live.rebased is True
+
+    def test_a_rebased_stretch_opens_at_its_own_reading_and_is_not_partial(self):
+        """opening_pct is the new quota's first reading, which a downgrade makes 0."""
+        _seed_samples("week", _W1_RESET, _W1_START, self.OBSERVED)
+        live = _instances()[1]
+        assert live.opening_pct == 0.0
+        assert live.partial is False
+
+    def test_the_two_stretches_key_apart_so_each_is_priced_over_its_own_span(self):
+        """One key for both would price the live stretch over the old one's span."""
+        _seed_samples("week", _W1_RESET, _W1_START, self.OBSERVED)
+        opened, live = _instances()
+        assert opened.key != live.key
+        assert live.key == ("week", None, _W1_RESET, 1)
+
+    def test_an_ordinary_window_is_one_stretch(self):
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
+        (inst,) = _instances()
+        assert inst.stretch == 0
+        assert inst.key == ("session", None, _W1_RESET, 0)
 
 
 class TestWindowBurn:
@@ -3029,6 +3085,8 @@ class TestCmdLimits:
                 "unseen_seconds": 0.0,
                 "account": "me@work.example",
                 "limit_tier": "default_claude_max_5x",
+                "stretch": 0,
+                "rebased": False,
             }
         ]
 
@@ -3251,6 +3309,20 @@ class TestLimitsRendering:
         assert "93.0%*" in out
         assert "first sampled at 77.0%" in out
         assert "Peak counts that rise" in out
+
+    def test_a_rebased_window_is_daggered_and_read_out(self, monkeypatch):
+        _seed_samples("week", _W1_RESET, _W1_START, [4.0, 10.0, 0.0, 2.0, 5.0])
+        out = self._reflowed(monkeypatch, now="2026-06-15T13:01")
+        assert "†" in out
+        assert "quota rebased at" in out
+        assert "filled a different allowance" in out
+        # Both curves are rows: the old peak is not lost to the new one.
+        assert "10.0%" in out
+        assert "5.0%" in out
+
+    def test_a_window_that_never_rebased_carries_no_dagger(self, monkeypatch):
+        _seed_samples("week", _W1_RESET, _W1_START, [4.0, 10.0, 9.0])
+        assert "†" not in self._render(monkeypatch, now="2026-06-15T13:01")
 
     def test_a_window_watched_from_the_start_carries_no_mark(self, monkeypatch):
         _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])

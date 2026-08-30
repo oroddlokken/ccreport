@@ -95,6 +95,7 @@ from ccreport.windows import (
 from ccreport.windows import (
     LIMIT_WINDOWS,
     ExtraIndex,
+    InstanceKey,
     SpendIndex,
     WindowInstance,
     WindowSpend,
@@ -2375,7 +2376,7 @@ def _instance_spend(
 
 def _load_instance_spend(
     instances: list[WindowInstance], now: float,
-) -> dict[tuple[str, str | None, float], WindowSpend]:
+) -> dict[InstanceKey, WindowSpend]:
     """Price every instance, keyed the way window_instances grouped them.
 
     One corpus load, bounded to the span the instances cover: a report of the
@@ -2497,6 +2498,8 @@ def _limits_entry(
         "unseen_seconds": inst.unseen_s,
         "account": accounts.label_at(when),
         "limit_tier": accounts.tier_at(when),
+        "stretch": inst.stretch,
+        "rebased": inst.rebased,
     }
 
 
@@ -2528,6 +2531,23 @@ def _partial_note(inst: WindowInstance) -> str | None:
     )
 
 
+def _rebase_note(inst: WindowInstance) -> str | None:
+    """The caption line for a stretch that filled a quota the ones before it did not.
+
+    A plan change restarts the percentage without moving the reset time, so one
+    reset covers two fill curves and the table prints a row for each. The note
+    dates the split, which is the only place the rows differ that a reader
+    cannot see in the columns.
+    """
+    if not inst.rebased:
+        return None
+    named = f"{short_model(inst.model)} " if inst.model else ""
+    return (
+        f"† {named}{_fmt_epoch(inst.resets_at)}: quota rebased at "
+        f"{_fmt_epoch(inst.first_ts)} — the rows above it filled a different allowance"
+    )
+
+
 def _group_per_pp(group: list[WindowInstance], spends: dict) -> float | None:
     """The group's own exchange rate: its total spend over its total rise.
 
@@ -2544,7 +2564,7 @@ def _group_per_pp(group: list[WindowInstance], spends: dict) -> float | None:
 def report_limits(
     instances: list[WindowInstance],
     accounts: AccountTimeline,
-    spends: dict[tuple[str, str | None, float], WindowSpend],
+    spends: dict[InstanceKey, WindowSpend],
 ) -> None:
     """Print one table per window type, each summarized by its own footer.
 
@@ -2564,7 +2584,10 @@ def report_limits(
     for window in window_types(instances):
         group = [i for i in instances if i.window == window]
         scoped = window == "scoped"
-        notes = [n for n in (_partial_note(i) for i in group) if n]
+        notes = [
+            n for i in group
+            for n in (_rebase_note(i), _partial_note(i)) if n
+        ]
         table = Table(
             title=f"{_LIMIT_WINDOW_LABELS.get(window, window)} — {len(group)} window(s)",
             title_style="bold", box=box.ROUNDED, expand=False, show_lines=False,
@@ -2590,7 +2613,7 @@ def report_limits(
             when = _as_local(inst.first_ts)
             tier = accounts.tier_at(when)
             spend = spends[inst.key]
-            row: list = [_fmt_epoch(inst.resets_at)]
+            row: list = [_fmt_epoch(inst.resets_at) + ("†" if inst.rebased else "")]
             if scoped:
                 row.append(short_model(inst.model) if inst.model else _ABSENT)
             row += [

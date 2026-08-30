@@ -1411,12 +1411,28 @@ before the report path, like `overrides` and `adopt`: the window instances bound
 the load to the span they cover, and the default report's unbounded one would be
 thrown away.
 
-**Window instance** = `(window, model, resets_at)`, with `resets_at` bucketed to
+**Window instance** = `(window, model, resets_at, stretch)`, with `resets_at` bucketed to
 the whole minute by `cache_db.rl_window_key()`. Samples sharing a reset time are
 readings of one 5-hour or 7-day span filling up, which is what makes a peak and a
 fill time mean anything; the model is in the key because the scoped limit follows
 whichever model it is scoped to, and which model that is can change inside one
 week.
+
+A plan change restarts the percentage against the new allowance and leaves
+`resets_at` where it was, so one reset time can hold two fill curves. The
+instance key carries a **stretch** index for that reason: `rebase_stretches()`
+cuts a group wherever a reading falls by more than `REBASE_DROP_PP` (5.0), and
+each cut is a row of its own with its own peak, fill span, rate and priced
+spend.
+
+Below that threshold a fall is a rounding step — every drop in this machine's
+stored history is exactly one point, bar the ten-point fall to zero on
+2026-08-30 when Max 20x became Pro. Nothing in a sample names the plan it was
+read under, so the cut is by drop size alone.
+
+The table daggers the Reset of a stretch a rebase opened and dates the split in
+a caption, so two rows under one reset time read as what they are. `--json`
+carries the index as `stretch` and the flag as `rebased`.
 
 Two writer-side defects the reader has to absorb, both found by running this
 report on real data:
@@ -1452,7 +1468,7 @@ Per instance:
 | Cache | `cache_read ÷ (input + cache_create + cache_read)` over the **fill span**, on the same model family the Spend column is filtered to. Cache reads are the cheapest tokens on the corpus, so the column answers "how much of this window's context was already paid for" and says why two windows with the same peak cost different amounts of quota. Output is left out of the denominator: it is the model's answer, not context that was or was not paid for again. `—` where no record priced the span, for the same reason Spend is — a window with no corpus behind it cached an unknown share, not 0%. The footer's is the group's total reads over its total observed input, not the mean of the rows (`windows.group_cache_hit`). `--json` carries the two counts as `cache_read_tokens` and `observed_input_tokens`, plus the ratio as `cache_hit_share` |
 | Extra | real dollars billed as Extra usage while the window ran, from `extra_usage_snapshots`. Not gated on Hit, and measured over the window's whole span rather than over the fill — see below. `—` where no reading bounds the span, which is unknown and not $0.00; `$0.00` where readings bound it and it did not move. `--json` carries it as `extra_usd` |
 | Hit | `round(peak) >= 100`. Rounded to match the write gate, which only passes a whole-percent move — 99.6 is the last sample a full window can leave behind |
-| Account / Tier | attributed at the instance's **first** sample, via `AccountTimeline.label_at()` / `.tier_at()` — one bisect over the same events, so both answers come off the event in force when the window opened. A window with no tier there is not in the table at all (below) |
+| Account / Tier | attributed at the instance's **first** sample, via `AccountTimeline.label_at()` / `.tier_at()` — one bisect over the same events, so both answers come off the event in force when the window opened. A rebased stretch opens at the change itself, so it names the plan that rebased it rather than the one before. A window with no tier there is not in the table at all (below) |
 
 The spend join takes the full record path (`load_all_records`), not a `SUM` over
 `ccreport_records`: dedup is what makes the number an answer, and summing the
@@ -1515,7 +1531,13 @@ The merge is what the client cannot do. A quota belongs to an **account**, so
 `server/limits.py` groups on (account, window, model, reset) rather than on the
 machine, and two laptops signed into one account contribute readings to one fill
 curve — each drawn as its own trace, with a bucket that machine took no reading
-in left as null rather than 0. Spend, `$/pp` and Cache are the same
+in left as null rather than 0. The merged group is then cut by
+`rebase_stretches` the way one machine's is, and the stretch rides in the query
+string beside the model and the account: a link carrying none opens the curve
+that opened the window, which is the only one a link written before the split
+could have named. Two machines read the same quota minutes out of step, so a
+merged series carries dips that a single one does not — the threshold is what
+tells those from the fall a plan change leaves. Spend, `$/pp` and Cache are the same
 `windows.py` functions the CLI's columns read, over `reports.load` bounded to
 the window spans: the full record path, because a 5-hour window is priced over
 hours and a grouped row has folded the hour away. There is no Extra column —

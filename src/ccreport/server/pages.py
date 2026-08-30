@@ -473,20 +473,23 @@ def limit_windows(request: Request, days: int = Query(default=dashboard.DEFAULT_
 
 @router.get("/limits/{window}/{resets_at}", response_class=HTMLResponse)
 def limit_window(request: Request, window: str, resets_at: float,
-                 model: str = Query(default=""), account: str = Query(default="")):
+                 model: str = Query(default=""), account: str = Query(default=""),
+                 stretch: int = Query(default=0)):
     """One window instance: its fill curve, and the work that drew it.
 
     The model and the account ride in the query string rather than the path.
     Both can carry a slash — an account renamed on the /settings page is
     whatever someone typed — and the reset time is what identifies the window
-    within them.
+    within them. So does the stretch, which a plan change adds under an
+    unchanged reset: a link with none names the curve that opened the window,
+    which is the only one a link written before the split could have meant.
 
     A window nothing was pushed a reading of is a 404, for the reason a mistyped
     period key is: an empty page reads as a window nobody used.
     """
     try:
         view = limits.cached_window(
-            request.app.state.db, window, resets_at, model or None, account,
+            request.app.state.db, window, resets_at, model or None, account, stretch,
         )
     except LookupError as exc:
         raise HTTPException(
