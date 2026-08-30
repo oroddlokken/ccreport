@@ -69,7 +69,7 @@
     // CCREPORT_LOCALE comes from format.js; the legend follows the same rules
     // as every other number on the page.
     const usd = new Intl.NumberFormat(CCREPORT_LOCALE, {
-      style: "currency", currency: "USD", currencyDisplay: "narrowSymbol",
+      style: "currency", currency: "USD", currencyDisplay: "symbol",
     });
     const money = (u, v) => (v == null ? "--" : usd.format(v));
     const count = (u, v) => (v == null ? "--" : new Intl.NumberFormat(CCREPORT_LOCALE).format(v));

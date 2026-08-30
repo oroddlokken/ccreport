@@ -7,8 +7,11 @@
 const CCREPORT_LOCALE = undefined;
 
 document.addEventListener("DOMContentLoaded", function () {
+  // Not narrowSymbol: a locale that puts the symbol last renders USD as a
+  // trailing bare "$", which names no country. "symbol" is "$337.63" in en-US
+  // and "337,63 USD" in nb-NO.
   const usd = new Intl.NumberFormat(CCREPORT_LOCALE, {
-    style: "currency", currency: "USD", currencyDisplay: "narrowSymbol",
+    style: "currency", currency: "USD", currencyDisplay: "symbol",
   });
   const nok = new Intl.NumberFormat(CCREPORT_LOCALE, {
     style: "currency", currency: "NOK", currencyDisplay: "narrowSymbol", maximumFractionDigits: 0,
