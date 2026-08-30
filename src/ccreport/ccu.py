@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ccreport.pricing import WEEK_WINDOW_S, pace_days, window_start_epoch
+from ccreport.pricing import WEEK_WINDOW_S, pace_days, quota_rebase_epoch, window_start_epoch
 
 BAR_WIDTH = 50
 
@@ -210,21 +210,48 @@ def bar(pct: float) -> str:
     return f"{GREEN}{'█' * filled}{DIM}{'░' * (BAR_WIDTH - filled)}{RESET}"
 
 
-def pace_line(actual: float, reset_iso: str, now: float) -> str:
+def week_rebase(reset_iso: str, now: float) -> float | None:
+    """When a plan change restarted this week's quota, None where none did.
+
+    Best-effort around the cache read: a database this dashboard cannot open
+    costs the pace line its cut, never the run. The status line reads the same
+    instant off its own fetch.
+    """
+    try:
+        return quota_rebase_epoch(window_start_epoch(reset_iso, WEEK_WINDOW_S, now), now)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def pace_line(
+    actual: float, reset_iso: str, now: float, *, rebased_at: float | None = None,
+) -> str:
     """How the week's usage compares with the clock: "6d 5h into 7-day window ...".
 
     Expected is the fraction of CLAUDE_CODE_PACE_DAYS elapsed, not of the seven
     the window actually runs: a pace of 5 means the whole quota is meant to be
     gone by Friday, so the bar it is measured against rises faster than time.
+
+    rebased_at is when a plan change restarted the quota under an unchanged
+    reset time. The window then runs from there to the reset, and the line says
+    so, because the percentage beside it is counting that span and not the
+    seven days. The status line's _weekly_pace cuts the same window the same
+    way; these two must not disagree about one reading.
     """
+    reset_epoch = iso_to_epoch(reset_iso)
     week_start = window_start_epoch(reset_iso, WEEK_WINDOW_S, now)
     if week_start is None:
         return ""
+    span = float(WEEK_WINDOW_S)
+    label = "7-day window"
+    if rebased_at is not None and reset_epoch is not None and week_start < rebased_at < reset_epoch:
+        week_start, span = rebased_at, reset_epoch - rebased_at
+        label = "window since the plan changed"
     elapsed = now - week_start
-    if elapsed <= 0 or elapsed > WEEK_WINDOW_S:
+    if elapsed <= 0 or elapsed > span:
         return ""
     pace = pace_days()
-    expected = min(int(elapsed * 100 // (pace * 86400)), 100)
+    expected = min(int(elapsed * 100 * WEEK_WINDOW_S // (span * pace * 86400)), 100)
     delta = int(actual) - expected
 
     el_d, rem = divmod(int(elapsed), 86400)
@@ -239,7 +266,7 @@ def pace_line(actual: float, reset_iso: str, now: float) -> str:
     colour = next((c for threshold, c in _PACE_BANDS if delta > threshold), _PACE_UNDER)
     sign = "+" if delta >= 0 else ""
     return (
-        f"{DIM}{elapsed_str} into 7-day window (pace: {pace}d) — "
+        f"{DIM}{elapsed_str} into {label} (pace: {pace}d) — "
         f"{expected}% expected, \033[{colour}m{sign}{delta}%{RESET}"
     )
 
@@ -303,7 +330,10 @@ def render(data: dict[str, Any], now: float, zone: str) -> list[str]:
         week_reset = _str(data, "week_reset")
         lines.append("")
         lines += section("Current week (all models)", week, week_reset, now, zone)
-        pace = pace_line(week, week_reset, now)
+        pace = pace_line(
+            week, week_reset, now,
+            rebased_at=week_rebase(week_reset, now),
+        )
         if pace:
             lines.append(pace)
 

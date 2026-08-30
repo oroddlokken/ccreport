@@ -924,6 +924,45 @@ class TestAccountTimelineTiers:
     def _at(self, tl, ts):
         return tl.tier_at(dt.datetime.fromtimestamp(ts, UTC))
 
+    def test_a_change_inside_the_span_is_where_the_window_restarted(self):
+        tl = self._tl(
+            (1000.0, None, "default_claude_max_20x"),
+            (2000.0, None, "default_claude_ai"),
+        )
+        assert tl.rebase_within(1500.0, 2500.0) == 2000.0
+
+    def test_the_newest_change_wins_when_the_span_holds_two(self):
+        """The curve on screen began at the last one; the earlier is history."""
+        tl = self._tl(
+            (1000.0, None, "default_claude_max_20x"),
+            (2000.0, None, "default_claude_max_5x"),
+            (3000.0, None, "default_claude_ai"),
+        )
+        assert tl.rebase_within(1500.0, 3500.0) == 3000.0
+
+    def test_a_change_outside_the_span_does_not_cut_it(self):
+        tl = self._tl(
+            (1000.0, None, "default_claude_max_20x"),
+            (2000.0, None, "default_claude_ai"),
+        )
+        assert tl.rebase_within(2500.0, 3500.0) is None
+        assert tl.rebase_within(200.0, 900.0) is None
+
+    def test_a_window_that_ran_on_one_plan_is_never_cut(self):
+        tl = self._tl(
+            (1000.0, None, "default_claude_max_20x"),
+            (2000.0, None, "default_claude_max_20x"),
+        )
+        assert tl.rebase_within(0.0, 5000.0) is None
+
+    def test_an_event_that_recorded_no_tier_is_not_a_change(self):
+        """_carried_tiers carries the reading forward, so a blank blob cuts nothing."""
+        tl = self._tl(
+            (1000.0, None, "default_claude_max_20x"),
+            (2000.0, None, None),
+        )
+        assert tl.rebase_within(0.0, 5000.0) is None
+
     def test_the_tier_in_force_is_the_newest_event_at_or_before(self):
         tl = self._tl(
             (1000.0, "default_claude_max_5x", "default_raven"),

@@ -385,6 +385,95 @@ class TestPaceWindowLabel:
         assert "@5d" in render()
 
 
+class TestPaceAcrossAPlanChange:
+    """A plan change restarts the percentage without moving the reset time.
+
+    The window the reading counts is then the rebase to the reset, not the seven
+    days, and pacing it against the seven reports a session at its ceiling as far
+    under budget — which is what the segment did after a Max 20x to Pro switch.
+    """
+
+    NOW = 1785000000.0
+    RESET = NOW + 2 * 86400        # week_start is five days back
+    REBASE = NOW - 6 * 3600        # the plan changed six hours ago
+
+    @pytest.fixture
+    def render(self):
+        import datetime as dt
+        import re
+
+        def _render(pct="11", rebased_at=None):
+            reset = dt.datetime.fromtimestamp(self.RESET, dt.UTC).isoformat()
+            return re.sub(
+                r"\x1b\[[0-9;]*m",
+                "",
+                sl._weekly_pace(pct, reset, self.NOW, rebased_at=rebased_at),
+            )
+
+        return _render
+
+    def test_without_the_rebase_the_delta_reads_far_under_budget(self, render):
+        assert render() == "5d/7d(2d0h) -60%"
+
+    def test_the_rebase_paces_the_reading_against_what_is_left(self, render):
+        assert render(rebased_at=self.REBASE) == "0d6h/2d6h†(2d0h) +0%"
+
+    def test_a_change_before_the_window_opened_does_not_cut_it(self, render):
+        assert render(rebased_at=self.NOW - 6 * 86400) == "5d/7d(2d0h) -60%"
+
+    def test_a_change_after_the_reset_does_not_cut_it(self, render):
+        assert render(rebased_at=self.RESET + 3600) == "5d/7d(2d0h) -60%"
+
+    def test_the_paced_days_still_scale_a_rebased_window(self, monkeypatch, render):
+        """CLAUDE_CODE_PACE_DAYS means the same fraction of a shorter window."""
+        monkeypatch.setenv("CLAUDE_CODE_PACE_DAYS", "5")
+        assert render(rebased_at=self.REBASE) == "0d6h/2d6h†@5d(2d0h) -5%"
+
+    def test_the_instant_comes_from_the_usage_dict(self):
+        assert sl._rebase_epoch({"tier_changed_at": 1785000000.0}) == 1785000000.0
+        assert sl._rebase_epoch({}) is None
+        assert sl._rebase_epoch({"tier_changed_at": None}) is None
+        assert sl._rebase_epoch({"tier_changed_at": "not a time"}) is None
+
+    def test_the_slow_render_reads_the_change_out_of_the_log(self):
+        from ccreport import cache_db
+
+        acc = {
+            "accountUuid": "uuid-1",
+            "emailAddress": "me@example.net",
+            "organizationUuid": None,
+            "organizationName": None,
+        }
+        assert sl._last_tier_change() is None
+        cache_db.record_account_event(
+            {**acc, "userRateLimitTier": "default_claude_max_20x"}, now=1000.0,
+        )
+        assert sl._last_tier_change() is None
+        cache_db.record_account_event(
+            {**acc, "userRateLimitTier": "default_claude_ai"}, now=2000.0,
+        )
+        assert sl._last_tier_change() == 2000.0
+
+    def test_ccu_cuts_the_same_window(self):
+        """The dashboard and the status line must not disagree about one reading."""
+        import datetime as dt
+        import re
+
+        from ccreport import ccu
+
+        reset = dt.datetime.fromtimestamp(self.RESET, dt.UTC).isoformat()
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", ccu.pace_line(11, reset, self.NOW))
+        cut = re.sub(
+            r"\x1b\[[0-9;]*m",
+            "",
+            ccu.pace_line(11, reset, self.NOW, rebased_at=self.REBASE),
+        )
+        assert "71% expected" in plain
+        assert "into 7-day window" in plain
+        assert "11% expected" in cut
+        assert "into window since the plan changed" in cut
+
+
 class TestScopedWeekCost:
     """The scoped quota spends the week window, so it carries a week cost too.
 

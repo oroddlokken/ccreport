@@ -972,6 +972,27 @@ def _capture_account(memo: dict | None = None) -> None:
         pass
 
 
+def _last_tier_change() -> float | None:
+    """When the plan last changed, or None where the log records no change.
+
+    A change rebases every quota under it without moving a reset time, so this
+    is the instant the percentages on screen started counting from. Read on the
+    slow path and carried in the usage dict: the render path reaches it per
+    frame and must not open the cache to do it.
+
+    Best-effort, like the capture above: an unreadable log costs the segment its
+    dagger and its corrected span, never the status line.
+    """
+    try:
+        from ccreport.accounts import AccountTimeline
+        from ccreport.cache_db import load_account_events
+
+        changes = AccountTimeline(load_account_events()).tier_changes()
+    except Exception:  # noqa: BLE001
+        return None
+    return changes[-1] if changes else None
+
+
 def _render_account() -> str:
     """Who this session bills to: email, organization, or both.
 
@@ -1493,8 +1514,31 @@ def _usage_reset_clock(reset_iso: str, now_epoch: float) -> str:
     return datetime.fromtimestamp(epoch).strftime("%H:%M")  # noqa: DTZ006
 
 
+def _compact_dh(seconds: float) -> str:
+    """Days and hours: "3d14h", "0d5h", "6d"."""
+    d = int(seconds // 86400)
+    h = int((seconds % 86400) // 3600)
+    return f"{d}d{h}h" if h > 0 else f"{d}d"
+
+
+def _rebase_epoch(usage: dict) -> float | None:
+    """The tier change a slow render read, as an epoch.
+
+    Carried in the usage dict rather than read here: _weekly_pace runs on every
+    frame and the account log is a database the fast path may not open.
+    """
+    value = usage.get("tier_changed_at")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _weekly_pace(
     w_pct_s: str, reset_iso: str, now: float, *, countdown: bool = True,
+    rebased_at: float | None = None,
 ) -> str:
     """Weekly pace indicator: compare actual usage % to expected % based on elapsed time.
 
@@ -1505,6 +1549,13 @@ def _weekly_pace(
     runs, while the delta is paced against CLAUDE_CODE_PACE_DAYS. When the two
     differ the window reads "7d@5d", so the segment names both rather than
     labelling a paced delta with the calendar window.
+
+    rebased_at is when a plan change restarted the quota, which it does without
+    moving the reset time. The reading then counts from there and has the rest
+    of the window to fill, so the span becomes reset minus the rebase and the
+    label carries the dagger `ccreport limits` marks such a row with. Pacing a
+    fresh plan's four hours against the old plan's five days reports a session
+    at its ceiling as far under budget.
 
     countdown=False drops the "(4d2h)" parenthetical, for a second segment sharing
     a reset with one already on screen.
@@ -1522,22 +1573,22 @@ def _weekly_pace(
     except ValueError:
         return ""
     pace = pace_days()
+    span_s = float(WEEK_WINDOW_S)
+    mark = ""
+    if rebased_at is not None and week_start < rebased_at < reset_epoch:
+        week_start, span_s, mark = rebased_at, reset_epoch - rebased_at, "\u2020"
     elapsed_s = now - week_start
-    elapsed_frac = elapsed_s / WEEK_WINDOW_S
+    elapsed_frac = elapsed_s / span_s
     if elapsed_frac <= 0 or elapsed_frac > 1:
         return ""
-    # Expected usage: consume 100% in pace_days, not 7 (cap at 100)
-    expected = min((elapsed_s / (pace * 86400)) * 100, 100)
+    # Expected usage: the whole quota gone in pace_days of the window's seven,
+    # which on a rebased window is that same fraction of what is left (cap 100)
+    expected = min(elapsed_frac * (WEEK_WINDOW_S / (pace * 86400)) * 100, 100)
     delta = actual - expected
-    # Compact elapsed time: "3d14h" or "0d5h" or "6d"
-    el_d = int(elapsed_s // 86400)
-    el_h = int((elapsed_s % 86400) // 3600)
-    if el_h > 0:
-        elapsed_str = f"{el_d}d{el_h}h"
-    else:
-        elapsed_str = f"{el_d}d"
+    elapsed_str = _compact_dh(elapsed_s)
     week_d = WEEK_WINDOW_S // 86400
-    window_str = f"{week_d}d" if pace == week_d else f"{week_d}d@{pace}d"
+    span_str = _compact_dh(span_s) if mark else f"{week_d}d"
+    window_str = span_str + mark + ("" if pace == week_d else f"@{pace}d")
     remain_s = int(reset_epoch - now)
     if remain_s > 0 and countdown:
         cd = _usage_countdown(reset_iso, now)
@@ -1914,7 +1965,8 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool, bool]
     if session_line:
         rl_inners.append(session_line)
 
-    pace = _weekly_pace(w_pct, usage.get("week_reset", ""), now)
+    rebased_at = _rebase_epoch(usage)
+    pace = _weekly_pace(w_pct, usage.get("week_reset", ""), now, rebased_at=rebased_at)
     week_line = _usage_combined(
         "W", w_pct, usage.get("week_reset", ""),
         _ustr(usage, "week_cost"), now,
@@ -1959,6 +2011,7 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool, bool]
                     ) == _usage_countdown(usage.get("week_reset", ""), now)
                     sc_pace = _weekly_pace(
                         sc_pct, sc_reset, now, countdown=not dup_cd,
+                        rebased_at=rebased_at,
                     )
                     scoped_line = _usage_combined(
                         sc_model[:2].title(), sc_pct,
@@ -2722,8 +2775,11 @@ def _fetch_all(
         # subprocesses started above rather than trail them.
         _capture_account(memo)
         # After the capture, so a /login this render noticed is the account the
-        # segment names rather than the one before it.
+        # segment names rather than the one before it, and a plan change it
+        # noticed is the instant the pace measures from.
         account_str = _render_account()
+        if usage_data:
+            usage_data["tier_changed_at"] = _last_tier_change()
         # S and W samples come from the raw stdin dict, sonnet/scoped from
         # usage_data — the native S/W merge happens later, in main, and would
         # not change what gets sampled here.

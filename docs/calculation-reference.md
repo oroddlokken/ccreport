@@ -240,6 +240,18 @@ else:
     window_start = reset - window_seconds
 ```
 
+A plan change rebases a quota's percentage without moving its reset time, so
+the window a reading counts can start later than that. `pricing.quota_rebase_epoch(window_start, now)`
+answers with the newest tier change in the span, off the `account_events` log
+through `accounts.AccountTimeline.rebase_within`, and None where the window ran
+on one plan. Two readers cut on it: `_parse_window_starts` moves
+`week_window_start` there, so `week_cost` and `week_model_costs` value the span
+the percentage counted and `week_key` re-scans the per-file entries the previous
+bound had cached; and the pace line below (§8.2, `ccu.pace_line` and
+`statusline._weekly_pace`) paces against reset minus the rebase. The status line
+takes the instant from its slow-path fetch as `tier_changed_at`, since the
+render path may not open the cache per frame.
+
 Window lengths live in `pricing.py`: `SESSION_WINDOW_S` (5 h, from
 `SESSION_WINDOW_HOURS`) and `WEEK_WINDOW_S` (7 d). A missing or unparseable
 reset gives None; the week then falls back to Monday 00:00 local time. Naive
@@ -1008,20 +1020,26 @@ Time format: 12-hour with am/pm, minutes omitted if :00.
 **Weekly pace** (`ccu.pace_line`, shown below weekly bar):
 ```
 week_start  = window_start_epoch(reset_iso, WEEK_WINDOW_S, now)   (§4)
-elapsed_s   = now - week_start          blank unless 0 < elapsed_s <= WEEK_WINDOW_S
-expected    = min(elapsed_s * 100 // (pace_days() * 86400), 100)
+span_s      = WEEK_WINDOW_S
+if week_start < rebased_at < reset:                              (§4, rebase)
+    week_start, span_s = rebased_at, reset - rebased_at
+elapsed_s   = now - week_start          blank unless 0 < elapsed_s <= span_s
+expected    = min(elapsed_s * 100 * WEEK_WINDOW_S // (span_s * pace_days() * 86400), 100)
 delta       = int(actual) - expected
 Display: "{el_d}d {el_h}h into 7-day window (pace: {pace}d) — {expected}% expected, {sign}{delta}%"
 Colours: >+15 red, >+5 yellow, >-5 green, >-15 cyan, else dim
 ```
 
-The window is always the seven days it actually runs; only `expected` divides by
-`pricing.pace_days()`, which reads `CLAUDE_CODE_PACE_DAYS` (README) and falls
-back to 7 for anything outside 1-7. A pace of 5 means the quota is meant to be
-gone by Friday, so the bar usage is measured against rises faster than the
-clock. The status line's pace segment reads the same function and names the pace
-the same way, writing its window as "7d@5d" once the two diverge; at the default
-7 it stays a bare "7d".
+The window is the seven days it actually runs, or reset minus the rebase where a
+plan change restarted it; only `expected` divides by `pricing.pace_days()`, which
+reads `CLAUDE_CODE_PACE_DAYS` (README) and falls back to 7 for anything outside
+1-7. A pace of 5 means the quota is meant to be gone by Friday, so the bar usage
+is measured against rises faster than the clock, and on a rebased window it is
+that same fraction of what is left. `ccu` names the cut window "window since the
+plan changed"; the status line marks it with the dagger `ccreport limits` puts on
+such a row, writing "0d4h/1d23h†(1d18h)". Both read the same pace function and
+name the pace the same way, the status line writing its window as "7d@5d" once
+the two diverge; at the default 7 it stays a bare "7d".
 
 **Last fetched:**
 ```

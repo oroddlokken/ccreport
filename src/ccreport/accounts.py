@@ -124,6 +124,16 @@ class AccountTimeline:
                 moved.append(self._ts[i])
         return moved
 
+    def rebase_within(self, start: float, end: float) -> float | None:
+        """The newest tier change in (start, end], or None where there is none.
+
+        A window whose reading fell because the plan changed under it fell
+        here. Only the last change inside the span matters: that is where the
+        curve the window is showing now began.
+        """
+        inside = [t for t in self.tier_changes() if start < t <= end]
+        return inside[-1] if inside else None
+
     def uuid_at(self, when: datetime) -> str | None:
         """The account uuid in force at *when*, None before the first event.
 

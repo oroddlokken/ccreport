@@ -2869,3 +2869,69 @@ class TestMonthsInSpan:
                   {"organization_rate_limit_tier": "default_claude_max_5x"})]
         cost = present(pricing.prorated_plan_cost(spans))
         assert cost == pytest.approx(100.0 * pricing.months_in_span(start, end))
+
+
+class TestWeekWindowStartAcrossAPlanChange:
+    """A plan change rebases the weekly quota under an unchanged reset time.
+
+    The dollars beside the percentage have to value the span the percentage
+    counted, so the week bound moves to the change. Without it a Pro reading
+    hours old is priced against five days of Max 20x spend.
+    """
+
+    # _parse_window_starts reads the wall clock, so the fixture anchors on it
+    # rather than on a frozen instant: a reset in the past is a window that has
+    # already rolled, and the bound under test would never be seven days back.
+    @pytest.fixture(autouse=True)
+    def _now(self):
+        self.NOW = datetime.now(UTC).timestamp()
+
+    def _account(self, tier):
+        return {
+            "accountUuid": "uuid-1",
+            "emailAddress": "me@example.net",
+            "organizationUuid": None,
+            "organizationName": None,
+            "userRateLimitTier": tier,
+        }
+
+    def _reset_iso(self):
+        import datetime as dt
+
+        return dt.datetime.fromtimestamp(self.NOW + 2 * 86400, dt.UTC).isoformat()
+
+    def test_no_change_leaves_the_bound_seven_days_back(self, monkeypatch):
+        from ccreport import cache_db, pricing
+
+        cache_db.record_account_event(
+            self._account("default_claude_max_20x"), now=self.NOW - 20 * 86400,
+        )
+        monkeypatch.setattr(pricing, "_local_tz", lambda: UTC)
+        _, week_start = pricing._parse_window_starts(None, self._reset_iso())
+        assert week_start.timestamp() == pytest.approx(self.NOW - 5 * 86400, abs=2)
+
+    def test_a_change_inside_the_window_moves_the_bound_to_it(self, monkeypatch):
+        from ccreport import cache_db, pricing
+
+        cache_db.record_account_event(
+            self._account("default_claude_max_20x"), now=self.NOW - 20 * 86400,
+        )
+        cache_db.record_account_event(
+            self._account("default_claude_ai"), now=self.NOW - 6 * 3600,
+        )
+        monkeypatch.setattr(pricing, "_local_tz", lambda: UTC)
+        _, week_start = pricing._parse_window_starts(None, self._reset_iso())
+        assert week_start.timestamp() == pytest.approx(self.NOW - 6 * 3600, abs=2)
+
+    def test_the_rebase_lookup_answers_none_where_nothing_changed(self):
+        from ccreport import cache_db, pricing
+
+        cache_db.record_account_event(
+            self._account("default_claude_max_20x"), now=self.NOW - 20 * 86400,
+        )
+        assert pricing.quota_rebase_epoch(self.NOW - 5 * 86400, self.NOW) is None
+
+    def test_the_rebase_lookup_needs_a_window_to_search(self):
+        from ccreport import pricing
+
+        assert pricing.quota_rebase_epoch(None, self.NOW) is None

@@ -1549,6 +1549,25 @@ def window_start_epoch(
     return epoch if epoch <= now else epoch - window_seconds
 
 
+def quota_rebase_epoch(window_start: float | None, now: float) -> float | None:
+    """When a plan change restarted the quota that opened at *window_start*.
+
+    A change of rate-limit tier rebases the percentage without moving the reset
+    time, so from that instant the reading counts a different allowance. None
+    where the account change log records no change inside the span, which is
+    every window that ran on one plan.
+
+    This opens the cache, so a caller on the status line's render path takes the
+    instant from its fetch rather than calling here per frame.
+    """
+    if window_start is None:
+        return None
+    from ccreport.accounts import AccountTimeline
+    from ccreport.cache_db import load_account_events
+
+    return AccountTimeline(load_account_events()).rebase_within(window_start, now)
+
+
 def _parse_window_starts(
     session_reset_iso: str | None,
     week_reset_iso: str | None,
@@ -1558,6 +1577,11 @@ def _parse_window_starts(
     Returns (session_window_start, week_window_start).
     session_window_start is None if the reset time is unavailable.
     week_window_start falls back to Monday 00:00 local time.
+
+    A plan change inside the week window moves its start to the change: the
+    percentage restarted there, so the dollars beside it have to value the same
+    span. That also moves week_key, which re-scans the per-file cost entries
+    the previous bound had cached.
     """
     tz = _local_tz()
     now = datetime.now(tz=tz)
@@ -1573,6 +1597,12 @@ def _parse_window_starts(
     ) or (now - timedelta(days=now.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0,
     )
+    try:
+        rebase = quota_rebase_epoch(week_window_start.timestamp(), now.timestamp())
+    except Exception:  # noqa: BLE001 — an unreadable log costs the cut, never the costs
+        rebase = None
+    if rebase is not None:
+        week_window_start = as_local(rebase) or week_window_start
 
     return session_window_start, week_window_start
 
