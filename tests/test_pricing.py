@@ -2627,6 +2627,7 @@ class TestPlanPrice:
         ("tier", "usd"),
         [
             ("default_claude_pro", 20.0),
+            ("default_claude_ai", 20.0),
             ("default_claude_max_5x", 100.0),
             ("default_claude_max_20x", 200.0),
         ],
@@ -2729,6 +2730,13 @@ class TestProratedPlanCost:
             (14, "default_claude_max_5x"), opening=datetime(2026, 2, 22, tzinfo=UTC),
         ))
         assert cost == pytest.approx(100.0 * 7 / 28 + 100.0 * 7 / 31)
+
+    def test_a_month_that_moved_from_max_to_pro_charges_both_stretches(self):
+        """Pro reports as `default_claude_ai`, whose absence cost the span that half."""
+        cost = pricing.prorated_plan_cost(
+            self._spans((14, "default_claude_max_20x"), (14, "default_claude_ai")),
+        )
+        assert cost == pytest.approx(110.0)
 
     def test_an_unpriced_stretch_contributes_nothing_but_does_not_void_the_span(self):
         cost = pricing.prorated_plan_cost(

@@ -359,7 +359,14 @@ PLAN_PRICES: list[dict[str, Any]] = [
     {
         "effective": "2025-01-01",
         "plans": {
+            # The $20 plan under both its names: `default_claude_ai` is what the
+            # oauthAccount blob reported on 2026-08-30 beside organizationType
+            # `claude_pro`, where a declared timeline spells it
+            # `default_claude_pro`. Named in this shipped period rather than a new
+            # one because it priced to None at every date before, so nothing
+            # already computed moves.
             "default_claude_pro": 20.0,
+            "default_claude_ai": 20.0,
             "default_claude_max_5x": 100.0,
             "default_claude_max_20x": 200.0,
         },
