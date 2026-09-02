@@ -122,6 +122,26 @@ def period_span(dimension: str, key: str) -> tuple[datetime, datetime, list[str]
             datetime.combine(stop, time.min).astimezone(), axis)
 
 
+def containing_periods(dimension: str, key: str) -> dict[str, list[str]]:
+    """The wider periods one period page sits inside, per dimension.
+
+    A week is listed under both months it touches, since neither of them holds
+    all of it. A month has nothing wider and answers with an empty map.
+    """
+    if dimension == "day":
+        return {"week": [week_key(key)], "month": [key[:7]]}
+    if dimension == "week":
+        first, stop = _period_dates("week", key)
+        months = dict.fromkeys([first.isoformat()[:7], (stop - timedelta(days=1)).isoformat()[:7]])
+        return {"month": list(months)}
+    return {}
+
+
+def _period_stub(key: str) -> dict:
+    """A breakdown row for a wider period this page folded no records into."""
+    return {"key": key, "cost": 0.0, "tokens": 0, "share": 0.0, "calls": 0}
+
+
 @dataclass
 class Tile:
     """One stat tile: a number and the line derived under it."""
@@ -821,6 +841,15 @@ def build(conn, days: int, now: datetime | None = None,
             row["plan_saved_nok"] = _in_nok(
                 row["plan_saved"], nok, (closes - timedelta(days=1)).date(),
             )
+
+    # The By-week and By-month rows are the only way out of a day page, so a
+    # day nothing was spent on is a dead end without these. Seeded after the
+    # plan columns above, so a stub month draws the dash rather than a whole
+    # subscription charged against no spend.
+    if scope is not None and scope.is_period:
+        for dimension, keys in containing_periods(scope.dimension, scope.key).items():
+            if dimension in breakdowns and not breakdowns[dimension]:
+                breakdowns[dimension] = [_period_stub(key) for key in keys]
 
     tiles = _tiles(merged, total_cost)
     # A period page charges its whole period: the month was paid for whether or

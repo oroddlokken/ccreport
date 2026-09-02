@@ -1086,3 +1086,70 @@ class TestCoveredAxis:
         opens, closes = dashboard._month_bounds(key)
         view = self._scoped(app, "month", key)
         assert len(self._days(view)) == (closes - opens).days
+
+
+class TestIdlePeriodStillLinksOutward:
+    """A day nothing was spent on is a page you step outward from."""
+
+    IDLE = "2019-03-06"
+    """A Wednesday no fixture record falls on, mid-week and mid-month."""
+
+    STRADDLE = "2019-02-27"
+    """A day whose week opens in February and closes in March."""
+
+    def _rows(self, app, dimension, key):
+        scope = dashboard.Scope(dimension=dimension, key=key)
+        return dashboard.build(app.state.db.connect(), 30, NOW, scope=scope).breakdowns
+
+    def test_a_day_names_its_week_and_its_month(self):
+        assert dashboard.containing_periods("day", self.IDLE) == {
+            "week": ["2019-03-04"], "month": ["2019-03"],
+        }
+
+    def test_a_week_takes_both_months_it_touches(self):
+        assert dashboard.containing_periods("week", self.STRADDLE) == {
+            "month": ["2019-02", "2019-03"],
+        }
+
+    def test_a_week_inside_one_month_names_it_once(self):
+        assert dashboard.containing_periods("week", self.IDLE) == {"month": ["2019-03"]}
+
+    def test_a_month_has_nothing_wider(self):
+        assert dashboard.containing_periods("month", "2019-03") == {}
+
+    def test_an_idle_day_seeds_the_two_rows(self, app):
+        rows = self._rows(app, "day", self.IDLE)
+        assert [row["key"] for row in rows["week"]] == ["2019-03-04"]
+        assert [row["key"] for row in rows["month"]] == ["2019-03"]
+        assert rows["month"][0] == {
+            "key": "2019-03", "cost": 0.0, "tokens": 0, "share": 0.0, "calls": 0,
+        }
+
+    def test_the_other_dimensions_stay_empty(self, app):
+        rows = self._rows(app, "day", self.IDLE)
+        assert all(rows[name] == [] for name in ("model", "account", "project", "machine", "day"))
+
+    def test_the_seeded_month_carries_no_plan(self, app):
+        """It renders the dash: a whole subscription against no spend is noise."""
+        assert "plan_usd" not in self._rows(app, "day", self.IDLE)["month"][0]
+
+    def test_an_idle_week_seeds_its_months(self, app):
+        assert [row["key"] for row in self._rows(app, "week", self.STRADDLE)["month"]] == [
+            "2019-02", "2019-03",
+        ]
+
+    def test_an_idle_month_seeds_nothing(self, app):
+        assert self._rows(app, "month", "2019-03")["month"] == []
+
+    def test_a_day_with_records_is_untouched(self, app):
+        day = (NOW - timedelta(days=1)).strftime("%Y-%m-%d")
+        rows = self._rows(app, "day", day)
+        assert len(rows["week"]) == 1
+        assert rows["week"][0]["cost"] > 0
+        assert rows["month"][0]["cost"] > 0
+
+    def test_the_page_draws_both_links(self, client):
+        body = client.get(f"/day/{self.IDLE}").text
+        assert 'href="/week/2019-03-04?days=' in body
+        assert 'href="/month/2019-03?days=' in body
+        assert "Nothing in this range." in body
