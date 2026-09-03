@@ -2469,7 +2469,7 @@ def _limits_entry(
     curve, correlating a tier change with the week it landed — so every number
     goes out as stored and the local-time rendering stays in the table.
     """
-    when = _as_local(inst.first_ts)
+    when = _as_local(inst.attributed_at)
     return {
         "window": inst.window,
         "model": inst.model,
@@ -2500,6 +2500,8 @@ def _limits_entry(
         "limit_tier": accounts.tier_at(when),
         "stretch": inst.stretch,
         "rebased": inst.rebased,
+        "attributed_at": inst.attributed_at,
+        "plan_change_at": inst.plan_change_at,
     }
 
 
@@ -2510,7 +2512,7 @@ def _tiered(inst: WindowInstance, accounts: AccountTimeline) -> bool:
     and its spend are real readings, and a fill rate with no entitlement behind
     it cannot be set beside the window below it in the table.
     """
-    return accounts.tier_at(_as_local(inst.first_ts)) is not None
+    return accounts.tier_at(_as_local(inst.attributed_at)) is not None
 
 
 def _partial_note(inst: WindowInstance) -> str | None:
@@ -2610,7 +2612,7 @@ def report_limits(
         table.add_column("Tier", style="dim")
 
         for inst in group:
-            when = _as_local(inst.first_ts)
+            when = _as_local(inst.attributed_at)
             tier = accounts.tier_at(when)
             spend = spends[inst.key]
             row: list = [_fmt_epoch(inst.resets_at) + ("†" if inst.rebased else "")]

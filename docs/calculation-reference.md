@@ -242,15 +242,24 @@ else:
 
 A plan change rebases a quota's percentage without moving its reset time, so
 the window a reading counts can start later than that. `pricing.quota_rebase_epoch(window_start, now)`
-answers with the newest tier change in the span, off the `account_events` log
-through `accounts.AccountTimeline.rebase_within`, and None where the window ran
-on one plan. Two readers cut on it: `_parse_window_starts` moves
+answers with the instant it restarted, or None where it did not. It reads the
+`account_events` log for the tier changes and the week rows of
+`rate_limit_snapshots` for the readings, and hands both to
+`windows.observed_rebase` — §9.7's rule, which wants a fall past
+`REBASE_DROP_PP` with a change beside it. Both halves, here as there: a receipt
+date typed into the timeline while the week is running dates a plan the
+readings already counted, and moving the bound onto it prices the week from
+that afternoon.
+
+Two readers cut on it: `_parse_window_starts` moves
 `week_window_start` there, so `week_cost` and `week_model_costs` value the span
 the percentage counted and `week_key` re-scans the per-file entries the previous
 bound had cached; and the pace line below (§8.2, `ccu.pace_line` and
 `statusline._weekly_pace`) paces against reset minus the rebase. The status line
 takes the instant from its slow-path fetch as `tier_changed_at`, since the
-render path may not open the cache per frame.
+render path may not open the cache per frame — `_last_tier_change(week_reset)`
+runs before that render writes its own sample, so a rebase is dated from the
+next render on.
 
 Window lengths live in `pricing.py`: `SESSION_WINDOW_S` (5 h, from
 `SESSION_WINDOW_HOURS`) and `WEEK_WINDOW_S` (7 d). A missing or unparseable
@@ -1022,6 +1031,7 @@ Time format: 12-hour with am/pm, minutes omitted if :00.
 week_start  = window_start_epoch(reset_iso, WEEK_WINDOW_S, now)   (§4)
 span_s      = WEEK_WINDOW_S
 if week_start < rebased_at < reset:                              (§4, rebase)
+    if read_at < rebased_at: blank                    # the reading predates it
     week_start, span_s = rebased_at, reset - rebased_at
 elapsed_s   = now - week_start          blank unless 0 < elapsed_s <= span_s
 expected    = min(elapsed_s * 100 * WEEK_WINDOW_S // (span_s * pace_days() * 86400), 100)
@@ -1040,6 +1050,14 @@ plan changed"; the status line marks it with the dagger `ccreport limits` puts o
 such a row, writing "0d4h/1d23h†(1d18h)". Both read the same pace function and
 name the pace the same way, the status line writing its window as "7d@5d" once
 the two diverge; at the default 7 it stays a bare "7d".
+
+`ccu` prices a percentage its fetch may have cached before the rebase, so
+`pace_line` takes `read_at` — the row's `last_updated` — and prints nothing
+where the reading is older than the cut. Such a reading counts the allowance
+the rebase replaced, and pacing it against the new window reported a whole
+week's usage as a first hour: 23% against 0% expected, minutes after a switch.
+The status line needs no such guard; its percentage comes from stdin, as fresh
+as the render that read it.
 
 **Last fetched:**
 ```
@@ -1154,6 +1172,16 @@ timeline of account changes.
   The comparison covers all seven fields, so a seat upgrade or a plan change on
   an unchanged login appends a row: dating a tier change is the point of keeping
   the tiers at all
+- **Stamped with the render's instant**, threaded from the slow path as
+  `_capture_account(memo, now_epoch)` and on to `record_account_event(now=)`,
+  which is the instant `_snapshot_rate_limits` stores its rows under. Taking
+  `time.time()` at write time instead put the capture 22 ms *after* a snapshot
+  the same render had already taken, and `_index_at` bisects right — so the
+  window that opened at a plan change read against the event before it and
+  §9.7's Tier column named the plan the account had just left. Rows written
+  before this read right regardless: §9.7 attributes a window a change opened
+  at the change itself (`WindowInstance.attributed_at`), not at its first
+  sample. Nothing rewrites the log
 - **Staleness**: the tier fields are undocumented and cached. Claude Code
   refreshes `oauthAccount` on `/login` (`profileFetchedAt`), so a tier changed
   server-side reads stale here until the next sign-in
@@ -1438,11 +1466,13 @@ week.
 
 A plan change restarts the percentage against the new allowance and leaves
 `resets_at` where it was, so one reset time can hold two fill curves. The
-instance key carries a **stretch** index for that reason: `rebase_stretches()`
+instance key carries a **stretch** index for that reason: `rebase_cuts()`
 cuts a group where a reading falls by more than `REBASE_DROP_PP` (5.0) *and* the
 plan history records a change within `REBASE_CHANGE_TOLERANCE_S` (an hour) of
 the fall. Each cut is a row of its own with its own peak, fill span, rate and
-priced spend.
+priced spend. `observed_rebase()` asks the same question of one window and
+answers with the change rather than the cut, which is what §4's week bound
+reads.
 
 Both halves, because neither is evidence alone. Readings fall that far without
 any plan change — two machines reading one account quota minutes out of step
@@ -1454,7 +1484,10 @@ it was read under, and a window that opened after the switch never fell.
 The tolerance is an hour because a change is dated by the render that read the
 new config, or by the receipt date someone typed, neither of which is the
 instant the quota was rebased — and §9.7's own defect list aside, the falling
-sample can precede the capture within one render. An account with no recorded
+sample can precede the capture within one render. An hour is wide enough that
+two changes can both sit in range of one fall, which a /login writing a
+transitional tier seconds before the real one produces; `_change_for` takes the
+one closest to the fall, preferring the later where two tie. An account with no recorded
 plan history has no changes and is never cut, which is what there is no
 evidence for rather than a guess at it.
 
@@ -1496,7 +1529,7 @@ Per instance:
 | Cache | `cache_read ÷ (input + cache_create + cache_read)` over the **fill span**, on the same model family the Spend column is filtered to. Cache reads are the cheapest tokens on the corpus, so the column answers "how much of this window's context was already paid for" and says why two windows with the same peak cost different amounts of quota. Output is left out of the denominator: it is the model's answer, not context that was or was not paid for again. `—` where no record priced the span, for the same reason Spend is — a window with no corpus behind it cached an unknown share, not 0%. The footer's is the group's total reads over its total observed input, not the mean of the rows (`windows.group_cache_hit`). `--json` carries the two counts as `cache_read_tokens` and `observed_input_tokens`, plus the ratio as `cache_hit_share` |
 | Extra | real dollars billed as Extra usage while the window ran, from `extra_usage_snapshots`. Not gated on Hit, and measured over the window's whole span rather than over the fill — see below. `—` where no reading bounds the span, which is unknown and not $0.00; `$0.00` where readings bound it and it did not move. `--json` carries it as `extra_usd` |
 | Hit | `round(peak) >= 100`. Rounded to match the write gate, which only passes a whole-percent move — 99.6 is the last sample a full window can leave behind |
-| Account / Tier | attributed at the instance's **first** sample, via `AccountTimeline.label_at()` / `.tier_at()` — one bisect over the same events, so both answers come off the event in force when the window opened. A rebased stretch opens at the change itself, so it names the plan that rebased it rather than the one before. A window with no tier there is not in the table at all (below) |
+| Account / Tier | attributed at `WindowInstance.attributed_at`, via `AccountTimeline.label_at()` / `.tier_at()` — one bisect over the same events, so both answers come off one event. That instant is the plan change that opened the quota where one did, else the first sample. A change opens a quota two ways, and `window_instances` carries the change as `plan_change_at` for both: a stretch `rebase_cuts` cut inside one reset time, and the first instance under a new reset time that opened before the previous instance's reset with a change within `REBASE_CHANGE_TOLERANCE_S` — what a plan change does to the 5-hour window, whose percentage has nothing to fall from (65 stored session instances, two opened early, both beside a change). Attributing at the first sample named the plan the account had just left: the sample precedes the capture by a render, or by 23 ms within one (§9.1), and both are stored. `--json` carries `attributed_at` and `plan_change_at` |
 
 The spend join takes the full record path (`load_all_records`), not a `SUM` over
 `ccreport_records`: dedup is what makes the number an answer, and summing the
@@ -1560,7 +1593,7 @@ The merge is what the client cannot do. A quota belongs to an **account**, so
 machine, and two laptops signed into one account contribute readings to one fill
 curve — each drawn as its own trace, with a bucket that machine took no reading
 in left as null rather than 0. The merged group is then cut by
-`rebase_stretches` the way one machine's is, and the stretch rides in the query
+`rebase_cuts` the way one machine's is, and the stretch rides in the query
 string beside the model and the account: a link carrying none opens the curve
 that opened the window, which is the only one a link written before the split
 could have named. The plan changes it cuts on are the *declared* timeline

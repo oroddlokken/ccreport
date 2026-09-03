@@ -924,36 +924,28 @@ class TestAccountTimelineTiers:
     def _at(self, tl, ts):
         return tl.tier_at(dt.datetime.fromtimestamp(ts, UTC))
 
-    def test_a_change_inside_the_span_is_where_the_window_restarted(self):
+    def test_a_change_is_dated_by_the_event_that_recorded_the_new_tier(self):
         tl = self._tl(
             (1000.0, None, "default_claude_max_20x"),
             (2000.0, None, "default_claude_ai"),
         )
-        assert tl.rebase_within(1500.0, 2500.0) == 2000.0
+        assert tl.tier_changes() == [2000.0]
 
-    def test_the_newest_change_wins_when_the_span_holds_two(self):
-        """The curve on screen began at the last one; the earlier is history."""
+    def test_every_change_is_listed_oldest_first(self):
+        """windows.observed_rebase picks among them; the log hands over all of them."""
         tl = self._tl(
             (1000.0, None, "default_claude_max_20x"),
             (2000.0, None, "default_claude_max_5x"),
             (3000.0, None, "default_claude_ai"),
         )
-        assert tl.rebase_within(1500.0, 3500.0) == 3000.0
+        assert tl.tier_changes() == [2000.0, 3000.0]
 
-    def test_a_change_outside_the_span_does_not_cut_it(self):
-        tl = self._tl(
-            (1000.0, None, "default_claude_max_20x"),
-            (2000.0, None, "default_claude_ai"),
-        )
-        assert tl.rebase_within(2500.0, 3500.0) is None
-        assert tl.rebase_within(200.0, 900.0) is None
-
-    def test_a_window_that_ran_on_one_plan_is_never_cut(self):
+    def test_a_log_that_ran_on_one_plan_records_no_change(self):
         tl = self._tl(
             (1000.0, None, "default_claude_max_20x"),
             (2000.0, None, "default_claude_max_20x"),
         )
-        assert tl.rebase_within(0.0, 5000.0) is None
+        assert tl.tier_changes() == []
 
     def test_an_event_that_recorded_no_tier_is_not_a_change(self):
         """_carried_tiers carries the reading forward, so a blank blob cuts nothing."""
@@ -961,7 +953,7 @@ class TestAccountTimelineTiers:
             (1000.0, None, "default_claude_max_20x"),
             (2000.0, None, None),
         )
-        assert tl.rebase_within(0.0, 5000.0) is None
+        assert tl.tier_changes() == []
 
     def test_the_tier_in_force_is_the_newest_event_at_or_before(self):
         tl = self._tl(
@@ -2635,6 +2627,99 @@ class TestRebasedWindows:
         assert inst.stretch == 0
         assert inst.key == ("session", None, _W1_RESET, 0)
 
+    def test_a_rebased_stretch_is_attributed_at_the_change_that_opened_it(self):
+        """The first sample trails the capture by a render or by 23 ms; the change does not."""
+        self._seed()
+        opened, live = _instances(self.CHANGED)
+        assert (opened.plan_change_at, opened.attributed_at) == (None, _W1_START)
+        assert (live.plan_change_at, live.attributed_at) == (self.CHANGED[0], self.CHANGED[0])
+
+    def test_a_window_reset_early_by_a_change_is_attributed_at_the_change(self):
+        """The 5-hour quota has nothing to fall from: a change opens a new reset time early."""
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
+        early = _W1_RESET - 1800.0
+        _seed_samples("session", _W1_RESET + 3 * 3600, early, [0.0, 6.0])
+        change = early + 100.0
+        _first, reset_early = _instances((change,))
+        assert reset_early.stretch == 0
+        assert reset_early.rebased is False
+        assert (reset_early.plan_change_at, reset_early.attributed_at) == (change, change)
+
+    def test_a_window_reset_early_with_no_change_near_it_keeps_its_first_sample(self):
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
+        early = _W1_RESET - 1800.0
+        _seed_samples("session", _W1_RESET + 3 * 3600, early, [0.0, 6.0])
+        _first, reset_early = _instances()
+        assert (reset_early.plan_change_at, reset_early.attributed_at) == (None, early)
+
+    def test_a_window_that_opened_on_schedule_is_not_attributed_to_a_change_before_it(self):
+        """A change an hour before a rollover did not open the window the rollover did."""
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
+        on_time = _W1_RESET + 600.0
+        _seed_samples("session", _W1_RESET + 5 * 3600, on_time, [1.0, 6.0])
+        _first, rolled = _instances((_W1_RESET - 3600.0,))
+        assert (rolled.plan_change_at, rolled.attributed_at) == (None, on_time)
+
+
+class TestObservedRebase:
+    """rebase_cuts' rule asked of one window, for the week bound.
+
+    pricing.quota_rebase_epoch reads it, so `ccreport limits` and the cost
+    window either side of a plan change cut at the same instant or at none.
+    """
+
+    CHANGE = 2000.0
+
+    def _samples(self, pcts):
+        """Readings 500 seconds apart from ts 1000, so a fall straddles CHANGE."""
+        return [{"ts": 1000.0 + 500 * i, "used_pct": p} for i, p in enumerate(pcts)]
+
+    def test_a_fall_beside_a_change_answers_the_change(self):
+        from ccreport.windows import observed_rebase
+
+        samples = self._samples([10.0, 20.0, 0.0, 3.0])
+        assert observed_rebase(samples, (self.CHANGE,)) == self.CHANGE
+
+    def test_a_change_the_reading_never_followed_answers_none(self):
+        from ccreport.windows import observed_rebase
+
+        assert observed_rebase(self._samples([10.0, 20.0, 22.0, 25.0]), (self.CHANGE,)) is None
+
+    def test_a_fall_with_no_change_behind_it_answers_none(self):
+        from ccreport.windows import observed_rebase
+
+        assert observed_rebase(self._samples([10.0, 20.0, 0.0, 3.0]), ()) is None
+
+    def test_a_one_point_dip_is_a_rounding_step(self):
+        from ccreport.windows import observed_rebase
+
+        assert observed_rebase(self._samples([10.0, 20.0, 19.0, 21.0]), (self.CHANGE,)) is None
+
+    def test_two_rebases_under_one_reset_answer_the_later(self):
+        """The curve on screen began at the last one; the earlier is history."""
+        from ccreport.windows import observed_rebase
+
+        samples = self._samples([10.0, 20.0, 0.0, 30.0, 1.0])
+        assert observed_rebase(samples, (self.CHANGE, 3000.0)) == 3000.0
+
+    def test_a_window_with_no_samples_answers_none(self):
+        from ccreport.windows import observed_rebase
+
+        assert observed_rebase([], (self.CHANGE,)) is None
+
+    def test_two_changes_in_range_of_one_fall_answer_the_one_it_straddles(self):
+        """A /login writes a transitional tier seconds before the real one: two changes."""
+        from ccreport.windows import observed_rebase
+
+        samples = self._samples([10.0, 20.0, 0.0])
+        assert observed_rebase(samples, (1490.0, 1800.0)) == 1800.0
+
+    def test_two_changes_before_a_fall_answer_the_nearer(self):
+        from ccreport.windows import observed_rebase
+
+        samples = self._samples([10.0, 20.0, 0.0])
+        assert observed_rebase(samples, (1300.0, 1400.0)) == 1400.0
+
 
 class TestWindowBurn:
     """How fast a window filled, and where that rate lands it by reset time."""
@@ -3150,7 +3235,33 @@ class TestCmdLimits:
                 "limit_tier": "default_claude_max_5x",
                 "stretch": 0,
                 "rebased": False,
+                "attributed_at": _W1_START,
+                "plan_change_at": None,
             }
+        ]
+
+    def test_the_tier_column_names_the_plan_a_window_opened_on(self, capsys):
+        """The s8x3 shape: a render stores its sample 23 ms before its capture.
+
+        The window the switch opened is read at the change and not at the
+        sample, so the stored ordering cannot name the plan the account left.
+        """
+        self._corpus()
+        opened = _W1_RESET - 1800.0
+        _seed_samples("session", _W1_RESET + 3 * 3600, opened, [0.0, 6.0])
+        cache_db.record_account_event(
+            {
+                "accountUuid": "u-work",
+                "emailAddress": "me@work.example",
+                "organizationName": "Org",
+                "userRateLimitTier": "default_claude_max_20x",
+            },
+            now=opened + 0.023,
+        )
+        tiers = [(e["first_ts"], e["limit_tier"]) for e in self._json(capsys, window="session")]
+        assert tiers == [
+            (_W1_START, "default_claude_max_5x"),
+            (opened, "default_claude_max_20x"),
         ]
 
     def test_the_json_carries_the_extra_usage_billed_while_the_window_ran(self, capsys):

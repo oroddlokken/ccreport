@@ -225,6 +225,7 @@ def week_rebase(reset_iso: str, now: float) -> float | None:
 
 def pace_line(
     actual: float, reset_iso: str, now: float, *, rebased_at: float | None = None,
+    read_at: float | None = None,
 ) -> str:
     """How the week's usage compares with the clock: "6d 5h into 7-day window ...".
 
@@ -237,6 +238,12 @@ def pace_line(
     so, because the percentage beside it is counting that span and not the
     seven days. The status line's _weekly_pace cuts the same window the same
     way; these two must not disagree about one reading.
+
+    read_at is when *actual* was read. A percentage read before the rebase
+    counts the allowance the rebase replaced, and pacing it against the new
+    window reported a whole week's usage as a first hour — 23% against 0%
+    expected, minutes after a plan change. The line waits for a fresh reading
+    instead, which arrives with the next fetch.
     """
     reset_epoch = iso_to_epoch(reset_iso)
     week_start = window_start_epoch(reset_iso, WEEK_WINDOW_S, now)
@@ -245,6 +252,8 @@ def pace_line(
     span = float(WEEK_WINDOW_S)
     label = "7-day window"
     if rebased_at is not None and reset_epoch is not None and week_start < rebased_at < reset_epoch:
+        if read_at is not None and read_at < rebased_at:
+            return ""
         week_start, span = rebased_at, reset_epoch - rebased_at
         label = "window since the plan changed"
     elapsed = now - week_start
@@ -333,6 +342,7 @@ def render(data: dict[str, Any], now: float, zone: str) -> list[str]:
         pace = pace_line(
             week, week_reset, now,
             rebased_at=week_rebase(week_reset, now),
+            read_at=iso_to_epoch(_str(data, "last_updated")),
         )
         if pace:
             lines.append(pace)

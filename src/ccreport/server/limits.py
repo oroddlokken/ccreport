@@ -166,14 +166,14 @@ def _merged_instances(
         moved = sorted(
             ts for uuid in uuids[key] for ts in changes.get(uuid, ())
         )
-        for i, stretch in enumerate(windows.rebase_stretches(grouped, moved)):
+        for i, (change, stretch) in enumerate(windows.rebase_cuts(grouped, moved)):
             machines: list[str] = []
             for sample in stretch:
                 if sample["machine"] not in machines:
                     machines.append(sample["machine"])
             merged.append((
                 account,
-                windows.WindowInstance(window, model, reset, stretch, i),
+                windows.WindowInstance(window, model, reset, stretch, i, change),
                 machines,
             ))
     return merged

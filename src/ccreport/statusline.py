@@ -132,6 +132,7 @@ from ccreport.pricing import (
     compute_session_usage,
     model_family,
     pace_days,
+    quota_rebase_epoch,
     rolling_cost_keys,
     window_start_epoch,
 )
@@ -934,7 +935,7 @@ def _config_json_path() -> Path:
     return CLAUDE_CONFIG_JSON
 
 
-def _capture_account(memo: dict | None = None) -> None:
+def _capture_account(memo: dict | None = None, now: float | None = None) -> None:
     """Note the signed-in account when it differs from the last one recorded.
 
     The render is the only capture point: nothing else reads this file, and the
@@ -947,6 +948,13 @@ def _capture_account(memo: dict | None = None) -> None:
     an unchanged stamp skips the parse. The path is in the stamp because
     _config_json_path can start answering with a different file mid-session.
     Pass no memo to force the parse.
+
+    *now* is the render's instant, which the rate-limit snapshot of the same
+    render is stamped with. Both writes have to carry it: the capture used to
+    take its own time.time() at write time and landed milliseconds after a
+    snapshot the render had already taken, so `ccreport limits` read the window
+    that opened at a plan change against the event before it and named the tier
+    the account had just left.
 
     Best-effort: any failure costs the change log one sample, never the status
     line. docs/calculation-reference.md section 9.1 enumerates them.
@@ -963,7 +971,7 @@ def _capture_account(memo: dict | None = None) -> None:
         if isinstance(oauth, dict):
             from ccreport import cache_db
 
-            cache_db.record_account_event(oauth)
+            cache_db.record_account_event(oauth, now=now)
         # Only a parse that got all the way through earns the skip; a torn read
         # or a database held by another writer has to be retried next render.
         if stamp is not None:
@@ -972,25 +980,28 @@ def _capture_account(memo: dict | None = None) -> None:
         pass
 
 
-def _last_tier_change() -> float | None:
-    """When the plan last changed, or None where the log records no change.
+def _last_tier_change(week_reset: str = "") -> float | None:
+    """When a plan change rebased the quota *week_reset* names, None where none did.
 
-    A change rebases every quota under it without moving a reset time, so this
-    is the instant the percentages on screen started counting from. Read on the
-    slow path and carried in the usage dict: the render path reaches it per
+    A rebase restarts every percentage under it without moving a reset time, so
+    this is the instant the readings on screen started counting from. Read on
+    the slow path and carried in the usage dict: the render path reaches it per
     frame and must not open the cache to do it.
+
+    A change the readings never followed is not a rebase. quota_rebase_epoch
+    wants a fall in the stored samples beside the logged change, so a receipt
+    date typed into the timeline mid-week leaves the pace measuring the seven
+    days the window actually ran. This render's own sample is written after this
+    call, which costs a rebase one render before the dagger appears.
 
     Best-effort, like the capture above: an unreadable log costs the segment its
     dagger and its corrected span, never the status line.
     """
     try:
-        from ccreport.accounts import AccountTimeline
-        from ccreport.cache_db import load_account_events
-
-        changes = AccountTimeline(load_account_events()).tier_changes()
+        now = time.time()
+        return quota_rebase_epoch(window_start_epoch(week_reset, WEEK_WINDOW_S, now), now)
     except Exception:  # noqa: BLE001
         return None
-    return changes[-1] if changes else None
 
 
 def _render_account() -> str:
@@ -2773,13 +2784,15 @@ def _fetch_all(
         dcat_data = _fetch_dcat(inp.cwd)
         # Nothing on the line depends on these two; they sit here to overlap the
         # subprocesses started above rather than trail them.
-        _capture_account(memo)
+        _capture_account(memo, now_epoch)
         # After the capture, so a /login this render noticed is the account the
         # segment names rather than the one before it, and a plan change it
         # noticed is the instant the pace measures from.
         account_str = _render_account()
         if usage_data:
-            usage_data["tier_changed_at"] = _last_tier_change()
+            usage_data["tier_changed_at"] = _last_tier_change(
+                str(usage_data.get("week_reset") or ""),
+            )
         # S and W samples come from the raw stdin dict, sonnet/scoped from
         # usage_data — the native S/W merge happens later, in main, and would
         # not change what gets sampled here.

@@ -2910,6 +2910,18 @@ class TestWeekWindowStartAcrossAPlanChange:
         _, week_start = pricing._parse_window_starts(None, self._reset_iso())
         assert week_start.timestamp() == pytest.approx(self.NOW - 5 * 86400, abs=2)
 
+    def _week_fall(self):
+        """A week reading that fell six hours ago, either side of the change."""
+        from ccreport import cache_db
+
+        resets = self.NOW + 2 * 86400
+        cache_db.record_rate_limit_snapshots(
+            [cache_db.RateLimitSample("week", 40.0, resets, None, "stdin")], now=self.NOW - 7 * 3600,
+        )
+        cache_db.record_rate_limit_snapshots(
+            [cache_db.RateLimitSample("week", 2.0, resets, None, "stdin")], now=self.NOW - 6 * 3600 + 60,
+        )
+
     def test_a_change_inside_the_window_moves_the_bound_to_it(self, monkeypatch):
         from ccreport import cache_db, pricing
 
@@ -2919,9 +2931,47 @@ class TestWeekWindowStartAcrossAPlanChange:
         cache_db.record_account_event(
             self._account("default_claude_ai"), now=self.NOW - 6 * 3600,
         )
+        self._week_fall()
         monkeypatch.setattr(pricing, "_local_tz", lambda: UTC)
         _, week_start = pricing._parse_window_starts(None, self._reset_iso())
         assert week_start.timestamp() == pytest.approx(self.NOW - 6 * 3600, abs=2)
+
+    def test_a_change_the_reading_never_followed_leaves_the_bound_alone(self, monkeypatch):
+        """A receipt date typed mid-week dates a plan, not a rebase.
+
+        Without the samples beside it the bound moved to the afternoon someone
+        typed, and the week's dollars became that afternoon's.
+        """
+        from ccreport import cache_db, pricing
+
+        cache_db.record_account_event(
+            self._account("default_claude_max_20x"), now=self.NOW - 20 * 86400,
+        )
+        cache_db.record_account_event(
+            self._account("default_claude_ai"), now=self.NOW - 6 * 3600,
+        )
+        resets = self.NOW + 2 * 86400
+        cache_db.record_rate_limit_snapshots(
+            [cache_db.RateLimitSample("week", 40.0, resets, None, "stdin")], now=self.NOW - 7 * 3600,
+        )
+        cache_db.record_rate_limit_snapshots(
+            [cache_db.RateLimitSample("week", 42.0, resets, None, "stdin")], now=self.NOW - 6 * 3600 + 60,
+        )
+        monkeypatch.setattr(pricing, "_local_tz", lambda: UTC)
+        _, week_start = pricing._parse_window_starts(None, self._reset_iso())
+        assert week_start.timestamp() == pytest.approx(self.NOW - 5 * 86400, abs=2)
+
+    def test_a_fall_with_no_change_behind_it_is_not_a_rebase(self, monkeypatch):
+        """Two machines reading one quota out of step fall and recover."""
+        from ccreport import cache_db, pricing
+
+        cache_db.record_account_event(
+            self._account("default_claude_max_20x"), now=self.NOW - 20 * 86400,
+        )
+        self._week_fall()
+        monkeypatch.setattr(pricing, "_local_tz", lambda: UTC)
+        _, week_start = pricing._parse_window_starts(None, self._reset_iso())
+        assert week_start.timestamp() == pytest.approx(self.NOW - 5 * 86400, abs=2)
 
     def test_the_rebase_lookup_answers_none_where_nothing_changed(self):
         from ccreport import cache_db, pricing

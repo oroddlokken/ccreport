@@ -1554,8 +1554,12 @@ def quota_rebase_epoch(window_start: float | None, now: float) -> float | None:
 
     A change of rate-limit tier rebases the percentage without moving the reset
     time, so from that instant the reading counts a different allowance. None
-    where the account change log records no change inside the span, which is
-    every window that ran on one plan.
+    where the stored week samples show no such restart, which is every window
+    that ran on one plan and every change the readings never followed.
+
+    The change log dates a plan; only a fall in the samples says a quota went
+    with it. windows.observed_rebase wants both halves, and this asks it for
+    them, so the cut here and the one `ccreport limits` draws are one rule.
 
     This opens the cache, so a caller on the status line's render path takes the
     instant from its fetch rather than calling here per frame.
@@ -1563,9 +1567,17 @@ def quota_rebase_epoch(window_start: float | None, now: float) -> float | None:
     if window_start is None:
         return None
     from ccreport.accounts import AccountTimeline
-    from ccreport.cache_db import load_account_events
+    from ccreport.cache_db import load_account_events, load_rate_limit_snapshots
+    from ccreport.windows import observed_rebase
 
-    return AccountTimeline(load_account_events()).rebase_within(window_start, now)
+    changes = AccountTimeline(load_account_events()).tier_changes()
+    if not changes:
+        return None
+    week = [
+        s for s in load_rate_limit_snapshots(since=window_start)
+        if s["window"] == "week" and s["ts"] <= now
+    ]
+    return observed_rebase(week, changes)
 
 
 def _parse_window_starts(

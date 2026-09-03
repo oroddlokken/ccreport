@@ -435,7 +435,8 @@ class TestPaceAcrossAPlanChange:
         assert sl._rebase_epoch({"tier_changed_at": None}) is None
         assert sl._rebase_epoch({"tier_changed_at": "not a time"}) is None
 
-    def test_the_slow_render_reads_the_change_out_of_the_log(self):
+    def test_the_slow_render_reads_the_rebase_out_of_the_log(self):
+        """It wants a logged change and a fall beside it, as `ccreport limits` does."""
         from ccreport import cache_db
 
         acc = {
@@ -444,15 +445,28 @@ class TestPaceAcrossAPlanChange:
             "organizationUuid": None,
             "organizationName": None,
         }
-        assert sl._last_tier_change() is None
+        now = time.time()
+        resets = now + 2 * 86400
+        reset_iso = dt.datetime.fromtimestamp(resets, dt.UTC).isoformat()
+        assert sl._last_tier_change(reset_iso) is None
         cache_db.record_account_event(
-            {**acc, "userRateLimitTier": "default_claude_max_20x"}, now=1000.0,
+            {**acc, "userRateLimitTier": "default_claude_max_20x"}, now=now - 20 * 86400,
         )
-        assert sl._last_tier_change() is None
+        assert sl._last_tier_change(reset_iso) is None
         cache_db.record_account_event(
-            {**acc, "userRateLimitTier": "default_claude_ai"}, now=2000.0,
+            {**acc, "userRateLimitTier": "default_claude_ai"}, now=now - 6 * 3600,
         )
-        assert sl._last_tier_change() == 2000.0
+        cache_db.record_rate_limit_snapshots(
+            [cache_db.RateLimitSample("week", 40.0, resets, None, "stdin")], now=now - 7 * 3600,
+        )
+        assert sl._last_tier_change(reset_iso) is None
+        cache_db.record_rate_limit_snapshots(
+            [cache_db.RateLimitSample("week", 2.0, resets, None, "stdin")], now=now - 6 * 3600 + 60,
+        )
+        assert sl._last_tier_change(reset_iso) == pytest.approx(now - 6 * 3600, abs=2)
+
+    def test_no_week_reset_leaves_the_render_no_window_to_cut(self):
+        assert sl._last_tier_change("") is None
 
     def test_ccu_cuts_the_same_window(self):
         """The dashboard and the status line must not disagree about one reading."""
@@ -472,6 +486,25 @@ class TestPaceAcrossAPlanChange:
         assert "into 7-day window" in plain
         assert "11% expected" in cut
         assert "into window since the plan changed" in cut
+
+    def test_a_reading_older_than_the_rebase_gets_no_pace_line(self):
+        """ccu prices a cached percentage; one read before the rebase counts the old quota."""
+        import datetime as dt
+        import re
+
+        from ccreport import ccu
+
+        reset = dt.datetime.fromtimestamp(self.RESET, dt.UTC).isoformat()
+        stale = ccu.pace_line(
+            11, reset, self.NOW, rebased_at=self.REBASE, read_at=self.REBASE - 120,
+        )
+        fresh = re.sub(
+            r"\x1b\[[0-9;]*m",
+            "",
+            ccu.pace_line(11, reset, self.NOW, rebased_at=self.REBASE, read_at=self.NOW),
+        )
+        assert stale == ""
+        assert "into window since the plan changed" in fresh
 
 
 class TestScopedWeekCost:
@@ -899,7 +932,7 @@ class TestDspVerdictIsMemoized:
         monkeypatch.setenv("CLAUDE_STATUSLINE_HISTORIC_COST", "0")
         monkeypatch.setattr(sl, "_fetch_usage", lambda *a: {})
         monkeypatch.setattr(sl, "_fetch_dcat", lambda cwd: {})
-        monkeypatch.setattr(sl, "_capture_account", lambda memo=None: None)
+        monkeypatch.setattr(sl, "_capture_account", lambda memo=None, now=None: None)
         monkeypatch.setattr(sl, "_accumulate_cache_stats", lambda *a: (0, 0, 0))
         monkeypatch.setattr(sl, "compute_session_usage", lambda *a: (0.0, frozenset()))
         inp = sl._InputData(
@@ -1221,7 +1254,7 @@ class TestARenderServesTheStoredProjectSplit:
         monkeypatch.setattr(cache_db, "read_cost_summary", fake_read)
         monkeypatch.setattr(sl, "_fetch_usage", fake_fetch_usage)
         monkeypatch.setattr(sl, "_fetch_dcat", lambda cwd: {})
-        monkeypatch.setattr(sl, "_capture_account", lambda memo=None: None)
+        monkeypatch.setattr(sl, "_capture_account", lambda memo=None, now=None: None)
         monkeypatch.setattr(sl, "_accumulate_cache_stats", lambda *a: (0, 0, 0))
         monkeypatch.setattr(sl, "compute_session_usage", lambda *a: (0.0, frozenset()))
         inp = sl._InputData(
@@ -1406,6 +1439,49 @@ class TestCaptureAccount:
         for _ in range(5):
             sl._capture_account()
         assert len(self._log()) == 1
+
+    def test_the_capture_is_stamped_with_the_render_instant(self, config):
+        """One render's two writes have to agree about when it happened."""
+        import json
+
+        config.write_text(json.dumps({"oauthAccount": self.ACC}))
+        sl._capture_account(None, 1788455323.710701)
+        (event,) = self._log()
+        assert event["ts"] == 1788455323.710701
+
+    def test_a_window_opened_by_a_plan_change_names_the_new_tier(self, config):
+        """The capture used to land milliseconds after the snapshot it shares a
+        render with, so `ccreport limits` read the rebased stretch's first
+        sample against the event before the change and named the plan it left.
+        """
+        import datetime as dt
+        import json
+
+        from ccreport import cache_db
+        from ccreport.accounts import AccountTimeline
+
+        now = 1788455323.710701
+        resets = now + 2 * 86400
+        config.write_text(json.dumps({"oauthAccount": self.ACC}))
+        sl._capture_account(None, now - 3600)
+        cache_db.record_rate_limit_snapshots(
+            [cache_db.RateLimitSample("week", 40.0, resets, None, "stdin")], now=now - 3600,
+        )
+        config.write_text(json.dumps({
+            "oauthAccount": {**self.ACC, "userRateLimitTier": "default_claude_max_20x"},
+        }))
+        sl._capture_account(None, now)
+        cache_db.record_rate_limit_snapshots(
+            [cache_db.RateLimitSample("week", 0.0, resets, None, "stdin")], now=now,
+        )
+        tiers = AccountTimeline(cache_db.load_account_events())
+        opened, rebased = (
+            tiers.tier_at(dt.datetime.fromtimestamp(row["ts"], dt.UTC))
+            for row in cache_db.load_rate_limit_snapshots()
+        )
+        assert rebased == "default_claude_max_20x"
+        # The stretch that ran wholly before the change keeps the plan it filled on.
+        assert opened == "default_claude_max_5x"
 
     def test_a_switch_between_renders_is_captured(self, config):
         import json

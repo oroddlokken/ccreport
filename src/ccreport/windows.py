@@ -138,6 +138,9 @@ class WindowInstance:
     stretch: int = 0
     """Which fill curve under this reset time, 0 for the one that opened it."""
 
+    plan_change_at: float | None = None
+    """The plan change this instance's quota opened on, None where none did."""
+
     @property
     def peak(self) -> float:
         """The fullest this window was ever seen. Raw float, as stored."""
@@ -191,6 +194,18 @@ class WindowInstance:
     def rebased(self) -> bool:
         """Whether an earlier stretch filled a different allowance under this reset."""
         return self.stretch > 0
+
+    @property
+    def attributed_at(self) -> float:
+        """The instant a report resolves this instance's account and tier at.
+
+        The first sample, unless a plan change opened the quota — then the
+        change, which the sample can only precede. Claude Code refreshes the
+        blob the tiers come from on /login, so a capture dates a plan change no
+        earlier than it happened; a window opened by one is otherwise read
+        against the event before it and named for the plan it left.
+        """
+        return self.plan_change_at if self.plan_change_at is not None else self.first_ts
 
     @property
     def last_ts(self) -> float:
@@ -305,21 +320,78 @@ def window_instances(
     for s in samples:
         resets = rl_window_key(s["resets_at"])
         by_key.setdefault((s["window"], s["model"], resets), []).append(s)
-    return [
-        WindowInstance(window, model, resets, stretch, i)
-        for (window, model, resets), grouped in by_key.items()
-        for i, stretch in enumerate(rebase_stretches(grouped, changes))
-    ]
+
+    # Reset order per quota, so each instance can see the reset the one before
+    # it ran to. A window that opened before that is a quota reset early, which
+    # is what a plan change does to the 5-hour one — the percentage has nothing
+    # to fall from, so rebase_cuts cannot see it and only the schedule can.
+    instances: list[WindowInstance] = []
+    previous: dict[tuple[str, str | None], float] = {}
+    for key in sorted(by_key, key=lambda k: (k[0], k[1] or "", k[2])):
+        window, model, resets = key
+        earlier = previous.get((window, model))
+        previous[(window, model)] = resets
+        for i, (change, stretch) in enumerate(rebase_cuts(by_key[key], changes)):
+            at = change
+            if i == 0 and earlier is not None and stretch[0]["ts"] < earlier:
+                at = _change_for(changes, stretch[0]["ts"], stretch[0]["ts"])
+            instances.append(WindowInstance(window, model, resets, stretch, i, at))
+    return instances
 
 
-def _change_between(changes: Sequence[float], before: float, after: float) -> bool:
-    """Whether a recorded plan change lands close enough to explain a fall between them."""
+def _change_for(changes: Sequence[float], before: float, after: float) -> float | None:
+    """The recorded plan change closest to a fall between them, None where none is near.
+
+    In range is within REBASE_CHANGE_TOLERANCE_S of the pair. Closest, because
+    the tolerance is an hour and renders are minutes apart, so two changes can
+    both be in range of both falls — a /login writing a transitional tier and
+    the real one seconds later is two, and the fall belongs to whichever it
+    straddles.
+    """
     lo = bisect.bisect_left(changes, before - REBASE_CHANGE_TOLERANCE_S)
-    return lo < len(changes) and changes[lo] <= after + REBASE_CHANGE_TOLERANCE_S
+    hi = bisect.bisect_right(changes, after + REBASE_CHANGE_TOLERANCE_S)
+    if lo >= hi:
+        return None
+    return min(
+        changes[lo:hi],
+        key=lambda c: (0.0 if before <= c <= after else min(abs(c - before), abs(c - after)), -c),
+    )
 
 
-def rebase_stretches(samples: list[dict], changes: Sequence[float]) -> list[list[dict]]:
+def observed_rebase(samples: Sequence[dict], changes: Sequence[float]) -> float | None:
+    """Where *samples* last show the quota rebased, None where they show no rebase.
+
+    rebase_cuts' rule asked of one window rather than of a report: a fall
+    past REBASE_DROP_PP with a recorded plan change beside it. What comes back
+    is the change and not the falling sample, because the new allowance counts
+    from there and the reset time it runs to did not move.
+
+    A change on its own is not a rebase. A receipt date typed into the timeline
+    while the week is running dates a plan the readings already counted, and
+    taking the window start from it prices the week from that afternoon.
+
+    *samples* must be one window's, in ts order, and *changes* sorted.
+    """
+    found: float | None = None
+    prev: dict | None = None
+    for s in samples:
+        if prev is not None and prev["used_pct"] - s["used_pct"] > REBASE_DROP_PP:
+            change = _change_for(changes, prev["ts"], s["ts"])
+            if change is not None:
+                found = change
+        prev = s
+    return found
+
+
+def rebase_cuts(
+    samples: list[dict], changes: Sequence[float],
+) -> list[tuple[float | None, list[dict]]]:
     """*samples* cut where a recorded plan change explains a fall in the reading.
+
+    Each cut comes back beside the change that opened it, None for the stretch
+    that opened the window — that is the instant the quota behind it started
+    counting, and a report attributes the row there rather than at a first
+    sample the capture can trail.
 
     One reset time can cover two fill curves: a plan change restarts the
     percentage against the new allowance and leaves resets_at where it was, so a
@@ -338,17 +410,18 @@ def rebase_stretches(samples: list[dict], changes: Sequence[float]) -> list[list
     so a caller can enumerate the result without checking for the ordinary
     window.
     """
-    stretches: list[list[dict]] = [[]]
+    cuts: list[tuple[float | None, list[dict]]] = [(None, [])]
     for s in samples:
-        prev = stretches[-1][-1] if stretches[-1] else None
-        if (
-            prev is not None
-            and prev["used_pct"] - s["used_pct"] > REBASE_DROP_PP
-            and _change_between(changes, prev["ts"], s["ts"])
-        ):
-            stretches.append([])
-        stretches[-1].append(s)
-    return stretches
+        prev = cuts[-1][1][-1] if cuts[-1][1] else None
+        change = (
+            _change_for(changes, prev["ts"], s["ts"])
+            if prev is not None and prev["used_pct"] - s["used_pct"] > REBASE_DROP_PP
+            else None
+        )
+        if change is not None:
+            cuts.append((change, []))
+        cuts[-1][1].append(s)
+    return cuts
 
 
 def instance_order(inst: WindowInstance) -> tuple[int, str, float, str, int]:
