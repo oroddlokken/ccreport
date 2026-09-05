@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -71,6 +71,11 @@ def app(tmp_path):
 @pytest.fixture
 def client(app):
     return TestClient(app)
+
+
+def _month_end(moment: datetime) -> date:
+    """The last day of *moment*'s month, which is the date a month row converts at."""
+    return (moment.replace(day=28) + timedelta(days=4)).replace(day=1).date() - timedelta(days=1)
 
 
 def _view(app, days=30):
@@ -864,12 +869,22 @@ class TestPlanTile:
         assert "-$" not in tile.subline
 
     def test_a_month_row_carries_its_saved_amount_in_kroner(self, app, monkeypatch):
-        """At the month's own last day, not at today's rate."""
+        """At the month's own last day, not at today's rate.
+
+        A rate on each month end the corpus reaches, because one keyed on today
+        is found only in the ten days get_rate walks back over and the test
+        failed on every date outside them. Today carries a different rate,
+        which is what a row converted at the wrong date would pick up -- unless
+        today is itself a month end, where the two keys collide and the month
+        end wins.
+        """
         from ccreport import exchange
 
-        monkeypatch.setattr(
-            exchange, "read_rates_since", lambda since: {NOW.date().isoformat(): 10.0},
-        )
+        this_month_end = _month_end(NOW)
+        last_month_end = _month_end(NOW.replace(day=1) - timedelta(days=1))
+        rates = {NOW.date().isoformat(): 99.0,
+                 last_month_end.isoformat(): 10.0, this_month_end.isoformat(): 10.0}
+        monkeypatch.setattr(exchange, "read_rates_since", lambda since: rates)
         self._declare(app)
         rows = [r for r in _view(app, 90).breakdowns["month"] if r.get("plan_saved_nok")]
         assert rows

@@ -307,10 +307,21 @@ _RECONCILE_SQL = """\
 UPDATE server_records AS s
    SET dup = CASE WHEN s.id = w.min_id THEN 0 ELSE 1 END
   FROM (SELECT account_uuid, dk, MIN(id) AS min_id
-          FROM server_records
+          FROM server_records INDEXED BY idx_srec_account_dk
          WHERE (account_uuid, dk) IN (VALUES %s)
       GROUP BY account_uuid, dk) AS w
  WHERE s.account_uuid = w.account_uuid AND s.dk = w.dk
+   AND s.dup <> CASE WHEN s.id = w.min_id THEN 0 ELSE 1 END
+"""
+"""One chunk of keys, re-flagged inside the write transaction a push holds.
+
+INDEXED BY holds the inner search on (account_uuid, dk); without it the planner
+searches idx_srec_acct_ts and reads the account's every row per chunk, since this
+database refuses ANALYZE and has no statistics to say otherwise -- 1.52s against
+0.37s for a 10,000-key file over 800,000 rows. The trailing comparison writes
+only the rows whose flag moves, which takes that file to 0.02s: a re-push
+re-decides thousands of keys and changes almost none, and each unchanged row it
+wrote was a dirtied page and more WAL for a value that already stood.
 """
 
 
@@ -350,6 +361,12 @@ def reconcile_all_dup(conn: sqlite3.Connection) -> None:
     has. Cleared rather than assumed, because this is the form that has to
     answer for whatever it finds -- the incremental one never writes a 1 there,
     but this is what a caller reaches for when it does not trust the column.
+
+    The trailing comparison writes only the rows whose flag moves, which is a
+    machine deletion: the cascade shifts a handful of keys and the rest of the
+    table already reads correctly, 0.86s against 3.60s over 800,000 rows. The
+    migration that fills the column moves every row and pays the write either
+    way.
     """
     conn.execute(
         "UPDATE server_records SET dup = 0 WHERE dup <> 0 AND (dk IS NULL OR dk = '')",
@@ -362,6 +379,7 @@ def reconcile_all_dup(conn: sqlite3.Connection) -> None:
                  WHERE dk IS NOT NULL AND dk <> ''
               GROUP BY account_uuid, dk) AS w
          WHERE s.account_uuid = w.account_uuid AND s.dk = w.dk
+           AND s.dup <> CASE WHEN s.id = w.min_id THEN 0 ELSE 1 END
     """)
 
 
@@ -500,6 +518,16 @@ code, which is the trade: a local disk failing takes the process down instead of
 raising. Nothing here is on a network filesystem.
 """
 
+BUSY_TIMEOUT_MS = 5000
+"""How long a statement waits for another connection's write before it raises.
+
+sqlite3's own default, set here so the number is readable and so `truncate_wal`
+has something to restore. A push arrives as one request per file and a write
+takes milliseconds, so a wait this long means something is wrong rather than
+busy -- and the request that hits the ceiling 500s, which the client retries on
+its next interval.
+"""
+
 WAL_TRUNCATE_BYTES = 64 * 1024 * 1024
 """How large the WAL may grow before a checkpoint truncates it.
 
@@ -524,9 +552,17 @@ def truncate_wal(conn: sqlite3.Connection, path: Path) -> bool:
             return False
     except OSError:
         return False
-    # (busy, pages in the WAL, pages moved back). Only the first says whether
-    # the file was reset; the other two describe a checkpoint that ran either way.
-    return conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    # A TRUNCATE checkpoint holds the writer lock while it waits for the readers
+    # it needs gone, so on the usual timeout it blocks every other push for five
+    # seconds and then gives up regardless: 5.769s against 0.000s with one report
+    # mid-query, and 0.008s where the moment really was free.
+    conn.execute("PRAGMA busy_timeout = 0")
+    try:
+        # (busy, pages in the WAL, pages moved back). Only the first says whether
+        # the file was reset; the other two describe a checkpoint that ran either way.
+        return conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    finally:
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -540,6 +576,7 @@ def connect(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), isolation_level=None)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute(f"PRAGMA mmap_size = {MMAP_SIZE}")
         if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:

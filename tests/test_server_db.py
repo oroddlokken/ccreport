@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 
 import pytest
 
@@ -113,6 +114,15 @@ class TestSchema:
         finally:
             second.close()
 
+    def test_the_reconcile_searches_the_account_and_key_index(self, conn):
+        """On idx_srec_acct_ts it reads the account's every row per chunk: 1.52s
+        against 0.37s over 800,000, and no ANALYZE may exist here to fix it."""
+        plan = str(conn.execute(
+            "EXPLAIN QUERY PLAN " + db._RECONCILE_SQL % "(?, ?)", ("acct", "dk"),
+        ).fetchall())
+        assert "idx_srec_account_dk" in plan, plan
+        assert "idx_srec_acct_ts" not in plan, plan
+
     def test_the_group_index_leads_with_the_dedup_flag(self, conn):
         """Half the table is dup=1; leading with it means a fold never reads that half."""
         cols = [row[2] for row in conn.execute("PRAGMA index_info(idx_srec_group)")]
@@ -180,6 +190,44 @@ class TestSchema:
             assert path.with_name(path.name + "-wal").stat().st_size == 0
         finally:
             conn.close()
+
+    def test_a_reader_makes_the_truncation_give_up_at_once(self, tmp_path, monkeypatch):
+        """It holds the writer lock while it waits, so waiting out the busy
+        timeout blocks every other push for 5.769s and then gives up anyway."""
+        import threading
+
+        path = tmp_path / "server.db"
+        conn = db.connect(path)
+        started, release, elapsed = threading.Event(), threading.Event(), []
+
+        def hold() -> None:
+            reader = db.connect(path)
+            reader.execute("BEGIN")
+            reader.execute("SELECT COUNT(*) FROM machines").fetchone()
+            started.set()
+            release.wait()
+            reader.execute("COMMIT")
+            reader.close()
+
+        thread = threading.Thread(target=hold, daemon=True)
+        try:
+            db.upsert_machine(conn, "m1", "laptop", 100.0)
+            monkeypatch.setattr(db, "WAL_TRUNCATE_BYTES", 1)
+            thread.start()
+            started.wait()
+            start = time.perf_counter()
+            assert db.truncate_wal(conn, path) is False
+            elapsed.append(time.perf_counter() - start)
+            assert elapsed[0] < 1.0, elapsed
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == db.BUSY_TIMEOUT_MS
+        finally:
+            release.set()
+            thread.join()
+            conn.close()
+
+    def test_a_connection_waits_out_another_write_before_it_raises(self, conn):
+        """A request that hits this ceiling 500s; the number is here to be read."""
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == db.BUSY_TIMEOUT_MS
 
     def test_a_new_column_reaches_a_database_that_already_has_the_table(
         self, tmp_path, monkeypatch,
@@ -407,6 +455,15 @@ class TestDedupFlag:
         conn.execute("UPDATE server_records SET dup = 1 - dup")
         db.reconcile_all_dup(conn)
         assert self._flags(conn) == incremental
+
+    def test_a_flag_that_already_stands_is_not_rewritten(self, conn):
+        """A re-push re-decides every key in the file and moves almost none;
+        each unchanged row it wrote was a dirtied page and more WAL."""
+        rows = [db.record_to_row(_record(mid=f"msg_{n}", dk=f"dk_{n}")) for n in range(20)]
+        self._push(conn, "m1", rows)
+        before = conn.total_changes
+        db._reconcile_dup(conn, {("acct-1", f"dk_{n}") for n in range(20)})
+        assert conn.total_changes == before
 
     def test_more_keys_than_one_statement_holds_are_all_flagged(self, conn):
         """The reconcile chunks its VALUES list; the seam must not drop a key."""
