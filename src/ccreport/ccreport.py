@@ -9,7 +9,6 @@ import argparse
 import hashlib
 import json
 import os
-import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -2003,79 +2002,45 @@ def cmd_migrate(args) -> None:
         print(f"moved {line}")
 
 
-def _pull_ff_only(root: Path) -> int:
-    """Fast-forward the checkout and echo what git said. Returns git's exit code.
+# The wrappers an install ships beside the package, in the order a person wires
+# them up. pyproject's force-include list is the other half of this pair and
+# tests/test_ccreport.py fails when the two drift.
+SHIPPED_SCRIPTS = (
+    "statusline-command_x.sh",
+    "quota-guard.sh",
+    "clear-statusline-memo.sh",
+    "clear-statusline-cache.sh",
+)
 
-    `--ff-only` and nothing else. A merge or a rebase here would resolve someone
-    else's conflicts inside a reporting tool; refusing leaves the user in a tree
-    they can still reason about, with git's own message saying why.
+
+def scripts_dir() -> Path | None:
+    """The directory holding those wrappers, or None where neither layout is here.
+
+    A wheel carries them at ccreport/scripts/; a checkout has them in bin/,
+    which is where the wheel copied them from.
     """
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(root), "pull", "--ff-only"],
-            capture_output=True, text=True,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"Could not run git pull: {exc}", file=sys.stderr)
-        return 1
-    for stream, sink in ((out.stdout, sys.stdout), (out.stderr, sys.stderr)):
-        text = stream.strip()
-        if text:
-            print(text, file=sink)
-    if out.returncode != 0:
-        print("Fast-forward refused — the checkout has commits of its own, "
-              "or the pull needs a merge. Resolve it with git.", file=sys.stderr)
-    return out.returncode
+    installed = Path(__file__).resolve().parent / "scripts"
+    if installed.is_dir():
+        return installed
+    checkout = Path(__file__).resolve().parents[2] / "bin"
+    return checkout if checkout.is_dir() else None
 
 
-def cmd_update(args) -> None:
-    """Report how far origin's master has moved past this checkout.
+def cmd_scripts() -> None:
+    """Print one wrapper path per line.
 
-    The status line renders the same number, but from an answer a detached
-    child refreshes twice a day. Asking here runs the check live, because the
-    user asked now, and writes the result back through the same meta keys — so
-    a check from the CLI also paces the next spawn and refreshes the segment.
-
-    Every outcome the check itself can reach exits 0, including the ones that
-    could not answer: not knowing is not a failure of the command. Only a
-    refused `--pull` exits non-zero, with git's own code.
+    Claude Code's settings.json takes a path rather than a command on PATH, so
+    a machine that installed the wheel needs to be told where these landed.
     """
-    from ccreport import update_check
-
-    root = update_check.checkout_root()
-    if root is None:
-        print("Installed as a package — there is no checkout here to update.")
-        return
-
-    upstream = f"origin/{update_check.UPSTREAM_BRANCH}"
-    sha = update_check.local_head_sha(root)
-    if sha is None:
-        cache_db.write_update_check("", None, time.time())
-        print(f"Could not read HEAD in {root}.")
-        return
-
-    slug = update_check.remote_slug(root)
-    behind = update_check.commits_behind(slug, sha) if slug else None
-    cache_db.write_update_check(sha, behind, time.time())
-
-    if slug is None:
-        print("origin is not a GitHub remote, so there is nothing to compare against.")
-        return
-    if behind is None:
-        print(f"Could not reach GitHub to compare against {upstream}.")
-        return
-    if behind == 0:
-        print(f"Up to date with {upstream}.")
-        return
-
-    commits = "commit" if behind == 1 else "commits"
-    print(f"{behind} {commits} behind {upstream}.")
-    if not args.pull:
-        print("Pull them: ccreport update --pull")
-        return
-    code = _pull_ff_only(root)
-    if code != 0:
-        sys.exit(code)
+    directory = scripts_dir()
+    found = [directory / name for name in SHIPPED_SCRIPTS
+             if (directory / name).is_file()] if directory else []
+    if not found:
+        print("This install ships no wrappers: neither ccreport/scripts nor bin is here.",
+              file=sys.stderr)
+        sys.exit(1)
+    for path in found:
+        print(path)
 
 
 def cmd_overrides(args) -> None:
@@ -2985,7 +2950,6 @@ def main() -> None:
                "  ccreport tiers plans.toml # declare plan changes off the receipts\n"
                "  ccreport limits -w session\n"
                "  ccreport archive --dry-run  # what the purged half folds to\n"
-               "  ccreport update           # is master ahead of this checkout?\n"
                "  ccreport migrate --dry-run\n"
                "  ccreport --server https://ccreport.example.net monthly\n"
                "  ccreport push            # send this machine's records\n"
@@ -3060,10 +3024,8 @@ def main() -> None:
     pmg.add_argument("--dry-run", "-n", action="store_true",
                      help="List what would move without moving it")
 
-    # The same "master has moved" check the status line renders, asked live.
-    pup = sub.add_parser("update", help="Check whether origin's master is ahead of this checkout")
-    pup.add_argument("--pull", action="store_true",
-                     help="Fast-forward the checkout when it is behind")
+    # Where the wrappers landed, for the settings.json that has to name one.
+    sub.add_parser("scripts", help="Print the path of each shell wrapper this install ships")
 
     # Per-account spend ceilings, and the projections measured against them.
     pb = sub.add_parser("budget", help="Per-account spend ceilings and the spend forecast")
@@ -3181,10 +3143,9 @@ def main() -> None:
     if args.command in ("overrides", "merge", "unmerge"):
         cmd_overrides(args)
         return
-    # Reads no records and prints no report: it wants the checkout and the
-    # compare API, neither of which the corpus load below has anything to add to.
-    if args.command == "update":
-        cmd_update(args)
+    # Answers off this install's own layout; there are no records behind it.
+    if args.command == "scripts":
+        cmd_scripts()
         return
     # Loads records itself, bounded to the span its samples cover, so it runs
     # here rather than falling through to the report path's unbounded load and

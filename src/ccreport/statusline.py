@@ -72,9 +72,9 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
       CLAUDE_STATUSLINE_30D_COST           — rolling 30-day cost
       CLAUDE_STATUSLINE_AT_COST            — all-time cost (when > 30D)
   CLAUDE_STATUSLINE_USAGE_JSON              — pre-provided usage JSON (skips usage_api.py)
-  CLAUDE_STATUSLINE_UPDATE                  — a line of its own when this ccreport checkout is
-                                              behind origin's master, from a check that runs
-                                              twice a day against GitHub's API
+  CLAUDE_STATUSLINE_UPDATE                  — a line of its own when a Homebrew-installed
+                                              ccreport is behind the newest release, from a
+                                              check that runs twice a day against GitHub's API
 
 Other environment variables:
   CLAUDE_STATUSLINE_LINE<n>_MSG             — text appended to rendered line n (n is 1-4) after
@@ -160,10 +160,10 @@ COST_SUMMARY_MAX_AGE = 900  # seconds the cached compute_costs() result stays us
 # render shows the machine-wide total alone rather than an hour-old split.
 COST_SUMMARY_FALLBACK_MAX_AGE = 3600
 FAST_TTL_S = 15            # seconds a render may reuse the previous render's fetch results
-# Every 36 hours, which is what the update line is worth: master moves in
-# commits, not releases, and nobody pulls on the hour. The stamp behind this is
-# written by the child on every outcome, so an unreachable API waits the same
-# interval as an answered one instead of spawning a process per render.
+# Every 36 hours, which is what the update line is worth: releases land weeks
+# apart and nobody upgrades on the hour. The stamp behind this is written by
+# the child on every outcome, so an unreachable API waits the same interval as
+# an answered one instead of spawning a process per render.
 UPDATE_CHECK_INTERVAL_S = 129_600
 EXTRA_ACCRUAL_PCT = 90     # session % from which extra credits could start accruing
 LAYOUT_WIDE_COLS = 150     # terminal columns threshold for 2-line layout
@@ -1052,15 +1052,15 @@ def _spawn_update_check() -> None:
 
 
 def _render_update(now: float) -> str:
-    """How far origin's master is ahead of this checkout, plus the spawn that refreshes it.
+    """Whether a newer release exists than this Homebrew install, plus the spawn that refreshes it.
 
     Slow path only, which is what the one meta read buys: the rendered string
     goes into the fetch cache beside the other rendered segments, so the
     fast path neither reads the database nor re-spawns.
 
-    Three things have to hold before the line appears. The count is above
-    zero; the check is recent enough to still describe the world; and the SHA
-    it compared is still the one at HEAD — a pull between the check and the
+    Three things have to hold before the line appears. A tag was stored; the
+    check is recent enough to still describe the world; and the version it
+    compared is still the one installed — an upgrade between the check and the
     render silences the line rather than letting it repeat an answer the user
     has already acted on.
     """
@@ -1068,26 +1068,26 @@ def _render_update(now: float) -> str:
         return ""
     from ccreport import update_check
 
-    root = update_check.checkout_root()
-    if root is None:
-        return ""  # installed as a package: nothing here to pull into
+    if not update_check.is_brew_install():
+        return ""  # every other install updates by a route this cannot name
     try:
         from ccreport import cache_db
 
-        checked_at, compared_sha, behind = cache_db.read_update_check()
+        checked_at, compared_version, latest = cache_db.read_update_check()
     except Exception:  # noqa: BLE001 — a busy database costs the line, not the render
         return ""
     if now - checked_at >= UPDATE_CHECK_INTERVAL_S:
         _spawn_update_check()
-    if not behind or now - checked_at >= update_check.UPDATE_MAX_AGE_S:
+    if not latest or now - checked_at >= update_check.UPDATE_MAX_AGE_S:
         return ""
-    if compared_sha != update_check.local_head_sha(root):
+    current = update_check.installed_version()
+    if not current or compared_version != current:
         return ""
-    # Not `git pull`: this line renders in whatever project the session is in,
-    # where that command pulls that project's repo and not this checkout.
-    # `ccreport update --pull` is the one that works from any directory.
-    return (f"\033[0;33m↑ A newer version of ccreport is available, run{RST}"
-            f"{SUBDUED} 'ccreport update --pull' {RST}\033[0;33mto update{RST}")
+    if not update_check.is_newer(latest, current):
+        return ""
+    return (f"\033[0;33m↑ ccreport {latest} is available, run{RST}"
+            f"{SUBDUED} 'brew upgrade {update_check.BREW_FORMULA}' {RST}"
+            f"\033[0;33mto update{RST}")
 
 
 _PUSH_CONFIG = Path.home() / ".config" / "ccreport" / "push.toml"

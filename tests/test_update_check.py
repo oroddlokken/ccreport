@@ -1,14 +1,13 @@
-"""Tests for update_check.py — the twice-a-day "master has moved" check.
+"""Tests for update_check.py — the twice-a-day "a newer release exists" check.
 
 GitHub is never called: every test patches the urlopen underneath
-``commits_behind``, and every git invocation is a stubbed ``subprocess.run``.
+``latest_release``, and every install shape is a patched ``__file__``.
 """
 
 from __future__ import annotations
 
 import io
 import json
-import subprocess
 import urllib.error
 import urllib.request
 from email.message import Message
@@ -17,26 +16,17 @@ import pytest
 
 from ccreport import cache_db, update_check
 
-SHA = "a" * 40
-OTHER_SHA = "b" * 40
+HERE = "0.1.1"
+BREW = "/opt/homebrew/Cellar/ccreport/0.1.1/libexec/lib/python3.13/site-packages/ccreport"
 
 
-def _mkrepo(tmp_path, head: str = "ref: refs/heads/master\n"):
-    """A tree shaped like the checkout: <root>/src/ccreport/, <root>/.git/."""
-    (tmp_path / "src" / "ccreport").mkdir(parents=True)
-    (tmp_path / ".git").mkdir()
-    (tmp_path / ".git" / "HEAD").write_text(head, encoding="utf-8")
-    return tmp_path
-
-
-def _as_module(monkeypatch, root):
-    """Point update_check at *root* by moving where it thinks it lives."""
-    monkeypatch.setattr(
-        update_check, "__file__", str(root / "src" / "ccreport" / "update_check.py"))
+def _as_module(monkeypatch, directory: str):
+    """Point update_check at *directory* by moving where it thinks it lives."""
+    monkeypatch.setattr(update_check, "__file__", f"{directory}/update_check.py")
 
 
 def _serve(monkeypatch, body, status_code=None):
-    """Answer the compare request with *body*, or raise an HTTPError instead."""
+    """Answer the release request with *body*, or raise an HTTPError instead."""
     def _urlopen(req, timeout=None):
         if status_code is not None:
             raise urllib.error.HTTPError(req.full_url, status_code, "no", Message(), None)
@@ -45,249 +35,210 @@ def _serve(monkeypatch, body, status_code=None):
     monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
 
 
-def _serve_git(monkeypatch, stdout: str, returncode: int = 0):
-    def _run(cmd, **kwargs):
-        return subprocess.CompletedProcess(cmd, returncode, stdout, "")
+class TestIsBrewInstall:
+    """Which installs the check speaks for."""
 
-    monkeypatch.setattr(subprocess, "run", _run)
+    @pytest.mark.parametrize("directory", [
+        "/opt/homebrew/Cellar/ccreport/0.1.1/libexec/lib/python3.13/site-packages/ccreport",
+        "/usr/local/Cellar/ccreport/0.1.1/libexec/lib/python3.13/site-packages/ccreport",
+        "/home/linuxbrew/.linuxbrew/Cellar/ccreport/0.1.1/lib/python3.13/site-pkgs/ccreport",
+    ])
+    def test_every_prefix_homebrew_uses(self, monkeypatch, directory):
+        _as_module(monkeypatch, directory)
+        assert update_check.is_brew_install() is True
 
+    def test_a_checkout_is_not_one(self, monkeypatch):
+        _as_module(monkeypatch, "/Users/me/git/ccreport/src/ccreport")
+        assert update_check.is_brew_install() is False
 
-class TestCheckoutRoot:
-    """Whether there is a checkout to pull into at all."""
+    def test_a_uv_tool_install_is_not_one(self, monkeypatch):
+        _as_module(
+            monkeypatch,
+            "/Users/me/.local/share/uv/tools/ccreport/lib/python3.13/site-packages/ccreport")
+        assert update_check.is_brew_install() is False
 
-    def test_a_git_directory_beside_src_is_the_root(self, tmp_path, monkeypatch):
-        root = _mkrepo(tmp_path)
-        _as_module(monkeypatch, root)
-        assert update_check.checkout_root() == root
+    def test_another_formulas_keg_is_not_one(self, monkeypatch):
+        """The name is half the match: ccreport vendored inside some other keg is not this."""
+        _as_module(monkeypatch, "/opt/homebrew/Cellar/dogcat/1.0/libexec/ccreport")
+        assert update_check.is_brew_install() is False
 
-    def test_no_git_directory_is_no_checkout(self, tmp_path, monkeypatch):
-        """What `uv tool install .` leaves: the package, no repository."""
-        (tmp_path / "src" / "ccreport").mkdir(parents=True)
-        _as_module(monkeypatch, tmp_path)
-        assert update_check.checkout_root() is None
-
-    def test_a_git_file_is_no_checkout(self, tmp_path, monkeypatch):
-        """A submodule or worktree points elsewhere; the readers want the directory."""
-        (tmp_path / "src" / "ccreport").mkdir(parents=True)
-        (tmp_path / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
-        _as_module(monkeypatch, tmp_path)
-        assert update_check.checkout_root() is None
-
-
-class TestLocalHeadSha:
-    """Reading HEAD out of .git, in each layout git leaves it in."""
-
-    def test_a_loose_ref(self, tmp_path):
-        root = _mkrepo(tmp_path)
-        refs = root / ".git" / "refs" / "heads"
-        refs.mkdir(parents=True)
-        (refs / "master").write_text(f"{SHA}\n", encoding="utf-8")
-        assert update_check.local_head_sha(root) == SHA
-
-    def test_a_detached_head_holds_the_sha_itself(self, tmp_path):
-        root = _mkrepo(tmp_path, head=f"{SHA}\n")
-        assert update_check.local_head_sha(root) == SHA
-
-    def test_packed_refs_when_no_loose_file_exists(self, tmp_path):
-        """Where a fresh clone keeps every branch until something writes to one."""
-        root = _mkrepo(tmp_path)
-        (root / ".git" / "packed-refs").write_text(
-            "# pack-refs with: peeled fully-peeled sorted\n"
-            f"{OTHER_SHA} refs/heads/other\n"
-            f"{SHA} refs/heads/master\n"
-            f"^{OTHER_SHA}\n",
-            encoding="utf-8",
-        )
-        assert update_check.local_head_sha(root) == SHA
-
-    def test_a_loose_ref_wins_over_packed_refs(self, tmp_path):
-        root = _mkrepo(tmp_path)
-        refs = root / ".git" / "refs" / "heads"
-        refs.mkdir(parents=True)
-        (refs / "master").write_text(f"{SHA}\n", encoding="utf-8")
-        (root / ".git" / "packed-refs").write_text(
-            f"{OTHER_SHA} refs/heads/master\n", encoding="utf-8")
-        assert update_check.local_head_sha(root) == SHA
-
-    def test_a_ref_named_nowhere_is_none(self, tmp_path):
-        root = _mkrepo(tmp_path)
-        (root / ".git" / "packed-refs").write_text(
-            f"{OTHER_SHA} refs/heads/other\n", encoding="utf-8")
-        assert update_check.local_head_sha(root) is None
-
-    def test_no_head_file_is_none(self, tmp_path):
-        (tmp_path / ".git").mkdir()
-        assert update_check.local_head_sha(tmp_path) is None
-
-    def test_a_head_that_is_neither_sha_nor_ref_is_none(self, tmp_path):
-        root = _mkrepo(tmp_path, head="not a ref\n")
-        assert update_check.local_head_sha(root) is None
+    def test_a_directory_merely_named_cellar_is_not_one(self, monkeypatch):
+        _as_module(monkeypatch, "/Users/me/Cellar-notes/ccreport")
+        assert update_check.is_brew_install() is False
 
 
-class TestRemoteSlug:
-    """owner/repo, derived from origin so a fork checks itself."""
+class TestParseVersion:
+    """Turning both spellings into something orderable."""
 
-    CASES = [
-        ("git@github.com:oroddlokken/ccreport.git", "oroddlokken/ccreport"),
-        ("git@github.com:oroddlokken/ccreport", "oroddlokken/ccreport"),
-        ("https://github.com/oroddlokken/ccreport.git", "oroddlokken/ccreport"),
-        ("https://github.com/oroddlokken/ccreport", "oroddlokken/ccreport"),
-        ("ssh://git@github.com/someone/fork.git", "someone/fork"),
-    ]
+    @pytest.mark.parametrize(("text", "parsed"), [
+        ("v0.2.0", (0, 2, 0)),
+        ("0.2.0", (0, 2, 0)),
+        ("V1.10.2", (1, 10, 2)),
+        (" v3.4 ", (3, 4)),
+        ("0.1.1.dev3+g9e7ff54", (0, 1, 1)),
+    ])
+    def test_it_reads_the_numeric_run(self, text, parsed):
+        assert update_check.parse_version(text) == parsed
 
-    @pytest.mark.parametrize(("url", "slug"), CASES)
-    def test_every_form_git_clone_writes(self, monkeypatch, tmp_path, url, slug):
-        _serve_git(monkeypatch, f"{url}\n")
-        assert update_check.remote_slug(tmp_path) == slug
-
-    def test_a_remote_elsewhere_is_none(self, monkeypatch, tmp_path):
-        _serve_git(monkeypatch, "git@gitlab.com:someone/ccreport.git\n")
-        assert update_check.remote_slug(tmp_path) is None
-
-    def test_no_origin_is_none(self, monkeypatch, tmp_path):
-        _serve_git(monkeypatch, "", returncode=128)
-        assert update_check.remote_slug(tmp_path) is None
-
-    def test_no_git_on_path_is_none(self, monkeypatch, tmp_path):
-        def _boom(cmd, **kwargs):
-            raise OSError
-
-        monkeypatch.setattr(subprocess, "run", _boom)
-        assert update_check.remote_slug(tmp_path) is None
+    @pytest.mark.parametrize("text", ["", "latest", "vNext", "release-2"])
+    def test_anything_unordered_is_none(self, text):
+        assert update_check.parse_version(text) is None
 
 
-class TestCommitsBehind:
-    """What the compare endpoint's answer becomes."""
+class TestIsNewer:
+    """Which comparisons earn a line."""
 
-    def test_ahead_reports_its_count(self, monkeypatch):
-        _serve(monkeypatch, {"status": "ahead", "ahead_by": 12})
-        assert update_check.commits_behind("o/r", SHA) == 12
+    def test_a_higher_release_is_newer(self):
+        assert update_check.is_newer("v0.2.0", "0.1.1") is True
 
-    def test_diverged_counts_only_masters_side(self, monkeypatch):
-        """Local commits of your own do not hide the ones you are missing."""
-        _serve(monkeypatch, {"status": "diverged", "ahead_by": 3, "behind_by": 1})
-        assert update_check.commits_behind("o/r", SHA) == 3
+    def test_the_same_release_is_not(self):
+        assert update_check.is_newer("v0.1.1", "0.1.1") is False
 
-    def test_identical_is_zero(self, monkeypatch):
-        _serve(monkeypatch, {"status": "identical", "ahead_by": 0})
-        assert update_check.commits_behind("o/r", SHA) == 0
+    def test_a_lower_release_is_not(self):
+        assert update_check.is_newer("v0.1.0", "0.1.1") is False
 
-    def test_behind_is_zero(self, monkeypatch):
-        """Unpushed commits, nothing to pull."""
-        _serve(monkeypatch, {"status": "behind", "ahead_by": 0, "behind_by": 2})
-        assert update_check.commits_behind("o/r", SHA) == 0
+    def test_a_shorter_tag_pads_rather_than_losing(self):
+        """0.2 and 0.2.0 name one release; only 0.2.1 is past it."""
+        assert update_check.is_newer("v0.2", "0.2.0") is False
+        assert update_check.is_newer("v0.2", "0.1.9") is True
 
-    def test_the_url_carries_the_sha_and_the_branch(self, monkeypatch):
-        seen = []
+    def test_two_digit_components_order_as_numbers(self):
+        assert update_check.is_newer("v0.10.0", "0.9.0") is True
+
+    @pytest.mark.parametrize(("latest", "current"),
+                             [("latest", "0.1.1"), ("v0.2.0", "unknown")])
+    def test_a_side_that_does_not_parse_is_never_newer(self, latest, current):
+        assert update_check.is_newer(latest, current) is False
+
+
+class TestLatestRelease:
+    """What the release endpoint answers, and what every failure answers instead."""
+
+    def test_it_returns_the_tag(self, monkeypatch):
+        _serve(monkeypatch, {"tag_name": "v0.2.0"})
+        assert update_check.latest_release() == "v0.2.0"
+
+    def test_the_url_names_the_repo_and_the_latest_release(self, monkeypatch):
+        seen: list[str] = []
 
         def _urlopen(req, timeout=None):
             seen.append(req.full_url)
-            return io.BytesIO(b'{"status": "identical", "ahead_by": 0}')
+            return io.BytesIO(b'{"tag_name": "v0.2.0"}')
 
         monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
-        update_check.commits_behind("owner/repo", SHA)
+        update_check.latest_release()
         assert seen == [
-            (
-                f"https://api.github.com/repos/owner/repo/compare/"
-                f"{SHA}...{update_check.UPSTREAM_BRANCH}"
-            ),
-        ]
+            f"https://api.github.com/repos/{update_check.UPSTREAM_REPO}/releases/latest"]
 
     @pytest.mark.parametrize("code", [403, 404, 500])
-    def test_an_http_error_is_unanswered_not_zero(self, monkeypatch, code):
-        """404 is the normal state for an unpushed commit; 403 is the rate limit."""
+    def test_an_http_error_is_unanswered(self, monkeypatch, code):
         _serve(monkeypatch, None, status_code=code)
-        assert update_check.commits_behind("o/r", SHA) is None
+        assert update_check.latest_release() is None
 
     def test_an_unreachable_host_is_unanswered(self, monkeypatch):
         def _urlopen(req, timeout=None):
-            raise urllib.error.URLError("offline")
+            raise urllib.error.URLError("down")
 
         monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
-        assert update_check.commits_behind("o/r", SHA) is None
+        assert update_check.latest_release() is None
 
     def test_a_body_that_is_not_json_is_unanswered(self, monkeypatch):
         def _urlopen(req, timeout=None):
-            return io.BytesIO(b"<html>rate limited</html>")
+            return io.BytesIO(b"<html>")
 
         monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
-        assert update_check.commits_behind("o/r", SHA) is None
+        assert update_check.latest_release() is None
 
-    def test_a_count_that_is_not_a_number_is_unanswered(self, monkeypatch):
-        _serve(monkeypatch, {"status": "ahead", "ahead_by": "lots"})
-        assert update_check.commits_behind("o/r", SHA) is None
+    def test_a_body_with_no_tag_is_unanswered(self, monkeypatch):
+        _serve(monkeypatch, {"name": "no tag here"})
+        assert update_check.latest_release() is None
+
+    def test_a_body_that_is_not_an_object_is_unanswered(self, monkeypatch):
+        _serve(monkeypatch, ["v0.2.0"])
+        assert update_check.latest_release() is None
 
 
 class TestRun:
-    """One check, end to end, and what it leaves in the cache."""
+    """One check, and what it leaves in the database."""
 
     @pytest.fixture
-    def repo(self, tmp_path, monkeypatch):
-        root = _mkrepo(tmp_path, head=f"{SHA}\n")
-        _as_module(monkeypatch, root)
-        _serve_git(monkeypatch, "git@github.com:oroddlokken/ccreport.git\n")
-        return root
+    def keg(self, monkeypatch):
+        _as_module(monkeypatch, BREW)
+        monkeypatch.setattr(update_check, "installed_version", lambda: HERE)
 
-    def test_it_stores_the_count_the_sha_and_the_stamp(self, repo, monkeypatch):
-        _serve(monkeypatch, {"status": "ahead", "ahead_by": 7})
+    def test_it_stores_the_tag_the_version_and_the_stamp(self, keg, monkeypatch):
+        _serve(monkeypatch, {"tag_name": "v0.2.0"})
+        monkeypatch.setattr(update_check.time, "time", lambda: 1_000_000.0)
         update_check.run()
-        checked_at, sha, behind = cache_db.read_update_check()
-        assert (sha, behind) == (SHA, 7)
-        assert checked_at > 0
+        assert cache_db.read_update_check() == (1_000_000.0, HERE, "v0.2.0")
 
-    def test_a_failed_check_still_advances_the_stamp(self, repo, monkeypatch):
-        """What paces the spawn: an unreachable API must not respawn every render."""
-        _serve(monkeypatch, None, status_code=404)
-        update_check.run()
-        checked_at, _sha, behind = cache_db.read_update_check()
-        assert behind is None
-        assert checked_at > 0
-
-    def test_a_failed_check_clears_a_count_it_could_not_confirm(self, repo, monkeypatch):
-        _serve(monkeypatch, {"status": "ahead", "ahead_by": 7})
-        update_check.run()
+    def test_a_failed_check_still_advances_the_stamp(self, keg, monkeypatch):
         _serve(monkeypatch, None, status_code=403)
+        monkeypatch.setattr(update_check.time, "time", lambda: 1_000_000.0)
+        update_check.run()
+        checked_at, _, latest = cache_db.read_update_check()
+        assert (checked_at, latest) == (1_000_000.0, None)
+
+    def test_a_failed_check_clears_a_tag_it_could_not_confirm(self, keg, monkeypatch):
+        cache_db.write_update_check(HERE, "v0.2.0", 1.0)
+        _serve(monkeypatch, None, status_code=500)
         update_check.run()
         assert cache_db.read_update_check()[2] is None
 
-    def test_a_non_github_remote_stores_no_count(self, repo, monkeypatch):
-        _serve_git(monkeypatch, "git@gitlab.com:someone/ccreport.git\n")
-
-        def _boom(req, timeout=None):
-            msg = "no request without a GitHub slug"
-            raise AssertionError(msg)
-
-        monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    def test_an_install_with_no_version_stores_no_tag(self, monkeypatch):
+        """No distribution metadata: nothing to compare a tag against."""
+        _as_module(monkeypatch, BREW)
+        monkeypatch.setattr(update_check, "installed_version", lambda: None)
+        monkeypatch.setattr(update_check.time, "time", lambda: 1_000_000.0)
         update_check.run()
-        _checked_at, _sha, behind = cache_db.read_update_check()
-        assert behind is None
+        assert cache_db.read_update_check() == (1_000_000.0, "", None)
 
-    def test_no_checkout_writes_nothing(self, tmp_path, monkeypatch):
-        (tmp_path / "src" / "ccreport").mkdir(parents=True)
-        _as_module(monkeypatch, tmp_path)
+    def test_no_keg_writes_nothing(self, monkeypatch):
+        _as_module(monkeypatch, "/Users/me/git/ccreport/src/ccreport")
+
+        def boom(req, timeout=None):
+            raise AssertionError("no request outside a keg")
+
+        monkeypatch.setattr(urllib.request, "urlopen", boom)
         update_check.run()
         assert cache_db.read_update_check() == (0.0, "", None)
 
     def test_main_swallows_what_run_raises(self, monkeypatch):
-        def _boom():
-            raise RuntimeError
+        def boom():
+            raise RuntimeError("no")
 
-        monkeypatch.setattr(update_check, "run", _boom)
+        monkeypatch.setattr(update_check, "run", boom)
         update_check.main()  # a detached child has nobody to report to
 
 
+class TestInstalledVersion:
+    """What the installed distribution says it is."""
+
+    def test_it_reads_the_package_metadata(self):
+        """The suite runs against an installed ccreport, so this answers a string."""
+        assert isinstance(update_check.installed_version(), str)
+
+    def test_no_metadata_is_none(self, monkeypatch):
+        import importlib.metadata
+
+        def boom(name):
+            raise importlib.metadata.PackageNotFoundError(name)
+
+        monkeypatch.setattr(importlib.metadata, "version", boom)
+        assert update_check.installed_version() is None
+
+
 class TestUpdateCheckStore:
-    """The meta round trip, including the states that mean 'no number'."""
+    """The meta round trip, including the state that means 'no tag'."""
 
     def test_a_never_run_check_reads_empty(self):
         assert cache_db.read_update_check() == (0.0, "", None)
 
-    def test_zero_survives_as_zero(self):
-        """Up to date is a fact; None is the absence of one."""
-        cache_db.write_update_check(SHA, 0, 1_000_000.0)
-        assert cache_db.read_update_check() == (1_000_000.0, SHA, 0)
+    def test_a_tag_survives_the_round_trip(self):
+        cache_db.write_update_check(HERE, "v0.2.0", 1_000_000.0)
+        assert cache_db.read_update_check() == (1_000_000.0, HERE, "v0.2.0")
 
-    def test_none_clears_the_count_and_keeps_the_stamp(self):
-        cache_db.write_update_check(SHA, 4, 1_000_000.0)
-        cache_db.write_update_check(SHA, None, 1_000_100.0)
-        assert cache_db.read_update_check() == (1_000_100.0, SHA, None)
+    def test_none_clears_the_tag_and_keeps_the_stamp(self):
+        cache_db.write_update_check(HERE, "v0.2.0", 1_000_000.0)
+        cache_db.write_update_check(HERE, None, 1_000_100.0)
+        assert cache_db.read_update_check() == (1_000_100.0, HERE, None)

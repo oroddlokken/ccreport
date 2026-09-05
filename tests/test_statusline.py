@@ -1710,23 +1710,19 @@ class TestAccountLandsOnTheLastLine:
 
 
 class TestUpdateSegment:
-    """What has to hold before a commits-behind count goes on screen."""
+    """What has to hold before the brew upgrade line goes on screen."""
 
     NOW = 1_000_000.0
-    SHA = "a" * 40
-    OTHER = "b" * 40
+    HERE = "0.1.1"
+    NEXT = "v0.2.0"
 
     @pytest.fixture
-    def checkout(self, tmp_path, monkeypatch):
-        """A tree update_check reads as its own checkout, with HEAD at SHA."""
+    def brew(self, monkeypatch):
+        """A Homebrew keg with HERE installed in it."""
         from ccreport import update_check
 
-        (tmp_path / "src" / "ccreport").mkdir(parents=True)
-        (tmp_path / ".git").mkdir()
-        (tmp_path / ".git" / "HEAD").write_text(f"{self.SHA}\n", encoding="utf-8")
-        monkeypatch.setattr(
-            update_check, "__file__", str(tmp_path / "src" / "ccreport" / "update_check.py"))
-        return tmp_path
+        monkeypatch.setattr(update_check, "is_brew_install", lambda: True)
+        monkeypatch.setattr(update_check, "installed_version", lambda: self.HERE)
 
     @pytest.fixture
     def spawns(self, monkeypatch):
@@ -1734,81 +1730,86 @@ class TestUpdateSegment:
         monkeypatch.setattr(sl, "_spawn_update_check", lambda: seen.append(["spawn"]))
         return seen
 
-    def _store(self, behind, *, age=0.0, sha=None):
+    def _store(self, latest, *, age=0.0, version=None):
         from ccreport import cache_db
 
-        cache_db.write_update_check(self.SHA if sha is None else sha, behind, self.NOW - age)
+        cache_db.write_update_check(self.HERE if version is None else version, latest, self.NOW - age)
 
-    def test_it_names_ccreport_and_what_to_run(self, checkout, spawns):
-        self._store(12)
+    def test_it_names_the_release_and_what_to_run(self, brew, spawns):
+        self._store(self.NEXT)
         line = sl._render_update(self.NOW)
-        assert "A newer version of ccreport is available" in line
-        assert "ccreport update --pull" in line
+        assert f"ccreport {self.NEXT} is available" in line
+        assert "brew upgrade oroddlokken/tap/ccreport" in line
 
-    def test_it_does_not_send_the_user_to_git_pull(self, checkout, spawns):
-        """The line renders in whatever project the session is in, not this checkout."""
-        self._store(12)
+    def test_it_does_not_send_the_user_to_a_pull(self, brew, spawns):
+        """Nothing here is a checkout; `git pull` and `ccreport update` are both gone."""
+        self._store(self.NEXT)
         line = sl._render_update(self.NOW)
-        assert "git pull" not in line.replace("ccreport update --pull", "")
+        assert "git pull" not in line
+        assert "ccreport update" not in line
 
-    def test_the_count_gates_the_line_without_appearing_in_it(self, checkout, spawns):
-        """One commit behind and twelve read alike; only the gate uses the number."""
-        self._store(1)
-        one = sl._render_update(self.NOW)
-        self._store(12)
-        assert one == sl._render_update(self.NOW) != ""
-
-    def test_up_to_date_shows_nothing(self, checkout, spawns):
-        self._store(0)
+    def test_the_same_release_shows_nothing(self, brew, spawns):
+        self._store(f"v{self.HERE}")
         assert sl._render_update(self.NOW) == ""
 
-    def test_an_unanswered_check_shows_nothing(self, checkout, spawns):
-        """A 404 or a rate limit stores no count; silence beats a guess."""
+    def test_an_older_release_shows_nothing(self, brew, spawns):
+        """A tag below the installed version is a downgrade, not an upgrade."""
+        self._store("v0.1.0")
+        assert sl._render_update(self.NOW) == ""
+
+    def test_an_unanswered_check_shows_nothing(self, brew, spawns):
+        """A 404 or a rate limit stores no tag; silence beats a guess."""
         self._store(None)
         assert sl._render_update(self.NOW) == ""
 
-    def test_a_pull_since_the_check_silences_the_line(self, checkout, spawns):
-        """The count describes a commit the user has already left."""
-        self._store(12, sha=self.OTHER)
+    def test_an_upgrade_since_the_check_silences_the_line(self, brew, spawns):
+        """The tag describes a release the user already runs."""
+        self._store(self.NEXT, version="0.1.0")
         assert sl._render_update(self.NOW) == ""
 
-    def test_a_count_older_than_the_max_age_is_not_repeated(self, checkout, spawns):
+    def test_a_tag_older_than_the_max_age_is_not_repeated(self, brew, spawns):
         from ccreport import update_check
 
-        self._store(12, age=update_check.UPDATE_MAX_AGE_S + 1)
+        self._store(self.NEXT, age=update_check.UPDATE_MAX_AGE_S + 1)
         assert sl._render_update(self.NOW) == ""
 
-    def test_the_toggle_turns_it_off(self, checkout, spawns, monkeypatch):
-        self._store(12)
+    def test_the_toggle_turns_it_off(self, brew, spawns, monkeypatch):
+        self._store(self.NEXT)
         monkeypatch.setenv("CLAUDE_STATUSLINE_UPDATE", "0")
         assert sl._render_update(self.NOW) == ""
 
-    def test_an_installed_package_has_nothing_to_pull(self, tmp_path, monkeypatch, spawns):
-        """No .git beside the package: `uv tool install .`, or a wheel."""
+    def test_a_checkout_or_a_wheel_is_left_alone(self, monkeypatch, spawns):
+        """Outside a keg there is no `brew upgrade` to name: no line, no spawn."""
         from ccreport import update_check
 
-        (tmp_path / "src" / "ccreport").mkdir(parents=True)
-        monkeypatch.setattr(
-            update_check, "__file__", str(tmp_path / "src" / "ccreport" / "update_check.py"))
-        self._store(12)
+        monkeypatch.setattr(update_check, "is_brew_install", lambda: False)
+        self._store(self.NEXT)
         assert sl._render_update(self.NOW) == ""
         assert spawns == []
 
-    def test_a_stale_stamp_spawns_the_check(self, checkout, spawns):
-        self._store(0, age=sl.UPDATE_CHECK_INTERVAL_S)
+    def test_an_install_with_no_version_shows_nothing(self, monkeypatch, spawns):
+        from ccreport import update_check
+
+        monkeypatch.setattr(update_check, "is_brew_install", lambda: True)
+        monkeypatch.setattr(update_check, "installed_version", lambda: None)
+        self._store(self.NEXT)
+        assert sl._render_update(self.NOW) == ""
+
+    def test_a_stale_stamp_spawns_the_check(self, brew, spawns):
+        self._store(None, age=sl.UPDATE_CHECK_INTERVAL_S)
         sl._render_update(self.NOW)
         assert len(spawns) == 1
 
-    def test_a_fresh_stamp_spawns_nothing(self, checkout, spawns):
-        self._store(0, age=sl.UPDATE_CHECK_INTERVAL_S - 1)
+    def test_a_fresh_stamp_spawns_nothing(self, brew, spawns):
+        self._store(None, age=sl.UPDATE_CHECK_INTERVAL_S - 1)
         sl._render_update(self.NOW)
         assert spawns == []
 
-    def test_a_never_run_check_spawns(self, checkout, spawns):
+    def test_a_never_run_check_spawns(self, brew, spawns):
         sl._render_update(self.NOW)
         assert len(spawns) == 1
 
-    def test_the_toggle_is_read_before_the_database(self, checkout, spawns, monkeypatch):
+    def test_the_toggle_is_read_before_the_database(self, brew, spawns, monkeypatch):
         """Off means off: no read, and no check spawned to feed a line nobody sees."""
         from ccreport import cache_db
 
@@ -1820,9 +1821,7 @@ class TestUpdateSegment:
         assert sl._render_update(self.NOW) == ""
         assert spawns == []
 
-    def test_a_busy_database_costs_the_line_not_the_render(
-        self, checkout, spawns, monkeypatch,
-    ):
+    def test_a_busy_database_costs_the_line_not_the_render(self, brew, spawns, monkeypatch):
         from ccreport import cache_db
 
         def boom():

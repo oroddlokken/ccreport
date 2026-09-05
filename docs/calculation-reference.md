@@ -569,38 +569,38 @@ else:
 
 ### 5.7 Update Check
 
-How far origin's master has moved past the checkout, for the status line's
-update segment. There are no tagged versions — master is the release, so the
-unit is a commit.
+Whether a release newer than this Homebrew install exists, for the status
+line's update segment. Only a Homebrew install is checked: a checkout, a
+`uv tool install` and a bare wheel each update by a route that has nothing to
+do with `brew upgrade`.
 
-- **Keys**: `update_checked_at`, `update_local_sha`, `update_behind` in `meta`,
-  read and written as a set by `cache_db.read_update_check()` /
+- **Keys**: `update_checked_at`, `update_local_version`, `update_latest` in
+  `meta`, read and written as a set by `cache_db.read_update_check()` /
   `write_update_check()`
 - **Written by**: `update_check.py`, run as `python3 -m ccreport.update_check`
   from a detached spawn on a slow render (`statusline._render_update`), when
   `update_checked_at` is older than `UPDATE_CHECK_INTERVAL_S` (129600 s, 36
   hours). The API call never happens on the render path
-- **Asked on demand**: `ccreport update` (`ccreport.cmd_update`) calls the same
-  three readers inline — no spawn, no interval, since the user asked now — and
-  stores the answer through the same keys, so a CLI check also paces the next
-  detached one. `--pull` runs `git pull --ff-only` in the checkout, and only
-  when the count is above zero; a refused fast-forward exits with git's code
-  rather than merging or rebasing
-- **Source**: `GET api.github.com/repos/{owner}/{repo}/compare/{HEAD}...master`,
-  unauthenticated. `owner/repo` comes from origin's URL, so a fork checks
-  itself. `status` separates a checkout that is behind from one carrying local
-  commits; `ahead_by` is the count stored
-- **Local SHA**: read from `.git/HEAD` plus the loose ref or `packed-refs` — a
-  file read, no git process, because `_render_update` needs it too. Nothing is
-  ever written into the checkout
-- **Unanswered vs zero**: `update_behind` empty means the check could not
-  answer — a 404 for a commit never pushed, a rate-limited 403, an unreachable
-  host. `0` means up to date. Only a count above zero renders
+- **Source**: `GET api.github.com/repos/oroddlokken/ccreport/releases/latest`,
+  unauthenticated. `/releases/latest` skips drafts and prereleases, so
+  `tag_name` names the release the tap's formula was rewritten for
+- **Install shape**: `update_check.is_brew_install()` matches a `Cellar/ccreport`
+  pair in the resolved package path, which covers `/opt/homebrew`, `/usr/local`
+  and linuxbrew without running `brew`. The version comes from the installed
+  distribution metadata (`importlib.metadata.version`)
+- **Comparison**: `parse_version` reads the leading numeric run of either
+  spelling, so `v0.2.0` and `0.2.0` order alike and `0.1.1.dev3+g9e7ff54`
+  compares as the release it followed. A side that does not parse is never
+  newer
+- **Unanswered**: `update_latest` empty means the check could not answer — a
+  rate-limited 403, an unreachable host, a repo with no release. Only a tag
+  above the installed version renders
 - **Stamp on failure**: written on every outcome, including the ones storing no
-  count, since it is what paces the spawn
-- **Render gate**: the stored count shows only while `update_local_sha` still
-  equals HEAD and the stamp is under `update_check.UPDATE_MAX_AGE_S` (1.5 days).
-  A pull silences the line at the next render rather than at the next check
+  tag, since it is what paces the spawn
+- **Render gate**: the stored tag shows only while `update_local_version` still
+  equals the installed version and the stamp is under
+  `update_check.UPDATE_MAX_AGE_S` (1.5 days). An upgrade silences the line at
+  the next render rather than at the next check
 
 ---
 
@@ -962,10 +962,9 @@ The entire historic cost line is gated by `CLAUDE_STATUSLINE_HISTORIC_COST` (def
 
 **Update available** (`_render_update()`, `CLAUDE_STATUSLINE_UPDATE`, default
 on): a line of its own directly under the cost windows, in both layouts —
-`↑ A newer version of ccreport is available, run 'ccreport update --pull' to
-update`. The count gates the line without appearing in it, and it names that
-command rather than `git pull` because the line renders in whatever project the
-session is in. The count and the gates it passes are §5.7.
+`↑ ccreport v0.2.0 is available, run 'brew upgrade oroddlokken/tap/ccreport' to
+update`. It renders for a Homebrew install alone; every other install shape
+leaves the line out. The tag and the gates it passes are §5.7.
 
 **Signed-in account** (`_render_account()`, last line, both toggles off by default):
 

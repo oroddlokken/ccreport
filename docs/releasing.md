@@ -78,5 +78,7 @@ uses, and `docker/metadata-action` writes it into the OCI labels with the revisi
 The image's CMD is the one-worker, no-reload form. `docker-compose.yml` overrides it with
 `--reload` for `just docker-up`, and `tests/test_docker_image.py` fails if either side drifts.
 
-A checkout is still the other way in: `ccreport update --pull` fast-forwards it to `master`, and
-the wheel and sdist ride along on the GitHub Release as assets.
+A checkout is still the other way in: `git pull` in it tracks `master`, and the wheel and sdist
+ride along on the GitHub Release as assets. Only a Homebrew install is told it is out of date —
+`statusline._render_update` names `brew upgrade` and there is no other upgrade route it can
+name.

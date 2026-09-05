@@ -13,13 +13,33 @@ BIN="${BASH_SOURCE[0]%/*}"
 [[ "$BIN" == "${BASH_SOURCE[0]}" ]] && BIN="."
 REPO="$BIN/.."
 SRC="$REPO/src"
+PY="$REPO/.venv/bin/python"
+
+# Two layouts. A checkout has this file in bin/ beside src/, with the project
+# venv beside both; a wheel install has it in the package's own scripts/ dir,
+# where the import root is the directory holding the package.
+if [[ ! -d "$SRC/ccreport" ]]; then
+  SRC="$REPO/.."
+  # The interpreter that owns the package, at <prefix>/bin — three levels above
+  # site-packages in a venv, and the walk covers lib64 and the flat layouts.
+  PY=""
+  probe="$SRC"
+  for _ in 1 2 3 4; do
+    probe="$probe/.."
+    if [[ -x "$probe/bin/python3" ]]; then
+      PY="$probe/bin/python3"
+      break
+    fi
+  done
+fi
 
 # Imported rather than run as a script, for the reason statusline-command_x.sh
 # does it: CPython caches bytecode only for modules it imports, and this runs
 # before every tool call.
 BOOT='import sys; sys.path.insert(0, sys.argv.pop(1)); from ccreport import quota_guard; quota_guard.main()'
 
-PY="$REPO/.venv/bin/python"
+# Last resort: a python3 off PATH can be older than this package needs, and the
+# environment it was installed into is not always on PATH.
 [[ -x "$PY" ]] || PY="$(command -v python3)"
 # No interpreter is not a reason to block a session: the guard is advisory
 # machinery, and a machine without python3 has no readings to guard with.

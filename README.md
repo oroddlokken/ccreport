@@ -12,9 +12,14 @@ already writes under `~/.claude/projects/` (or `~/.config/claude/projects/`).
 brew install oroddlokken/tap/ccreport
 ```
 
-That puts `ccreport` and `ccu` on `PATH`. The status line and the hooks run
-out of a checkout, so a machine that wants those installs from one instead;
-see [Install from a checkout](#install-from-a-checkout).
+That puts `ccreport`, `ccu`, `ccreport-statusline` and `ccreport-quota-guard`
+on `PATH`. The four shell wrappers `settings.json` points at ship beside the
+package rather than on `PATH`, because a hook takes a path and not a command;
+`ccreport scripts` prints them, one per line, the status line's first.
+
+Every `/path/to/ccreport/bin/...` below is one of those lines on a wheel
+install and the checkout's own `bin/` otherwise. Editing the modules wants a
+clone; see [Install from a checkout](#install-from-a-checkout).
 
 ## Status line
 
@@ -26,9 +31,11 @@ Segments are toggled with `CLAUDE_STATUSLINE_*` environment variables, `1` on
 and `0` off. The full list, with defaults, is the module docstring of
 `src/ccreport/statusline.py`.
 
-`bin/statusline-command_x.sh` reads each toggle as `${VAR:-default}`, so a
-wrapper of your own that exports them and hands over wins. Keep it outside the
-checkout and your settings survive every `git pull`:
+`settings.json` can name `ccreport-statusline` directly, and every segment then
+renders at its module default. `bin/statusline-command_x.sh` reads each toggle
+as `${VAR:-default}` instead, so a wrapper of your own that exports them and
+hands over wins. Keep that wrapper outside the checkout and your settings
+survive every `git pull`:
 
 ```bash
 #!/usr/bin/env bash
@@ -109,8 +116,10 @@ itself.
 
 ### The quota guard
 
-`bin/quota-guard.sh` stops a session before it crosses into extra usage. Wire it
-to both events; the verdict is the same for either, and only which turn it halts
+`bin/quota-guard.sh` stops a session before it crosses into extra usage. Point
+the hooks at the wrapper rather than at `ccreport-quota-guard`: the arming gate
+below is in the wrapper, and this runs before every tool call. Wire it to both
+events; the verdict is the same for either, and only which turn it halts
 differs:
 
 ```json
@@ -298,33 +307,31 @@ installed copy, so an edit takes effect on the next invocation.
 
 ## Updates
 
-The CLI has no tagged versions: master is what a checkout tracks, so updating
-is a fast-forward in the checkout:
+Homebrew is the update route the tools can name, so it is the one they report
+on:
 
 ```
-ccreport update           # how far behind master is this checkout?
-ccreport update --pull    # fast-forward it
+brew upgrade oroddlokken/tap/ccreport
 ```
 
-Both run from any directory — the checkout is found from where the package is
-installed, not from your cwd. The check is live, and `--pull` runs
-`git pull --ff-only`, so a checkout with commits of its own is left alone.
-
-The status line says when that is worth doing, on a line under the cost
+The status line says when that is worth running, on a line under the cost
 windows:
 
 ```
-↑ A newer version of ccreport is available, run 'ccreport update --pull' to update
+↑ ccreport v0.2.0 is available, run 'brew upgrade oroddlokken/tap/ccreport' to update
 ```
 
-Twice a day a detached process asks GitHub's API how far origin's master has
-moved past your HEAD. It reads `.git` as files and writes nothing there — no
-fetch, no refs touched — and the request never happens on the render path. Set
-`CLAUDE_STATUSLINE_UPDATE=0` to turn the line and the request off. An installed
-copy with no checkout beside it never checks at all.
+Twice a day a detached process asks GitHub's API for the newest release tag and
+compares it against the installed version. The request never happens on the
+render path. Set `CLAUDE_STATUSLINE_UPDATE=0` to turn the line and the request
+off.
 
-The line goes quiet the moment you pull, rather than waiting for the next
-check: the stored count is tied to the commit it was measured against.
+A checkout, a `uv tool install` and a bare wheel each update by a route this
+cannot name, so none of them checks at all — a checkout pulls, and the other two
+are reinstalled by whoever put them there.
+
+The line goes quiet the moment you upgrade, rather than waiting for the next
+check: the stored tag is tied to the version it was compared against.
 
 ## Where the data lives
 

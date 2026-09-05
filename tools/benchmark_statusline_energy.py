@@ -19,10 +19,11 @@ Four phases:
      costs in CPU and wall seconds.
 
 Run on an otherwise quiescent machine; the idle baseline is ambient.
-The three detached spawns (ccreport.usage_api, ccreport.update_check,
-ccreport.push) escape the process tree, so os.wait4 never sees them and
-phase 1 does not count them. Phase 4 counts them by watching the process
-table instead; it runs last so its forced spawns cannot reach phase 2.
+The detached spawns (ccreport.usage_api and ccreport.push here;
+ccreport.update_check joins them only on a Homebrew install, which a checkout
+is not) escape the process tree, so os.wait4 never sees them and phase 1 does
+not count them. Phase 4 counts them by watching the process table instead; it
+runs last so its forced spawns cannot reach phase 2.
 
 Every phase-4 figure is a floor. CPU comes from ps at 10 ms resolution and
 wall from the poll interval, so a process that lives and dies between two
@@ -189,12 +190,12 @@ def _describe(pid: int, tag: str = "") -> tuple[str, bool]:
 
 
 def _bench_home() -> str:
-    """A private HOME with the three interval gates cold, and a push target.
+    """A private HOME with the interval gates cold, and a push target.
 
-    All three gates are state under the user's home: the usage row's age and
+    Every gate is state under the user's home: the usage row's age and
     push_next_at in ~/.local/share/ccreport/cache.db, update_checked_at beside them,
     and ~/.config/ccreport/push.toml, whose absence stops the push before any
-    gate is read. A HOME of its own resets all three for one render without
+    gate is read. A HOME of its own resets them all for one render without
     writing anything into the cache the machine actually reports from. The
     server URL is a closed port: the push has to start to be counted, and
     nothing here wants it to arrive.
@@ -251,8 +252,8 @@ def _detached_run(tag: str) -> dict:
             elif pgid == pid and ppid == proc.pid:
                 # Named here rather than in the batch below, which runs a ps
                 # per pid after the whole table has been walked: the push is
-                # the shortest-lived of the three spawns and was reaching that
-                # batch already dead, landing in the report as "(exited)".
+                # the shortest-lived of the spawns and was reaching that batch
+                # already dead, landing in the report as "(exited)".
                 cmd, _ = _describe(pid, tag)
                 roots[pid] = label_of(cmd)
                 kin[pid] = (pgid, roots[pid])
@@ -319,7 +320,7 @@ def _detached_run(tag: str) -> dict:
         "groups": groups,
         # A grandchild can outlive its first sighting by less than the one ps
         # call it takes to name it. Its parent is still known, and "one more
-        # process under update_check" is the part of it this phase is counting.
+        # process under usage_api" is the part of it this phase is counting.
         "descendants": sorted(
             f"child of {roots[pgid]}" if name == UNNAMED else name
             for pid, (pgid, name) in kin.items() if pid not in roots and pgid in roots
@@ -381,7 +382,7 @@ def measure_detached(runs: int) -> dict:
     Sampling ps can only miss a process, never invent one, so the run that saw
     the most is the run that missed the least — a median would report a dropped
     sample as the truth. Each run gets its own HOME: a second render against the
-    first one's cache is a render with all three gates shut.
+    first one's cache is a render with every gate shut.
     """
     observed = [_detached_run(f"phase4-{i}") for i in range(runs)]
     widest = max(observed, key=lambda r: (len(r["detached"]), len(r["descendants"])))
@@ -472,7 +473,7 @@ def main() -> int:
         renders_done = int(load_duration / full["wall_s"])
 
     # After phase 2: this phase resets the gates that make a render spawn, and
-    # three extra interpreters landing in the power window would be charged to
+    # the extra interpreters landing in the power window would be charged to
     # the render loop.
     detached = None
     if args.child_runs > 0:
@@ -500,7 +501,7 @@ def main() -> int:
     ]
 
     # The detached CPU is charged to the slow render that spawned it, not spread
-    # over every render: three of these run per interval, not per frame.
+    # over every render: these run per interval, not per frame.
     detached_j = None
     if detached and detached["groups"]:
         detached_cpu = total_cpu(detached["groups"])

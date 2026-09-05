@@ -19,6 +19,11 @@ dependencies = [
 [project.scripts]
 ccreport = "ccreport.ccreport:main"
 ccu = "ccreport.ccu:main"
+# The render and the guard, for a machine that installed the wheel rather than
+# cloning. Claude Code can point at either directly; the shell wrappers below
+# add the CCQUOTA_STOP gate and the CLAUDE_STATUSLINE_* defaults.
+ccreport-statusline = "ccreport.statusline:main"
+ccreport-quota-guard = "ccreport.quota_guard:main"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
@@ -36,6 +41,18 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ccreport"]
+
+# The wrappers Claude Code's settings.json points at, shipped inside the
+# package so `ccreport scripts` can name their directory on any install.
+# Deliberately not entry points: settings.json wants a path it can pass to
+# bash, and putting these on PATH would shadow nothing but confuse everything.
+# bin/ccreport and bin/ccu stay out — they resolve $REPO/src and $REPO/.venv,
+# which is a checkout, and the console scripts above already cover the install.
+[tool.hatch.build.targets.wheel.force-include]
+"bin/statusline-command_x.sh" = "ccreport/scripts/statusline-command_x.sh"
+"bin/quota-guard.sh" = "ccreport/scripts/quota-guard.sh"
+"bin/clear-statusline-memo.sh" = "ccreport/scripts/clear-statusline-memo.sh"
+"bin/clear-statusline-cache.sh" = "ccreport/scripts/clear-statusline-cache.sh"
 
 [tool.hatch.build.targets.sdist]
 # An include-list, not an exclude-list, because hatchling reads the root

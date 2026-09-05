@@ -4435,21 +4435,22 @@ def write_push_attempt(
 
 
 # ---------------------------------------------------------------------------
-# Update check (how far master is ahead of the checkout, used by update_check.py)
+# Update check (whether a newer release exists, used by update_check.py)
 # ---------------------------------------------------------------------------
 
-# The SHA rides along with the count because it is what keeps the count honest.
-# A render compares it against HEAD as it stands now: once the user pulls, the
-# stored count describes a commit they have left, and the segment goes quiet
-# until the next check rather than repeating a number that is no longer true.
-_UPDATE_KEYS = ("update_checked_at", "update_local_sha", "update_behind")
+# The installed version rides along with the tag because it is what keeps the
+# tag honest. A render compares it against the version installed now: once the
+# user runs `brew upgrade`, the stored tag describes a release they already
+# have, and the segment goes quiet until the next check rather than repeating
+# an upgrade that is no longer there.
+_UPDATE_KEYS = ("update_checked_at", "update_local_version", "update_latest")
 
 
-def read_update_check() -> tuple[float, str, int | None]:
-    """(checked_at, the SHA compared, commits behind) from the last check.
+def read_update_check() -> tuple[float, str, str | None]:
+    """(checked_at, the version compared, the newest release tag) from the last check.
 
     A never-run check is (0.0, "", None), and so is one that could not reach
-    the API — None is "unanswered", distinct from a 0 that means up to date.
+    the API — None is "unanswered", distinct from a tag that names a release.
     """
     conn = get_connection()
     vals = _get_meta_many(conn, _UPDATE_KEYS)
@@ -4457,20 +4458,15 @@ def read_update_check() -> tuple[float, str, int | None]:
         checked_at = float(vals.get("update_checked_at") or 0)
     except ValueError:
         checked_at = 0.0
-    behind_raw = vals.get("update_behind") or ""
-    try:
-        behind = int(behind_raw) if behind_raw else None
-    except ValueError:
-        behind = None
-    return checked_at, vals.get("update_local_sha") or "", behind
+    return checked_at, vals.get("update_local_version") or "", vals.get("update_latest") or None
 
 
-def write_update_check(local_sha: str, behind: int | None, checked_at: float) -> None:
-    """Store one check's result. *behind* None clears the count, keeping the stamp."""
+def write_update_check(local_version: str, latest: str | None, checked_at: float) -> None:
+    """Store one check's result. *latest* None clears the tag, keeping the stamp."""
     conn = get_connection()
     _set_meta(conn, "update_checked_at", str(checked_at))
-    _set_meta(conn, "update_local_sha", local_sha)
-    _set_meta(conn, "update_behind", "" if behind is None else str(behind))
+    _set_meta(conn, "update_local_version", local_version)
+    _set_meta(conn, "update_latest", latest or "")
     conn.commit()
 
 

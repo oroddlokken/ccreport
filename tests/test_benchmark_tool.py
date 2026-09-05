@@ -171,9 +171,11 @@ class TestDetachedChildren:
             proc.wait()
 
     @pytest.mark.slow
-    def test_a_cold_render_is_seen_spawning_all_three(self, bench):
-        """The three spawns are interval-gated, so only a render against a cold
-        HOME makes them at all — which is what this phase exists to arrange.
+    def test_a_cold_render_is_seen_spawning_both(self, bench):
+        """The spawns are interval-gated, so only a render against a cold HOME
+        makes them at all — which is what this phase exists to arrange. The
+        update check is not among them: it runs for a Homebrew install alone
+        and the suite runs from a checkout.
         """
         # Two renders and their union, not one run's list: ps samples, and a
         # spawn that lives and dies between two of them is missed by the run
@@ -181,14 +183,14 @@ class TestDetachedChildren:
         # a closed port — and a third render costs the suite more than the
         # union of two leaves on the table.
         seen = bench.measure_detached(2)
-        expected = {"ccreport.usage_api", "ccreport.update_check", "ccreport.push"}
+        expected = {"ccreport.usage_api", "ccreport.push"}
         assert seen["failed_renders"] == 0
         assert expected <= set(seen["seen"])
-        # Any other name is a fourth spawn and belongs in the report. UNNAMED
+        # Any other name is a third spawn and belongs in the report. UNNAMED
         # is not one: it is a root that exited before ps could print its
         # command, which is the same sampling miss one line up allows for.
         assert set(seen["seen"]) - expected <= {bench.UNNAMED}
-        assert seen["peak_live"] >= 3
+        assert seen["peak_live"] >= 2
         # Every spawn one of the two renders was seen making is priced. The
         # figure is a floor — a process under 10 ms of CPU reads as 0.00 — so
         # only the total is asserted against zero.

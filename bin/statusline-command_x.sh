@@ -20,6 +20,25 @@ BIN="${BASH_SOURCE[0]%/*}"
 [[ "$BIN" == "${BASH_SOURCE[0]}" ]] && BIN="."
 REPO="$BIN/.."
 SRC="$REPO/src"
+PY="$REPO/.venv/bin/python"
+
+# Two layouts. A checkout has this file in bin/ beside src/, with the project
+# venv beside both; a wheel install has it in the package's own scripts/ dir,
+# where the import root is the directory holding the package.
+if [[ ! -d "$SRC/ccreport" ]]; then
+  SRC="$REPO/.."
+  # The interpreter that owns the package, at <prefix>/bin — three levels above
+  # site-packages in a venv, and the walk covers lib64 and the flat layouts.
+  PY=""
+  probe="$SRC"
+  for _ in 1 2 3 4; do
+    probe="$probe/.."
+    if [[ -x "$probe/bin/python3" ]]; then
+      PY="$probe/bin/python3"
+      break
+    fi
+  done
+fi
 
 # CPython writes and reads __pycache__ only for modules it imports, never for
 # the file named on its command line: run as a script, the whole module is
@@ -29,11 +48,11 @@ SRC="$REPO/src"
 # the module still sees `-t` at sys.argv[1] the way a script invocation did.
 BOOT='import sys; sys.path.insert(0, sys.argv.pop(1)); from ccreport import statusline; statusline.main()'
 
-# The render and the refresh it spawns import nothing outside the stdlib, so
-# any interpreter runs them and the project venv is only a preference. That is
-# what lets this wrapper skip `uv run` entirely: the resolver costs ~40 ms of
-# every render and would answer with one of these two anyway.
-PY="$REPO/.venv/bin/python"
+# The render and the refresh it spawns import nothing outside the stdlib, which
+# is what lets this wrapper skip `uv run`: the resolver costs ~40 ms of every
+# render and would answer with the interpreter picked above anyway.
+# Last resort: a python3 off PATH can be older than this package needs, and the
+# environment it was installed into is not always on PATH.
 [[ -x "$PY" ]] || PY="$(command -v python3)"
 if [[ ! -x "$PY" ]]; then
   # No output at all rather than an error line: this is a status bar, and a

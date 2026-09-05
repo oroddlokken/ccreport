@@ -86,7 +86,10 @@ that cache before it sends and the CLI is not always what runs first.
 `pricing.py`, `cache_db.py`, `exchange.py`, `aggregate.py`,
 `project_identity.py` and `usage_api.py` are shared. `update_check.py` is
 spawned by the status line alone. `bin/` holds the wrappers that Claude Code's
-settings.json and a PATH entry point at.
+settings.json and a PATH entry point at. Four of them are force-included into
+the wheel at `ccreport/scripts/`, since settings.json names a path and a wheel
+install has no checkout to name; `ccreport scripts` prints where they landed,
+and `ccreport.SHIPPED_SCRIPTS` is the other half of that pyproject list.
 
 The status line renders on every frame, which is why it imports nothing outside
 the stdlib and defers `cache_db` (and with it sqlite3) into the functions that
@@ -151,16 +154,16 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
 - The update line comes from `update_check.py`, spawned detached on slow renders
   when the stored stamp is older than `UPDATE_CHECK_INTERVAL_S` (36 h). The child
   writes that stamp on every outcome, failures included, so an unreachable API
-  cannot become a spawn per render. A stored count is rendered only while
-  `update_local_sha` still equals HEAD, so a pull silences the line instead of
-  repeating a number the user has acted on. The updater knows no tags: it
-  measures commits past origin/master, and `ccreport update --pull`
-  fast-forwards a checkout, so for the CLI master is the release and the unit
-  is a commit. The `vX.Y.Z` tags the repo also carries are the server's track —
-  each publishes a GitHub Release and a GHCR image (`docs/releasing.md`) and
-  moves nothing the updater reads. `ccreport update` asks the same question
-  inline, with no spawn and no interval, and writes its answer through the
-  same keys
+  cannot become a spawn per render. It reports for a Homebrew install alone,
+  matched on a `Cellar/ccreport` pair in the resolved package path: a checkout
+  pulls and a `uv tool install` is reinstalled, so neither has an upgrade
+  command this could name, and nothing updates itself — there is no
+  `ccreport update`. The unit is the `vX.Y.Z` tag, which publishes a GitHub
+  Release, a GHCR image and the tap's formula (`docs/releasing.md`), compared
+  against `importlib.metadata.version`. A stored tag is rendered only while
+  `update_local_version` still equals the installed version, so a
+  `brew upgrade` silences the line instead of repeating a release the user has
+  acted on
 - A rate-limit sample is pushed like a record: `push.build_samples` resolves the
   account off `account_events` and sends everything newer than a per-server
   watermark (`cache_db.read_push_samples_at`), which `--full` and a policy

@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- **A wheel install reaches the status line and the quota guard.** `ccreport-statusline` and `ccreport-quota-guard` join `ccreport` and `ccu` on `PATH`, and the four wrappers Claude Code's settings.json points at ship inside the package at `ccreport/scripts/`, off `PATH` because a hook takes a path rather than a command. `ccreport scripts` prints where they landed. Both wrappers resolve the checkout layout and the installed one, and in an install they run the interpreter that owns the package rather than the first `python3` on `PATH`, which can be older than the package needs.
+
+### Changed
+
+- **The update line reports a Homebrew install and names `brew upgrade`.** It compares `importlib.metadata.version` against the newest `vX.Y.Z` release tag, which is what the tap's formula is rewritten for, and renders `run 'brew upgrade oroddlokken/tap/ccreport'`. A keg is matched on a `Cellar/ccreport` pair in the resolved package path, so `/opt/homebrew`, `/usr/local` and linuxbrew all answer without running `brew`. A checkout, a `uv tool install` and a bare wheel each update by a route this cannot name, so none of them checks at all — no line, no request.
+
+### Removed
+
+- **`ccreport update` and `ccreport update --pull`.** Nothing updates itself now: the fast-forward and the origin/master compare behind it are gone, and a checkout pulls with git like any other. The status line's `CLAUDE_STATUSLINE_UPDATE` toggle and its twice-a-day detached check stay, against the release tag instead of a commit count.
+
 ## 0.1.1 (2026-09-05)
 
 ### Fixed
