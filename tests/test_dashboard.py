@@ -817,6 +817,65 @@ class TestPlanTile:
         ).cost(*dashboard.range_bounds(30, NOW)))
         assert just_work < whole
 
+    def test_a_day_charges_a_plan_the_other_account_was_idle_on(self, app):
+        """Only work spent that day, and both subscriptions were paid for it."""
+        self._declare(app, "work")
+        self._declare(app, "home", "default_claude_pro")
+        conn = app.state.db.connect()
+        key = (NOW - timedelta(days=1)).strftime("%Y-%m-%d")
+        view = dashboard.build(conn, 90, NOW, dashboard.Scope("day", key))
+        assert [row.account for row in view.accounts] == ["work@example.net"]
+        start, end, _axis = dashboard.period_span("day", key)
+        both = present(dashboard._Plans(conn).cost(start, end))
+        alone = present(dashboard._Plans(conn, {"work@example.net"}).cost(start, end))
+        assert both > alone
+        subline = present(self._tile(view)).subline
+        assert dashboard._fmt_usd(both) in subline
+        assert dashboard._fmt_usd(alone) not in subline
+
+    def test_an_account_page_still_divides_by_its_own_plan(self, app):
+        """The other account's subscription bought none of what is on this page."""
+        self._declare(app, "work")
+        self._declare(app, "home", "default_claude_pro")
+        conn = app.state.db.connect()
+        view = dashboard.build(
+            conn, 90, NOW, dashboard.Scope("account", "work@example.net"),
+        )
+        start, end = dashboard.range_bounds(90, NOW)
+        merged = dashboard.reports.load_grouped(
+            conn, dashboard.reports.Filters(since=start, until=end),
+        )
+        span = dashboard._active_span(
+            [m for m in merged if m.account == "work@example.net"], start, end,
+        )
+        expected = present(dashboard._Plans(conn, {"work@example.net"}).cost(*span))
+        every = present(dashboard._Plans(conn).cost(*span))
+        assert expected < every
+        subline = present(self._tile(view)).subline
+        assert dashboard._fmt_usd(expected) in subline
+        assert dashboard._fmt_usd(every) not in subline
+
+    def test_a_plan_declared_ended_stops_being_charged(self, app):
+        """An entry with no tier field is how a subscription that stopped is said."""
+        from ccreport import tier_timeline
+        from ccreport.server import db
+
+        self._declare(app, "work")
+        conn = app.state.db.connect()
+        ended = (NOW - timedelta(days=120)).timestamp()
+        db.set_account_tiers(conn, "home", [
+            tier_timeline.Entry(
+                ts=datetime(2020, 1, 1, tzinfo=UTC).timestamp(), account="home",
+                organization_rate_limit_tier="default_claude_pro",
+            ),
+            tier_timeline.Entry(ts=ended, account="home"),
+        ], 1.0)
+        conn.commit()
+        span = dashboard.range_bounds(30, NOW)
+        assert (present(dashboard._Plans(conn).cost(*span))
+                == pytest.approx(present(dashboard._Plans(
+                    conn, {"work@example.net"}).cost(*span))))
+
     def test_a_renamed_account_still_finds_its_plan(self, app):
         """_Plans matches display names, and an alias replaces the pushed label."""
         from ccreport.server import db

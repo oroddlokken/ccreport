@@ -595,9 +595,18 @@ class _Plans:
     range.
     """
 
-    def __init__(self, conn, accounts: set[str]) -> None:
+    def __init__(self, conn, accounts: set[str] | None = None) -> None:
         entries = db.account_tiers(conn)
         self._timeline = tier_timeline.TierTimeline(entries)
+        if accounts is None:
+            # Every declared plan, which is what a page about a span rather
+            # than about one account has to divide by: a subscription is paid
+            # for whether or not that account was worked on that day, the same
+            # reason a month page charges the whole month. An account that
+            # stopped paying declares it as an entry with no tier field, which
+            # prices to None and drops out of the sum.
+            self._uuids = sorted({entry.account for entry in entries})
+            return
         aliases = db.account_aliases(conn)
         # Display names, because that is what a folded record carries and what
         # a breakdown row groups on. The timeline is keyed by uuid, so the two
@@ -827,8 +836,11 @@ def build(conn, days: int, now: datetime | None = None,
     }
     # Attached after the fold rather than inside it: a plan cost is not a
     # property of any record, and breakdown() sees neither the connection the
-    # timeline is read from nor which account a folded row belongs to.
-    plans = _Plans(conn, set(accounts))
+    # timeline is read from nor which account a folded row belongs to. An
+    # account page divides by its own plan; every other page divides by all of
+    # them, including an account that spent nothing over the span.
+    plans = _Plans(conn, {scope.key} if scope is not None
+                   and scope.dimension == "account" else None)
     for row in breakdowns.get("month", []):
         opens, closes = _month_bounds(row["key"])
         usd = plans.cost(opens, closes)

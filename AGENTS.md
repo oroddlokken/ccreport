@@ -261,7 +261,12 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   records cover (`_active_span`) rather than the range bounds, which on the
   all-time toggle start at the server's oldest record; a period page is the
   exception and charges its whole period, because the month was paid for
-  whether or not every day of it was worked
+  whether or not every day of it was worked. What it divides by is every
+  declared plan, not the plans of the accounts the page happens to show: a
+  subscription is paid for on a day that account was idle, the same reason a
+  month page charges the whole month. An account page passes its own account
+  and divides by that one alone, and a plan that stopped is a `[[tier]]` entry
+  with no tier field, which prices to None and leaves the sum
 - Which rows a report has is `aggregate.py`; what they look like is
   `ccreport.py`. The row builders there are the one place the rollup path and
   the full record path meet, and the server folds records through the same
