@@ -49,6 +49,24 @@ jobs:
       - name: Check sdist
         run: uvx --from rust-just just check-sdist
 
+      # The tap push is the last step of a release and the first that needs
+      # this token, so its write access is probed here instead. The repo API's
+      # permissions.push reports the user's role, which is push for the owner
+      # whatever the token itself can do.
+      - name: Check tap write access
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            -u "x-access-token:${TAP_TOKEN}" \
+            "https://github.com/oroddlokken/homebrew-tap.git/info/refs?service=git-receive-pack")
+          if [ "$CODE" != "200" ]; then
+            echo "HOMEBREW_TAP_TOKEN cannot push to oroddlokken/homebrew-tap (HTTP $CODE)." >&2
+            echo "Set the token's Contents permission to Read and write, then rerun." >&2
+            exit 1
+          fi
+          echo "Tap write access confirmed."
+
       - name: Extract version from branch name
         id: version
         run: |
@@ -145,3 +163,55 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  update-homebrew:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version
+        id: meta
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          VERSION="${BRANCH#release/v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download wheel and compute SHA256
+        id: sha
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          WHEEL="ccreport-${VERSION}-py3-none-any.whl"
+          URL="https://github.com/oroddlokken/ccreport/releases/download/${TAG}/${WHEEL}"
+          # The release asset takes a moment to become downloadable, so an
+          # empty digest here means too early rather than wrong.
+          for i in 1 2 3 4 5; do
+            SHA256=$(curl -sL "$URL" | shasum -a 256 | cut -d' ' -f1)
+            if [ -n "$SHA256" ]; then break; fi
+            sleep 10
+          done
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: oroddlokken/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        run: |
+          cd homebrew-tap
+          sed -i 's|url ".*"|url "${{ steps.sha.outputs.url }}"|' Formula/ccreport.rb
+          sed -i 's|sha256 ".*"|sha256 "${{ steps.sha.outputs.sha256 }}"|' Formula/ccreport.rb
+
+      - name: Commit and push
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ccreport.rb
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Update ccreport to ${{ steps.meta.outputs.version }}"
+          git push

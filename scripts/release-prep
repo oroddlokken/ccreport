@@ -171,6 +171,7 @@ Merging this PR will:
 1. Create the final \`v${VERSION}\` tag
 2. Build and publish the GitHub Release
 3. Push the GHCR image
+4. Update the Homebrew formula
 EOF
 )" \
         --base master)

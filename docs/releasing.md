@@ -19,8 +19,8 @@ stops. `tests/test_release_prep.py` drives both paths against a bare local remot
 
 Merging that pull request fires `.github/workflows/publish.yml`. It tags `vX.Y.Z`, builds the
 wheel and sdist, creates the GitHub Release with that version's `CHANGELOG.md` section as its
-body, and pushes the server image to GHCR. The merge is the irreversible step, and it is the
-user's to make.
+body, pushes the server image to GHCR, and pushes a formula commit to the
+`oroddlokken/homebrew-tap` repo. The merge is the irreversible step, and it is the user's to make.
 
 Run `just release-prep` only when the user names a version and asks for a release, and leave the
 merge to them. `just next` reports the candidate patch and minor versions and changes nothing.
@@ -32,6 +32,23 @@ branch starts with `release/v`; landing the same commits any other way publishes
 each sets up its own toolchain and pins its own `PYRIGHT_PYTHON_FORCE_VERSION`. A step added to
 one has to be added to the other, or the failure surfaces at release time, when the merge has
 already landed on `master`.
+
+## Homebrew formula
+
+`publish.yml` rewrites the `url` and `sha256` fields in `Formula/ccreport.rb` in the tap repo and
+pushes the commit, so a version bump needs no hand edit and a hand edit is overwritten by the next
+release.
+
+Hand edits cover structural changes only: a new runtime dependency, a changed entry point. Wait for
+user confirmation before making one, and say so when a CLI change requires it.
+
+The formula installs the release wheel into its own virtualenv and puts `ccreport` and `ccu` on
+`PATH`. The status line and the hooks are not in it: they run out of a checkout.
+
+The tap is a separate repo, checked out at `~/git/homebrew-tap`. The `update-homebrew` job reads
+`HOMEBREW_TAP_TOKEN` from this repo's secrets — a PAT with `contents:write` on the tap. The publish
+job probes that write access ahead of the tag push, so a token that can only read the tap fails
+the release before anything is published.
 
 ## `just check-sdist` guards the tarball
 
@@ -55,5 +72,5 @@ uses, and `docker/metadata-action` writes it into the OCI labels with the revisi
 The image's CMD is the one-worker, no-reload form. `docker-compose.yml` overrides it with
 `--reload` for `just docker-up`, and `tests/test_docker_image.py` fails if either side drifts.
 
-The CLI has no release track. It stays a checkout install, and `ccreport update --pull`
-fast-forwards to `master`; the wheel and sdist ride along on the GitHub Release as assets.
+A checkout is still the other way in: `ccreport update --pull` fast-forwards it to `master`, and
+the wheel and sdist ride along on the GitHub Release as assets.

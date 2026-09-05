@@ -713,8 +713,8 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
 ## Releasing
 
 `docs/releasing.md` covers `just release-prep`, the step past which a release
-cannot be undone, the parity rule between `ci.yml` and `publish.yml`, and the
-GHCR image. Read it before running any release command.
+cannot be undone, the parity rule between `ci.yml` and `publish.yml`, the GHCR
+image and the Homebrew formula. Read it before running any release command.
 
 ## Changelog
 

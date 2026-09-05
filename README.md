@@ -6,6 +6,16 @@ status line: three commands over one cache.
 `ccreport` and the status line work off the JSONL session logs Claude Code
 already writes under `~/.claude/projects/` (or `~/.config/claude/projects/`).
 
+## Install
+
+```bash
+brew install oroddlokken/tap/ccreport
+```
+
+That puts `ccreport` and `ccu` on `PATH`. The status line and the hooks run
+out of a checkout, so a machine that wants those installs from one instead;
+see [Install from a checkout](#install-from-a-checkout).
+
 ## Status line
 
 ![status line under a Claude Code session, showing model, context, quota and cost windows](assets/statusline.png)
@@ -270,7 +280,7 @@ docker run -p 8787:8787 -v ccreport-data:/data \
 is the bridge gateway rather than loopback, so the default answers every page
 403.
 
-## Install
+## Install from a checkout
 
 ```bash
 git clone git@github.com:oroddlokken/ccreport.git && cd ccreport
