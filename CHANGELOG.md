@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.1.1 (2026-09-05)
+
 ### Fixed
 
 - **A pool connection is closed by the thread that opened it.** A worker thread that ends drops its `threading.local` storage, and the connection went with it — finalized by the GC rather than closed. A holder now sits in that storage and closes on the thread's own teardown, the only thread sqlite3 permits a close from; the suite went from 1758 warnings to 8.
