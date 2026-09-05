@@ -14,6 +14,18 @@ from ccreport import ccreport as ccr
 NOW = datetime(2026, 3, 15, 12, 0, tzinfo=UTC).astimezone()
 
 
+class _FrozenClock(datetime):
+    """`datetime` with `now` pinned to NOW, for the command tests.
+
+    The calendar-month projection wants three active days inside the month, so
+    a run seeded backwards from the wall clock projects nothing on the 2nd.
+    """
+
+    @classmethod
+    def now(cls, tz=None):
+        return NOW.astimezone(tz) if tz else NOW
+
+
 def _costs(pairs) -> dict[str, float]:
     """(day of March, USD) pairs as the mapping the forecast reads."""
     return {f"2026-03-{day:02d}": cost for day, cost in pairs}
@@ -226,6 +238,7 @@ class TestBudgetCommand:
         monkeypatch.setattr(ccr, "discover_jsonl_files", list)
         monkeypatch.setattr(ccr, "_ensure_cache_valid", lambda _live_paths: None)
         cache_db.init_ccreport_meta(ccr.CACHE_VERSION, ccr._script_hash())
+        monkeypatch.setattr(ccr, "datetime", _FrozenClock)
 
     def _run(self, monkeypatch, argv) -> str:
         buf = io.StringIO()
@@ -235,7 +248,7 @@ class TestBudgetCommand:
         return buf.getvalue()
 
     def _seed(self, days=5, cost=5.0):
-        now = datetime.now().astimezone()
+        now = NOW
         cache_db.record_account_event(
             {"accountUuid": "u", "emailAddress": "me@work.example", "organizationName": "Org"},
             now=now.timestamp() - 40 * 86400,
