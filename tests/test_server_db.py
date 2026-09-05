@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gc
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -652,3 +654,27 @@ class TestDatabase:
         thread.join()
         assert seen[0] is not database.connect()
         database.close()
+
+
+class TestPoolConnectionsClose:
+    """Whoever opened a pool connection is who closes it."""
+
+    def test_a_worker_threads_connection_closes_when_that_thread_ends(self, tmp_path):
+        """Left open, the GC finalizes it and sqlite3 calls it an unclosed database."""
+        database = db.Database(tmp_path / "server.db")
+        opened: list[sqlite3.Connection] = []
+        thread = threading.Thread(target=lambda: opened.append(database.connect()))
+        thread.start()
+        thread.join()
+        del thread
+        gc.collect()
+        with pytest.raises(sqlite3.ProgrammingError):
+            opened[0].execute("SELECT 1")
+
+    def test_close_still_takes_the_calling_threads_connection(self, tmp_path):
+        database = db.Database(tmp_path / "server.db")
+        conn = database.connect()
+        database.close()
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+        assert database.connect() is not conn

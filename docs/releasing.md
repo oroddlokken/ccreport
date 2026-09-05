@@ -39,6 +39,12 @@ already landed on `master`.
 pushes the commit, so a version bump needs no hand edit and a hand edit is overwritten by the next
 release.
 
+The digest is taken from the wheel downloaded to a file rather than from a pipe. A release asset
+takes a moment to become downloadable, and until it is, GitHub serves a 404 body that digests to a
+real sha256; a formula carrying that digest fails every `brew install`. The job retries five times
+on `curl -f`'s exit code and then exits 1, which leaves the tap untouched. Rerunning the job fixes
+that, where a pushed wrong digest needs a hand edit to the formula.
+
 Hand edits cover structural changes only: a new runtime dependency, a changed entry point. Wait for
 user confirmation before making one, and say so when a CLI change requires it.
 

@@ -84,6 +84,31 @@ def isolate_cache_db(tmp_path, monkeypatch, isolate_environment):
 
 
 @pytest.fixture(autouse=True)
+def close_server_pools(monkeypatch):
+    """Close the server connections this test opened on its own thread.
+
+    Database keeps one connection per thread and leaves them to process exit:
+    right for a long-lived server, wrong for a test process. An abandoned
+    connection is finalized by the GC rather than closed, which sqlite3 reports
+    as an unclosed database.
+    """
+    from ccreport.server import db
+
+    built: list[db.Database] = []
+    original = db.Database
+
+    def track(path):
+        pool = original(path)
+        built.append(pool)
+        return pool
+
+    monkeypatch.setattr(db, "Database", track)
+    yield
+    for pool in built:
+        pool.close()
+
+
+@pytest.fixture(autouse=True)
 def isolate_session_logs(tmp_path, monkeypatch):
     """Keep every test off the developer's own ~/.claude/projects.
 

@@ -468,6 +468,30 @@ SCHEMA_VERSION = migrations.head(MIGRATION_CHAIN, MIGRATION_BASELINE)
 """The version a fully migrated database is stamped at. Derived, never edited."""
 
 
+class _ThreadConnection:
+    """One thread's connection, closed when that thread ends.
+
+    A worker thread that exits drops its threading.local storage, and the
+    connection goes with it -- finalized by the GC rather than closed. CPython
+    frees that storage on the dying thread, which is the only thread sqlite3
+    lets close it.
+    """
+
+    __slots__ = ("conn",)
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+
+    def __del__(self) -> None:
+        # sqlite3 refuses a close from a thread that did not open the connection.
+        # A raise here would print an unraisable traceback in place of the
+        # warning this exists to remove.
+        try:
+            self.conn.close()
+        except sqlite3.Error:
+            pass
+
+
 class Database:
     """One connection per thread over one server database file.
 
@@ -484,21 +508,22 @@ class Database:
 
     def connect(self) -> sqlite3.Connection:
         """The calling thread's connection, opened on its first use."""
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = self._local.conn = connect(self.path)
-        return conn
+        held = getattr(self._local, "held", None)
+        if held is None:
+            held = self._local.held = _ThreadConnection(connect(self.path))
+        return held.conn
 
     def close(self) -> None:
         """Close this thread's connection, if it has one.
 
-        Only this thread's: sqlite3 refuses a close from anywhere else, and the
-        pool's other connections are released when the process exits.
+        Only this thread's: sqlite3 refuses a close from anywhere else. Another
+        thread's connection is closed by _ThreadConnection when that thread ends.
         """
-        conn = getattr(self._local, "conn", None)
-        if conn is not None:
-            conn.close()
-            self._local.conn = None
+        held = getattr(self._local, "held", None)
+        if held is not None:
+            held.conn.close()
+            self._local.held = None
+
 
 
 MMAP_SIZE = 512 * 1024 * 1024

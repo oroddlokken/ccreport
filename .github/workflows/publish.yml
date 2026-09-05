@@ -183,13 +183,21 @@ jobs:
           TAG="${{ steps.meta.outputs.tag }}"
           WHEEL="ccreport-${VERSION}-py3-none-any.whl"
           URL="https://github.com/oroddlokken/ccreport/releases/download/${TAG}/${WHEEL}"
-          # The release asset takes a moment to become downloadable, so an
-          # empty digest here means too early rather than wrong.
+          # The release asset takes a moment to become downloadable. GitHub's
+          # 404 body digests to a real sha256, so curl's exit code is what the
+          # loop turns on; a digest is never empty enough to retry on.
           for i in 1 2 3 4 5; do
-            SHA256=$(curl -sL "$URL" | shasum -a 256 | cut -d' ' -f1)
-            if [ -n "$SHA256" ]; then break; fi
+            if curl -fsSL -o wheel.whl "$URL"; then break; fi
             sleep 10
           done
+          if [ ! -s wheel.whl ]; then
+            echo "$URL never became downloadable. Rerun this job." >&2
+            exit 1
+          fi
+          # An error page can arrive with a 200, and past this step the
+          # formula's sha256 is the only thing that would catch it.
+          unzip -tq wheel.whl
+          SHA256=$(shasum -a 256 wheel.whl | cut -d' ' -f1)
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
