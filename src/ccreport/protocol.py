@@ -1,10 +1,10 @@
 """The version the push client and a ccreport server agree on over the wire.
 
 One integer, bumped by hand, and separate from everything else that carries a
-number. The package version is `0.1.0` and has never moved — this repo has no
-tags and no releases, master is the release and the unit is a commit — so it
-cannot say whether a payload will be understood. A commit sha can: every commit
-differs from every other, which makes it advisory and nothing more.
+number. The package version comes off the newest `vX.Y.Z` tag through
+hatch-vcs and moves with every release whether or not the bytes did, so it
+cannot say whether a payload will be understood. Nor can a commit sha: every
+commit differs from every other, which makes it advisory and nothing more.
 
 Bump PROTOCOL_VERSION when, and only when, the bytes on the wire change:
 

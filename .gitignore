@@ -20,3 +20,5 @@ seeded_*
 export/
 .claude-cache/
 .playwright-mcp
+dist/
+src/ccreport/_version.py

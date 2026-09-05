@@ -1,6 +1,6 @@
 [project]
 name = "ccreport"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Token usage and cost reporting for Claude Code, plus the status line that reads the same cache"
 requires-python = ">=3.13"
 # The status line imports none of these — it renders on stdlib alone, which is
@@ -21,14 +21,34 @@ ccreport = "ccreport.ccreport:main"
 ccu = "ccreport.ccu:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+raw-options = { version_scheme = "no-guess-dev" }
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/ccreport/_version.py"
 
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ccreport"]
+
+[tool.hatch.build.targets.sdist]
+# An include-list, not an exclude-list, because hatchling reads the root
+# .gitignore alone: a directory a tool gitignores from inside itself stays
+# invisible to git status and still ships. Without this section the tarball
+# sweeps in the 2.9 MB .dogcats issue store and the 2.5 MB assets/ screenshots.
+include = [
+  "/src",
+  "/docs",
+  "/bin",
+  "/README.md",
+  "/CHANGELOG.md",
+]
 
 # PEP 735 dependency groups — NOT [project.optional-dependencies]
 [dependency-groups]

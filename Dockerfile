@@ -40,6 +40,7 @@ USER app
 EXPOSE 8787
 
 # The repo's own entry point rather than granian directly: it reads the
-# CCREPORT_SERVER_* environment. --reload drops it to one worker, which is what
-# a shared SQLite file wants.
-CMD ["python", "-m", "ccreport.server.fastapi_server", "--host", "0.0.0.0", "--reload"]
+# CCREPORT_SERVER_* environment. --workers is spelled out because argparse
+# defaults it to 2 and one SQLite file wants one writer; docker-compose.yml
+# overrides this command with --reload for development.
+CMD ["python", "-m", "ccreport.server.fastapi_server", "--host", "0.0.0.0", "--workers", "1"]

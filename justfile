@@ -19,8 +19,10 @@ lint:
     uv run ruff check src tests tools
 
 # lint using pyright
+# latest unless the caller pins one, which ci.yml does to the version uv.lock
+# resolves: a pyright release upstream must not turn master red on its own
 lint-pyright:
-    PYRIGHT_PYTHON_FORCE_VERSION=latest uv run pyright src tests
+    PYRIGHT_PYTHON_FORCE_VERSION=${PYRIGHT_PYTHON_FORCE_VERSION:-latest} uv run pyright src tests
 
 # run all linters
 lint-all:
@@ -76,3 +78,37 @@ test-changed:
 # run all tests with coverage
 test-all:
     uv run pytest --timeout 60 -n 8 tests --cov-report=html --cov=src/ccreport
+
+# build an sdist and check what it carries
+check-sdist:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Built into a temp dir rather than dist/, which holds artifacts from
+    # earlier builds that would make the tarball ambiguous.
+    out=$(mktemp -d)
+    trap 'rm -rf "$out"' EXIT
+    uv build --sdist --out-dir "$out" -q
+    ./scripts/check-sdist "$out"/*.tar.gz
+
+# show next possible versions (patch or minor bump)
+next:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sed 's/^v//; s/-rc\..*//' | sort -t. -k1,1n -k2,2n -k3,3n -u | tail -1)
+    LATEST=${LATEST:-0.0.0}
+    IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST"
+    RC=$(git tag -l "v${LATEST}-rc.*" | sort -V | tail -1 | sed -n 's/.*-rc\.//p')
+    RELEASED=$(git tag -l "v${LATEST}" | head -1)
+    if [ -n "$RC" ] && [ -z "$RELEASED" ]; then
+        echo "Current: ${LATEST} (rc.${RC}, unreleased)"
+    else
+        echo "Current: ${LATEST}"
+    fi
+    echo "  patch: ${MAJOR}.${MINOR}.$((PATCH + 1))"
+    echo "  minor: ${MAJOR}.$((MINOR + 1)).0"
+
+# The user's call, never an agent's: docs/releasing.md says why.
+# prepare a release: create RC tag, push branch, open PR
+release-prep *args:
+    ./scripts/release-prep {{args}}
+    git pull origin master

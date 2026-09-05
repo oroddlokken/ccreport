@@ -10,6 +10,9 @@ services:
     image: ccreport:dev
     container_name: ccreport-server
     restart: unless-stopped
+    # The image's CMD is the published one-worker form. --reload watches the
+    # ./src mount below and drops the server to one worker itself.
+    command: ["python", "-m", "ccreport.server.fastapi_server", "--host", "0.0.0.0", "--reload"]
     environment:
       CCREPORT_SERVER_DB: /data/server.db
       # A browser on the host reaches the container through the compose bridge,

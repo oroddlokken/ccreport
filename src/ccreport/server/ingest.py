@@ -219,7 +219,13 @@ class HealthResponse(BaseModel):
 
 
 def server_version() -> str:
-    """The running build's version, or "unknown" if the package is not installed."""
+    """The running build's version, or "unknown" if the package is not installed.
+
+    The published image is that case: the Dockerfile copies ``src`` raw over a
+    venv built with ``--no-install-project``, so the version lives in the
+    image's ``org.opencontainers.image.version`` label and not here. Installing
+    the project would cost the venv layer its cache on every source edit.
+    """
     from importlib.metadata import PackageNotFoundError, version
 
     try:

@@ -254,6 +254,22 @@ first list afterwards, `exclude` and `unexclude` the second.
 runs; the default is 30. A metered link wants a longer interval, a wired desktop
 a shorter one.
 
+### The published image
+
+A `vX.Y.Z` tag is what builds `ghcr.io/oroddlokken/ccreport:X.Y.Z` and
+`:latest`, for `linux/amd64`. The image runs one worker and no reloader:
+
+```bash
+docker run -p 8787:8787 -v ccreport-data:/data \
+  -e CCREPORT_SERVER_DB=/data/server.db \
+  -e CCREPORT_SERVER_NETWORKS='127.0.0.1/32 192.168.0.0/16' \
+  ghcr.io/oroddlokken/ccreport:latest
+```
+
+`_NETWORKS` has to name the range a browser arrives from. Inside docker that
+is the bridge gateway rather than loopback, so the default answers every page
+403.
+
 ## Install
 
 ```bash
@@ -272,8 +288,8 @@ installed copy, so an edit takes effect on the next invocation.
 
 ## Updates
 
-There are no tagged versions. master is the release, so updating is a
-fast-forward in the checkout:
+The CLI has no tagged versions: master is what a checkout tracks, so updating
+is a fast-forward in the checkout:
 
 ```
 ccreport update           # how far behind master is this checkout?

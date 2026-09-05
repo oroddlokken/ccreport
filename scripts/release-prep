@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── Colors ────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+    GREEN='\033[0;32m' RED='\033[0;31m' YELLOW='\033[0;33m'
+    BOLD='\033[1m' DIM='\033[2m' RESET='\033[0m'
+else
+    GREEN='' RED='' YELLOW='' BOLD='' DIM='' RESET=''
+fi
+
+info()  { printf "${BOLD}▸${RESET} %s\n" "$*"; }
+ok()    { printf "${GREEN}✓${RESET} %s\n" "$*"; }
+warn()  { printf "${YELLOW}!${RESET} %s\n" "$*"; }
+die()   { printf "${RED}✗${RESET} %s\n" "$*" >&2; exit 1; }
+
+# ── Usage ─────────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--no-watch] [--skip-checks] <version>
+
+Prepare a release: run checks, create RC tag, push branch, open PR.
+
+Arguments:
+  <version>       Version to release (e.g. 0.9.3 or v0.9.3)
+
+Options:
+  -W, --no-watch      Skip watching CI/release actions after prep
+  --skip-checks       Skip local lint-all and test-all
+  -h, --help          Show this help
+EOF
+}
+
+# ── Parse args ────────────────────────────────────────────────────────
+WATCH=true
+SKIP_CHECKS=false
+VERSION=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -W|--no-watch)   WATCH=false; shift ;;
+        --skip-checks)   SKIP_CHECKS=true; shift ;;
+        -h|--help)       usage; exit 0 ;;
+        -*)              die "Unknown option: $1" ;;
+        *)
+            [[ -n "$VERSION" ]] && die "Unexpected argument: $1"
+            VERSION="$1"; shift
+            ;;
+    esac
+done
+
+[[ -z "$VERSION" ]] && { usage; exit 1; }
+
+VERSION="${VERSION#v}"
+BRANCH="release/v${VERSION}"
+TAG_PREFIX="v${VERSION}-rc"
+
+# Bail out if v${VERSION} has already been released. Without this guard,
+# re-running with a shipped version cuts a stray RC tag against already-
+# released code and can re-trigger the publish workflow.
+git fetch --tags --quiet 2>/dev/null || true
+if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+    die "v${VERSION} is already released — pick a new version."
+fi
+
+# The branch work happens in this clone, so an uncommitted edit would ride
+# into the release commit or block the checkout. A detached HEAD is recorded
+# as its sha, which restores the same commit.
+[[ -z "$(git status --porcelain)" ]] || die "Working tree is dirty — commit or stash first."
+ORIGINAL_REF=$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)
+
+restore() { git checkout --quiet "$ORIGINAL_REF" 2>/dev/null || true; }
+trap restore EXIT
+
+# ── Phase 1: Local checks ────────────────────────────────────────────
+if [[ "$SKIP_CHECKS" == false ]]; then
+    info "Running lint-all…"
+    just lint-all
+    ok "Linting passed"
+
+    info "Running test-all…"
+    just test-all
+    ok "Tests passed"
+else
+    warn "Skipping local checks (--skip-checks)"
+fi
+
+# ── Phase 1: Release prep ────────────────────────────────────────────
+
+# Determine next RC number
+LAST_RC=$(git tag -l "${TAG_PREFIX}.*" | sed "s/${TAG_PREFIX}\.//" | sort -n | tail -1)
+if [[ -z "$LAST_RC" ]]; then
+    RC=1
+else
+    RC=$((LAST_RC + 1))
+fi
+RC_TAG="${TAG_PREFIX}.${RC}"
+
+info "Preparing ${RC_TAG} on branch ${BRANCH}"
+
+# Create or reuse the release branch.
+NEEDS_FORCE_PUSH=false
+REUSING_BRANCH=true
+if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+    git checkout --quiet "${BRANCH}"
+elif git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null 2>&1; then
+    # The branch is on origin but not in this clone — a previous RC cut
+    # elsewhere, or a local branch since deleted. Branching off master instead
+    # would fork a sibling of the real tip that no push can fast-forward.
+    info "Fetching existing ${BRANCH} from origin"
+    git fetch --quiet origin "${BRANCH}:${BRANCH}"
+    git checkout --quiet "${BRANCH}"
+else
+    git checkout --quiet -b "${BRANCH}"
+    REUSING_BRANCH=false
+fi
+
+if [[ "$REUSING_BRANCH" == true ]]; then
+    # If master has new commits the release branch doesn't include, hard-reset
+    # the branch to master so any fixes that landed since the previous RC are
+    # picked up. The changelog stamp gets re-created below.
+    NEW_ON_MASTER=$(git rev-list --count "HEAD..master")
+    if [[ "$NEW_ON_MASTER" -gt 0 ]]; then
+        info "Syncing ${BRANCH} to master (${NEW_ON_MASTER} new commit(s) since previous RC)"
+        git reset --hard --quiet master
+        NEEDS_FORCE_PUSH=true
+    fi
+fi
+
+# Stamp CHANGELOG: insert version header after [Unreleased]
+DATE=$(date +%Y-%m-%d)
+if ! grep -q "^## ${VERSION}" CHANGELOG.md; then
+    sed -i.bak "s/^## \[Unreleased\]/## [Unreleased]\n\n## ${VERSION} (${DATE})/" CHANGELOG.md
+    rm -f CHANGELOG.md.bak
+    git add CHANGELOG.md
+    git commit --quiet -m "Prepare changelog for v${VERSION}"
+fi
+
+# Skip tagging if HEAD already has an RC tag (nothing changed)
+EXISTING_TAG=$(git tag --points-at HEAD | grep "^${TAG_PREFIX}\." || true)
+if [[ -n "$EXISTING_TAG" ]]; then
+    warn "HEAD already tagged as ${EXISTING_TAG} — nothing changed, skipping tag."
+    RC_TAG="$EXISTING_TAG"
+else
+    # Tag, then push the branch and the tag as separate commands. Sending
+    # both with `push --tags` publishes the tag even when the branch ref is
+    # rejected, which strands an RC tag on a commit no branch reaches.
+    git tag -a "${RC_TAG}" -m "Release candidate ${RC_TAG}"
+    PUSH_ARGS=(-u origin "${BRANCH}")
+    [[ "$NEEDS_FORCE_PUSH" == true ]] && PUSH_ARGS=(--force-with-lease "${PUSH_ARGS[@]}")
+    if ! git push "${PUSH_ARGS[@]}"; then
+        git tag -d "${RC_TAG}" >/dev/null
+        die "Push of ${BRANCH} was rejected. Dropped the local ${RC_TAG} so a rerun cuts it again; nothing was published."
+    fi
+    git push origin "${RC_TAG}"
+    ok "RC tag ${RC_TAG} pushed"
+fi
+
+# Open PR if one doesn't exist yet
+PR_URL=""
+if ! gh pr view "${BRANCH}" > /dev/null 2>&1; then
+    PR_URL=$(gh pr create \
+        --head "${BRANCH}" \
+        --title "Release v${VERSION}" \
+        --body "$(cat <<EOF
+## Release v${VERSION}
+
+Release candidate: \`${RC_TAG}\`
+
+Merging this PR will:
+1. Create the final \`v${VERSION}\` tag
+2. Build and publish the GitHub Release
+3. Push the GHCR image
+EOF
+)" \
+        --base master)
+    ok "PR created: ${PR_URL}"
+else
+    PR_URL=$(gh pr view "${BRANCH}" --json url -q .url)
+    ok "PR: ${PR_URL}"
+fi
+
+# ── Status summary ───────────────────────────────────────────────────
+echo ""
+info "Release status for v${VERSION}"
+printf "  ${BOLD}RC tag:${RESET}  %s\n" "$RC_TAG"
+printf "  ${BOLD}Branch:${RESET} %s\n" "$BRANCH"
+printf "  ${BOLD}PR:${RESET}     %s\n" "$PR_URL"
+
+PR_JSON=$(gh pr view "${BRANCH}" --json state,reviewDecision,mergeable,statusCheckRollup 2>/dev/null || true)
+if [[ -n "$PR_JSON" ]]; then
+    PR_STATE=$(echo "$PR_JSON" | jq -r '.state // "UNKNOWN"')
+    REVIEW=$(echo "$PR_JSON" | jq -r '.reviewDecision // "NONE"')
+    MERGEABLE=$(echo "$PR_JSON" | jq -r '.mergeable // "UNKNOWN"')
+
+    case "$PR_STATE" in
+        OPEN)   printf "  ${BOLD}State:${RESET}  ${GREEN}open${RESET}\n" ;;
+        MERGED) printf "  ${BOLD}State:${RESET}  ${GREEN}merged${RESET}\n" ;;
+        CLOSED) printf "  ${BOLD}State:${RESET}  ${RED}closed${RESET}\n" ;;
+        *)      printf "  ${BOLD}State:${RESET}  %s\n" "$PR_STATE" ;;
+    esac
+
+    case "$REVIEW" in
+        APPROVED)          printf "  ${BOLD}Review:${RESET} ${GREEN}approved${RESET}\n" ;;
+        CHANGES_REQUESTED) printf "  ${BOLD}Review:${RESET} ${RED}changes requested${RESET}\n" ;;
+        REVIEW_REQUIRED)   printf "  ${BOLD}Review:${RESET} ${YELLOW}review required${RESET}\n" ;;
+        NONE)              printf "  ${BOLD}Review:${RESET} ${DIM}none${RESET}\n" ;;
+        *)                 printf "  ${BOLD}Review:${RESET} %s\n" "$REVIEW" ;;
+    esac
+
+    case "$MERGEABLE" in
+        MERGEABLE)   printf "  ${BOLD}Merge:${RESET}  ${GREEN}ready${RESET}\n" ;;
+        CONFLICTING) printf "  ${BOLD}Merge:${RESET}  ${RED}conflicts${RESET}\n" ;;
+        *)           printf "  ${BOLD}Merge:${RESET}  ${DIM}%s${RESET}\n" "$(echo "$MERGEABLE" | tr '[:upper:]' '[:lower:]')" ;;
+    esac
+
+    TOTAL=$(echo "$PR_JSON" | jq '[.statusCheckRollup[]? | select(.name != null)] | length')
+    PASS=$(echo "$PR_JSON" | jq '[.statusCheckRollup[]? | select(.conclusion == "SUCCESS")] | length')
+    FAIL=$(echo "$PR_JSON" | jq '[.statusCheckRollup[]? | select(.conclusion == "FAILURE")] | length')
+    PENDING=$((TOTAL - PASS - FAIL))
+
+    if [[ "$TOTAL" -gt 0 ]]; then
+        if [[ "$FAIL" -gt 0 ]]; then
+            printf "  ${BOLD}Checks:${RESET} ${RED}%d/%d passed, %d failed${RESET}" "$PASS" "$TOTAL" "$FAIL"
+        elif [[ "$PENDING" -gt 0 ]]; then
+            printf "  ${BOLD}Checks:${RESET} ${YELLOW}%d/%d passed, %d pending${RESET}" "$PASS" "$TOTAL" "$PENDING"
+        else
+            printf "  ${BOLD}Checks:${RESET} ${GREEN}%d/%d passed${RESET}" "$PASS" "$TOTAL"
+        fi
+        echo ""
+    else
+        printf "  ${BOLD}Checks:${RESET} ${DIM}none${RESET}\n"
+    fi
+fi
+
+# ── Phase 2: Watch ────────────────────────────────────────────────────
+[[ "$WATCH" == false ]] && exit 0
+
+echo ""
+info "Watch mode — monitoring CI and release actions…"
+
+info "Waiting for PR checks…"
+# gh exits non-zero for an empty rollup and for a failed check alike, and a
+# pull request seconds old always reports none. Wait for the first check to
+# register before handing off to --watch.
+CHECKS=0
+for _ in $(seq 1 30); do
+    CHECKS=$(gh pr view "${BRANCH}" --json statusCheckRollup \
+        -q '[.statusCheckRollup[]?] | length' 2>/dev/null || echo 0)
+    [[ -n "$CHECKS" ]] || CHECKS=0
+    [[ "$CHECKS" -gt 0 ]] && break
+    sleep 5
+done
+if [[ "$CHECKS" -eq 0 ]]; then
+    die "No check registered on ${BRANCH} within 150s. Read the PR's checks, or rerun with -W."
+fi
+
+if ! gh pr checks "${BRANCH}" --watch --fail-fast; then
+    die "PR checks failed"
+fi
+
+echo ""
+ok "All checks passed!"
+printf "  ${BOLD}PR:${RESET} %s\n" "$PR_URL"
+echo ""
+info "Waiting for PR to be merged…"
+
+while true; do
+    STATE=$(gh pr view "${BRANCH}" --json state -q .state)
+    case "$STATE" in
+        MERGED)
+            ok "PR merged!"
+            break
+            ;;
+        CLOSED)
+            die "PR was closed without merging"
+            ;;
+        *)
+            printf "${DIM}.${RESET}"
+            sleep 30
+            ;;
+    esac
+done
+
+echo ""
+info "Waiting for publish workflow…"
+PUBLISH_RUN_ID=""
+for _ in $(seq 1 60); do
+    PUBLISH_RUN_ID=$(gh run list -w publish.yml -b "${BRANCH}" --json databaseId,createdAt \
+        -q ".[0].databaseId // empty" 2>/dev/null || true)
+    [[ -n "$PUBLISH_RUN_ID" ]] && break
+    sleep 5
+done
+
+if [[ -z "$PUBLISH_RUN_ID" ]]; then
+    die "Could not find publish workflow run"
+fi
+
+if ! gh run watch "$PUBLISH_RUN_ID" --exit-status; then
+    die "Publish workflow failed"
+fi
+
+echo ""
+ok "Release v${VERSION} published!"
+printf "  ${BOLD}Release:${RESET} https://github.com/oroddlokken/ccreport/releases/tag/v%s\n" "$VERSION"

@@ -35,7 +35,8 @@ updated without starting work.
 
 Wait for explicit user approval before closing an issue. When the work is done:
 run `dcat update <id> --status in_review`, ask the user to test, ask "Can I
-close issue [id] '[title]'?", and run `dcat close <id>` after they confirm.
+close issue [id] '[title]'?", and run `dcat close <id>` after they confirm. Then
+ask "Should I add this to CHANGELOG.md?" — see Changelog below.
 
 
 ## What is here
@@ -152,10 +153,14 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   writes that stamp on every outcome, failures included, so an unreachable API
   cannot become a spawn per render. A stored count is rendered only while
   `update_local_sha` still equals HEAD, so a pull silences the line instead of
-  repeating a number the user has acted on. There are no tags and no releases —
-  master is the release and the unit is a commit. `ccreport update` asks the
-  same question inline, with no spawn and no interval, and writes its answer
-  through the same keys
+  repeating a number the user has acted on. The updater knows no tags: it
+  measures commits past origin/master, and `ccreport update --pull`
+  fast-forwards a checkout, so for the CLI master is the release and the unit
+  is a commit. The `vX.Y.Z` tags the repo also carries are the server's track —
+  each publishes a GitHub Release and a GHCR image (`docs/releasing.md`) and
+  moves nothing the updater reads. `ccreport update` asks the same question
+  inline, with no spawn and no interval, and writes its answer through the
+  same keys
 - A rate-limit sample is pushed like a record: `push.build_samples` resolves the
   account off `account_events` and sends everything newer than a per-server
   watermark (`cache_db.read_push_samples_at`), which `--full` and a policy
@@ -178,7 +183,8 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
 - What the client and the server agree on over the wire is
   `protocol.PROTOCOL_VERSION`, one integer bumped by hand when the bytes change:
   a new payload section, a renamed or retyped field, a response key a client
-  reads. Not the package version, which is `0.1.0` and has never moved, and not
+  reads. Not the package version, which hatch-vcs reads off the newest `vX.Y.Z`
+  tag and which moves with every release whether or not the bytes did, and not
   a commit sha, which differs on every commit and so can only ever be advisory.
   A refactor that moves no bytes needs no bump, and neither does a schema change
   the payload does not expose — the two `MIGRATION_CHAIN`s are the versions for
@@ -703,6 +709,26 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   structurally — the series is business-day only — and dates newer than 5 days
   are never negative-cached, since that day's rate may simply not be published
   yet
+
+## Releasing
+
+`docs/releasing.md` covers `just release-prep`, the step past which a release
+cannot be undone, the parity rule between `ci.yml` and `publish.yml`, and the
+GHCR image. Read it before running any release command.
+
+## Changelog
+
+Entries go under `[Unreleased]` at the top of `CHANGELOG.md` and never under a
+released heading. `.github/workflows/publish.yml` reads the lines under the
+matching `## X.Y.Z` heading, stopping at the next `## `, and that text is the
+GitHub Release body — an entry filed under a shipped version is published
+against work that already went out.
+
+A released section is `## X.Y.Z (YYYY-MM-DD)`, stamped in by
+`scripts/release-prep`. Inside it the subsections are `### Added`,
+`### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, `### Security` and
+`### Development` (tooling, CI, dev workflow). They stay at `### `, because a
+`## ` inside a released section ends the release body there.
 
 ## Formatting
 
