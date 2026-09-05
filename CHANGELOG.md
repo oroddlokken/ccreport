@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.1.2 (2026-09-05)
+
 ### Added
 
 - **A wheel install reaches the status line and the quota guard.** `ccreport-statusline` and `ccreport-quota-guard` join `ccreport` and `ccu` on `PATH`, and the four wrappers Claude Code's settings.json points at ship inside the package at `ccreport/scripts/`, off `PATH` because a hook takes a path rather than a command. `ccreport scripts` prints where they landed. Both wrappers resolve the checkout layout and the installed one, and in an install they run the interpreter that owns the package rather than the first `python3` on `PATH`, which can be older than the package needs.
