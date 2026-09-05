@@ -59,6 +59,20 @@ def _snapshot(
     )
 
 
+_WRAPPER = Path(__file__).resolve().parent.parent / "bin" / "quota-guard.sh"
+
+
+def _path_python(tmp_path: Path) -> tuple[Path, Path]:
+    """A python3 on PATH that records having run, and the directory to prepend."""
+    path_dir = tmp_path / "fakebin"
+    path_dir.mkdir(exist_ok=True)
+    marker = tmp_path / "python-ran"
+    fake = path_dir / "python3"
+    fake.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    fake.chmod(0o755)
+    return marker, path_dir
+
+
 def _window(percent: float, resets_in: float = 3600.0) -> dict:
     return {"percent": percent, "resets_at": NOW + resets_in}
 
@@ -105,6 +119,53 @@ class TestArming:
             env={**env, qg.STOP_ENV: "95"}, check=True,
         )
         assert marker.exists()
+
+
+    def test_the_probe_skips_an_interpreter_above_no_package(self, tmp_path):
+        """A prefix five levels up is / on a shallow path, and its python3 owns nothing."""
+        stray = tmp_path / "stray"
+        (stray / "bin").mkdir(parents=True)
+        stray_marker = tmp_path / "stray-ran"
+        (stray / "bin" / "python3").write_text(
+            f"#!/bin/sh\ntouch {stray_marker}\nexit 1\n", encoding="utf-8",
+        )
+        (stray / "bin" / "python3").chmod(0o755)
+        marker, path_dir = _path_python(tmp_path)
+        # Five levels below the stray prefix: what the wrapper's four ..-steps
+        # reach from the directory holding bin/.
+        script = stray / "a" / "b" / "c" / "d" / "bin" / "quota-guard.sh"
+        script.parent.mkdir(parents=True)
+        shutil.copy(_WRAPPER, script)
+
+        subprocess.run(
+            ["bash", str(script)], input="{}", capture_output=True, text=True,
+            env={"PATH": f"{path_dir}:/bin:/usr/bin", "TMPDIR": str(tmp_path), qg.STOP_ENV: "95"},
+            check=True,
+        )
+        assert not stray_marker.exists()
+        assert marker.exists()
+
+    def test_a_wheel_layout_runs_the_interpreter_beside_the_package(self, tmp_path):
+        """Under site-packages the prefix owns the package, so its python3 wins over PATH."""
+        prefix = tmp_path / "prefix"
+        (prefix / "bin").mkdir(parents=True)
+        prefix_marker = tmp_path / "prefix-ran"
+        (prefix / "bin" / "python3").write_text(
+            f"#!/bin/sh\ntouch {prefix_marker}\n", encoding="utf-8",
+        )
+        (prefix / "bin" / "python3").chmod(0o755)
+        marker, path_dir = _path_python(tmp_path)
+        scripts = prefix / "lib" / "python3.13" / "site-packages" / "ccreport" / "scripts"
+        scripts.mkdir(parents=True)
+        shutil.copy(_WRAPPER, scripts / "quota-guard.sh")
+
+        subprocess.run(
+            ["bash", str(scripts / "quota-guard.sh")], input="{}", capture_output=True, text=True,
+            env={"PATH": f"{path_dir}:/bin:/usr/bin", "TMPDIR": str(tmp_path), qg.STOP_ENV: "95"},
+            check=True,
+        )
+        assert prefix_marker.exists()
+        assert not marker.exists()
 
 
 class TestVerdict:

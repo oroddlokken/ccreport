@@ -23,14 +23,19 @@ if [[ ! -d "$SRC/ccreport" ]]; then
   # The interpreter that owns the package, at <prefix>/bin — three levels above
   # site-packages in a venv, and the walk covers lib64 and the flat layouts.
   PY=""
-  probe="$SRC"
-  for _ in 1 2 3 4; do
-    probe="$probe/.."
-    if [[ -x "$probe/bin/python3" ]]; then
-      PY="$probe/bin/python3"
-      break
-    fi
-  done
+  # The walk starts only from a directory that holds the package, because five
+  # levels above a shallow path is /, whose python3 cannot import ccreport and
+  # exits 1 into a hook that reads 1 as a block.
+  if [[ -d "$SRC/ccreport" ]]; then
+    probe="$SRC"
+    for _ in 1 2 3 4; do
+      probe="$probe/.."
+      if [[ -x "$probe/bin/python3" ]]; then
+        PY="$probe/bin/python3"
+        break
+      fi
+    done
+  fi
 fi
 
 # Imported rather than run as a script, for the reason statusline-command_x.sh
