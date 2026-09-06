@@ -1773,6 +1773,14 @@ def cmd_push(args) -> None:
             f"{len(result.skipped)} unchanged, {len(result.rejected)} rejected "
             f"({result.records} records{samples}{pulled}{declared})",
         )
+        if result.unattributed:
+            # Said out loud, because the alternative it replaces was silent: a
+            # record no account_events entry covers used to travel under a
+            # placeholder account and turn up on the server as a third person.
+            console.print(
+                f"  {result.unattributed} records older than this machine's account log "
+                f"were left here. Run [bold]ccreport adopt[/bold] to claim them.",
+            )
         for path, detail in result.rejected:
             failed = True
             console.print(f"  [red]rejected[/red] {path or '(the request)'}: {detail}")

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **A push no longer sends records under a placeholder account.** A cache whose `account_events` table does not reach back to a record stamped it `"unknown"`, and the server grouped those rows as an account of their own — one cold-cache run put 80,078 records and $4,256 of real spend under a name no alias reaches. `push._attribution` is now the one place the record, sample and Extra-reading builders resolve an account, and a row it cannot attribute stays on the machine. A file whose every record is uncovered is left out of the batch rather than offered empty, because the server replaces what it holds per (machine, path); a file the log covers in part sends that part. `ccreport server push` reports the count it left and names `ccreport adopt`.
+
 ## 0.1.3 (2026-09-06)
 
 ### Development

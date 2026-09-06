@@ -369,7 +369,14 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   project name through this machine's own override rules. The server holds no
   merge rules and treats the pushed name as final. Each record also carries the
   machine's UTC offset at that instant, which is what makes `server_records.day`
-  the machine's calendar day rather than the server's
+  the machine's calendar day rather than the server's. A row no event covers is
+  left here rather than sent under a placeholder, which grouped on the server as
+  an account of its own holding real spend — `_attribution` is where all three
+  builders answer that, and `ccreport adopt` is what claims the history. A file
+  whose every record is uncovered is not offered at all, since the server
+  replaces what it holds per (machine, path) and an emptied file erases rows it
+  may be the only copy of; a file the log covers in part sends that part and
+  stamps its watermark, so the rest needs a `--full` push once the claim exists
 - `~/.config/ccreport/push.toml` is the machine's whole push policy — server,
   token, `restricted`, `allow`, `exclude`, `salt`, `networks`,
   `interval_minutes` — written by

@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from dataclasses import replace as _replace_fields
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 from ccreport import protocol, tier_timeline
 
@@ -129,6 +130,14 @@ class PushResult:
     sent nothing but samples has not sent no data."""
     extra: int = 0
     """Extra-usage readings stored, counted apart for the same reason."""
+    unattributed: int = 0
+    """Records this run left out because no account_events entry covers them.
+
+    Reported rather than counted as sent: the spend is real and stays on this
+    machine, and `ccreport adopt` is what claims it. A file whose records are
+    all uncovered is not offered at all, so nothing here has moved a watermark
+    — but a file that mixed the two has, and its uncovered records need a
+    `--full` push once the claim exists."""
     pulled: int = 0
     """Contributing machines the reply named. Zero on a plain push, which asks
     for no remainder, and on a machine signed in to no account at all."""
@@ -693,15 +702,36 @@ def _records_for(conn: sqlite3.Connection, path: str) -> list[dict]:
     return [dict(zip(_CCR_COLS, row, strict=True)) for row in rows]
 
 
-def _payload_record(rec: dict, timeline, override) -> dict:
-    """One cached record as the object the ingest endpoint accepts.
+def _attribution(timeline, when: datetime) -> dict | None:
+    """The account fields for a row at *when*, or None where no event covers it.
+
+    None leaves the row out of the payload. A moment before this machine's
+    first captured event has no account: the change log is the only thing that
+    can name one, and a placeholder lands on the server as an account of its
+    own, holding real spend under a name no alias can reconcile with the
+    account it belongs to. `ccreport adopt` claims pre-capture history, and
+    until it runs those rows stay here.
+    """
+    uuid = timeline.uuid_at(when)
+    if uuid is None:
+        return None
+    return {"account_uuid": uuid, "account_label": timeline.label_at(when)}
+
+
+def _payload_record(rec: dict, timeline, override) -> dict | None:
+    """One cached record as the object the ingest endpoint accepts, or None.
 
     Two things are resolved here rather than on the server. The account, from
     the change log, because a session log names none and the server has no copy
     of this machine's. The project name, through this machine's own override
     rules, because the server holds none and treats what arrives as final.
+
+    None where the change log covers neither — see _attribution.
     """
     when = datetime.fromtimestamp(rec["ts"], tz=UTC)
+    account = _attribution(timeline, when)
+    if account is None:
+        return None
     local = when.astimezone()
     offset = local.utcoffset()
     project = rec["project"]
@@ -724,26 +754,43 @@ def _payload_record(rec: dict, timeline, override) -> dict:
         "output_tokens": rec["output_tokens"],
         "cache_create": rec["cache_create"],
         "cache_read": rec["cache_read"],
-        "account_uuid": timeline.uuid_at(when) or "unknown",
-        "account_label": timeline.label_at(when),
+        **account,
     }
+
+
+class Built(NamedTuple):
+    """The file objects a batch carries, and what they left behind."""
+
+    files: list[dict]
+    unattributed: int
 
 
 def build_files(
     conn: sqlite3.Connection, pending: list[tuple[str, int, int]], timeline, override,
-) -> list[dict]:
-    """The file objects a batch carries, whole files only."""
+) -> Built:
+    """The file objects a batch carries, whole files only, and the records dropped.
+
+    A file whose every record is unattributed is left out of the batch rather
+    than offered empty. The server replaces what it holds for a (machine, path)
+    pair, so an emptied file erases rows it may be the only copy of, and a file
+    that is never offered keeps its watermark and will be offered again.
+    """
     files = []
+    unattributed = 0
     for path, mtime_ns, size in pending:
+        cached = _records_for(conn, path)
+        records = [_payload_record(rec, timeline, override) for rec in cached]
+        kept = [rec for rec in records if rec is not None]
+        unattributed += len(records) - len(kept)
+        if not kept:
+            continue
         files.append({
             "path": path,
             "mtime_ns": mtime_ns,
             "size": size,
-            "records": [
-                _payload_record(rec, timeline, override) for rec in _records_for(conn, path)
-            ],
+            "records": kept,
         })
-    return files
+    return Built(files, unattributed)
 
 
 SAMPLES_PER_BATCH = 2000
@@ -775,11 +822,10 @@ def build_samples(conn: sqlite3.Connection, timeline, since: float) -> list[dict
     for row in rows:
         sample = dict(zip(_RL_SNAPSHOT_COLS, row, strict=True))
         when = datetime.fromtimestamp(sample["ts"], tz=UTC)
-        samples.append({
-            **sample,
-            "account_uuid": timeline.uuid_at(when) or "unknown",
-            "account_label": timeline.label_at(when),
-        })
+        account = _attribution(timeline, when)
+        if account is None:
+            continue
+        samples.append({**sample, **account})
     return samples
 
 
@@ -802,12 +848,10 @@ def build_extra(conn: sqlite3.Connection, timeline, since: float) -> list[dict]:
     readings = []
     for ts, spent in rows:
         when = datetime.fromtimestamp(ts, tz=UTC)
-        readings.append({
-            "ts": ts,
-            "spent": spent,
-            "account_uuid": timeline.uuid_at(when) or "unknown",
-            "account_label": timeline.label_at(when),
-        })
+        account = _attribution(timeline, when)
+        if account is None:
+            continue
+        readings.append({"ts": ts, "spent": spent, **account})
     return readings
 
 
@@ -1137,7 +1181,7 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
         samples_at = cache_db.read_push_samples_at(server.url)
         extra_at = cache_db.read_push_extra_at(server.url)
         pending = changed_files(conn, watermark)
-        files = build_files(conn, pending, timeline, override)
+        files, unattributed = build_files(conn, pending, timeline, override)
         samples = build_samples(conn, timeline, samples_at)
         extra = build_extra(conn, timeline, extra_at)
     finally:
@@ -1147,7 +1191,7 @@ def push_to(server: ServerConfig, *, full: bool = False, db_path: Path | None = 
         if replace:
             item["replace"] = True
 
-    result = PushResult(server=server.url)
+    result = PushResult(server=server.url, unattributed=unattributed)
     sent_samples_at = samples_at
     sent_extra_at = extra_at
     batches = pack_batches(files, server.label, server.max_body) + pack_samples(

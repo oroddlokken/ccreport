@@ -36,6 +36,19 @@ def _write_config(tmp_path, url="https://ccr.example.net", token="tok", **extra)
     return path
 
 
+def _captured(ts: float = TS - 86400, uuid: str = "u-acct") -> None:
+    """The account capture every ordinary machine has by the time it pushes.
+
+    A push sends only what the change log covers, so a test about the transport
+    needs a log that covers its records. The tests about attribution write
+    their own.
+    """
+    cache_db.record_account_event(
+        {"accountUuid": uuid, "emailAddress": "me@example.com", "organizationName": "Org"},
+        now=ts,
+    )
+
+
 def _cached_file(path="/p/a.jsonl", mtime_ns=1, size=100, records=None) -> None:
     """Put one file's records in the local cache, the way ccreport would."""
     records = records or [{
@@ -197,26 +210,38 @@ class TestCacheRefresh:
 
 class TestPayload:
     def _built(self, monkeypatch, override=None, events=()):
+        """One record's payload, under a change log that covers it by default.
+
+        Every field but the account is resolved the same whoever was signed in,
+        so the tests about those fields say nothing about the log and get one
+        that covers the record.
+        """
         from ccreport.accounts import AccountTimeline
 
+        events = events or [{
+            "ts": TS - 86400,
+            "identity": {"accountUuid": "u-acct", "emailAddress": "me@example.com",
+                         "organizationName": "Org"},
+        }]
         for event in events:
             cache_db.record_account_event(event["identity"], now=event["ts"])
         timeline = AccountTimeline(cache_db.load_account_events())
         conn = push._read_only(cache_db.DB_PATH)
         try:
-            files = push.build_files(conn, [("/p/a.jsonl", 1, 100)], timeline, override)
+            built = push.build_files(conn, [("/p/a.jsonl", 1, 100)], timeline, override)
         finally:
             conn.close()
-        return files[0]["records"][0]
+        return built.files[0]["records"][0]
 
     def test_a_file_travels_whole(self, tmp_path):
         _cached_file()
         conn = push._read_only(cache_db.DB_PATH)
-        files = push.build_files(conn, [("/p/a.jsonl", 1, 100)], _NoAccounts(), None)
+        built = push.build_files(conn, [("/p/a.jsonl", 1, 100)], _Attributed(), None)
         conn.close()
-        assert files[0]["path"] == "/p/a.jsonl"
-        assert files[0]["mtime_ns"] == 1
-        assert len(files[0]["records"]) == 1
+        assert built.files[0]["path"] == "/p/a.jsonl"
+        assert built.files[0]["mtime_ns"] == 1
+        assert len(built.files[0]["records"]) == 1
+        assert built.unattributed == 0
 
     def test_the_account_is_stamped_from_the_change_log(self, tmp_path):
         _cached_file()
@@ -228,15 +253,64 @@ class TestPayload:
         assert rec["account_uuid"] == "u-work"
         assert rec["account_label"] == "me@work.example"
 
-    def test_history_older_than_the_log_is_sent_as_unknown(self, tmp_path):
-        """The log starts when capture was switched on; before it, nothing knows."""
+    def test_history_older_than_the_log_is_left_here(self, tmp_path):
+        """The log starts when capture was switched on; before it, nothing knows.
+
+        Sent under a placeholder it became an account of its own on the server,
+        holding real spend under a name no alias reaches. `ccreport adopt` is
+        the way to claim it.
+        """
         _cached_file()
-        rec = self._built(None, events=[{
-            "ts": TS + 86400,
-            "identity": {"accountUuid": "u-work", "emailAddress": "me@work.example",
-                         "organizationName": "Org"},
-        }])
-        assert rec["account_uuid"] == "unknown"
+        cache_db.record_account_event(
+            {"accountUuid": "u-work", "emailAddress": "me@work.example",
+             "organizationName": "Org"},
+            now=TS + 86400,
+        )
+        from ccreport.accounts import AccountTimeline
+
+        timeline = AccountTimeline(cache_db.load_account_events())
+        conn = push._read_only(cache_db.DB_PATH)
+        built = push.build_files(conn, [("/p/a.jsonl", 1, 100)], timeline, None)
+        conn.close()
+        assert built.files == []
+        assert built.unattributed == 1
+
+    def test_a_file_the_log_covers_in_part_sends_that_part(self, tmp_path):
+        """The covered records are real spend and go; the rest wait for a claim."""
+        _cached_file(records=[
+            {"mid": "m1", "model": "claude-haiku-4-5", "ts": TS, "sid": "s",
+             "project": "p", "cwd": None, "repo": None, "dk": "d1", "cost": None,
+             "t": [1, 2, 3, 4]},
+            {"mid": "m2", "model": "claude-haiku-4-5", "ts": TS + 172800, "sid": "s",
+             "project": "p", "cwd": None, "repo": None, "dk": "d2", "cost": None,
+             "t": [1, 2, 3, 4]},
+        ])
+        cache_db.record_account_event(
+            {"accountUuid": "u-work", "emailAddress": "me@work.example",
+             "organizationName": "Org"},
+            now=TS + 86400,
+        )
+        from ccreport.accounts import AccountTimeline
+
+        timeline = AccountTimeline(cache_db.load_account_events())
+        conn = push._read_only(cache_db.DB_PATH)
+        built = push.build_files(conn, [("/p/a.jsonl", 1, 100)], timeline, None)
+        conn.close()
+        assert built.unattributed == 1
+        assert [rec["mid"] for rec in built.files[0]["records"]] == ["m2"]
+        assert built.files[0]["records"][0]["account_uuid"] == "u-work"
+
+    def test_no_payload_field_carries_a_placeholder_account(self, tmp_path):
+        """The three builders answer one rule, so none can drift back to one."""
+        _cached_file()
+        conn = push._read_only(cache_db.DB_PATH)
+        try:
+            built = push.build_files(conn, [("/p/a.jsonl", 1, 100)], _NoAccounts(), None)
+            assert built.files == []
+            assert push.build_samples(conn, _NoAccounts(), 0) == []
+            assert push.build_extra(conn, _NoAccounts(), 0) == []
+        finally:
+            conn.close()
 
     def test_the_project_is_resolved_through_this_machines_rules(self, tmp_path):
         """The server holds no merge rules and treats what arrives as final."""
@@ -265,11 +339,45 @@ class TestPayload:
         """The server takes that from the token."""
         _cached_file()
         conn = push._read_only(cache_db.DB_PATH)
-        files = push.build_files(conn, [("/p/a.jsonl", 1, 100)], _NoAccounts(), None)
+        built = push.build_files(conn, [("/p/a.jsonl", 1, 100)], _Attributed(), None)
         conn.close()
-        batch = push.pack_batches(files, "Laptop", push.DEFAULT_MAX_BODY)[0]
+        batch = push.pack_batches(built.files, "Laptop", push.DEFAULT_MAX_BODY)[0]
         assert "machine_id" not in batch
         assert batch["label"] == "Laptop"
+
+
+class TestPushOutput:
+    """What `ccreport server push` prints for records it could not attribute."""
+
+    def _run(self, monkeypatch, result):
+        from types import SimpleNamespace
+
+        from ccreport import ccreport as cli
+        from ccreport import push as push_mod
+
+        monkeypatch.setattr(push_mod, "configured", lambda config=None: True)
+        monkeypatch.setattr(push_mod, "run_once", lambda **kwargs: [result])
+        cli.cmd_push(SimpleNamespace(server=None, config=None, full=False))
+
+    def test_records_left_here_are_named_with_the_command_that_claims_them(
+        self, monkeypatch, capsys,
+    ):
+        self._run(monkeypatch, push.PushResult(
+            server="https://ccr.example.net", accepted=["/p/a.jsonl"], records=4,
+            unattributed=7,
+        ))
+        out = capsys.readouterr().out
+        assert "7 records older than this machine's account log" in out
+        assert "ccreport adopt" in out
+
+    def test_a_fully_attributed_run_says_nothing_about_it(self, monkeypatch, capsys):
+        """A zero on every push would read as a broken feature."""
+        self._run(monkeypatch, push.PushResult(
+            server="https://ccr.example.net", accepted=["/p/a.jsonl"], records=4,
+        ))
+        out = capsys.readouterr().out
+        assert "adopt" not in out
+        assert "1 sent" in out
 
 
 class _NoAccounts:
@@ -280,6 +388,16 @@ class _NoAccounts:
 
     def label_at(self, when):
         return "unknown"
+
+
+class _Attributed:
+    """A timeline that covers every moment, for tests about the rest of a payload."""
+
+    def uuid_at(self, when):
+        return "u-acct"
+
+    def label_at(self, when):
+        return "me@example.com"
 
 
 class TestBatching:
@@ -447,6 +565,7 @@ class TestAgainstAServer:
             return resp.json()
 
         monkeypatch.setattr(push, "post_batch", post)
+        _captured()
         return app, client, config
 
     def test_a_first_push_sends_everything_and_records_it(self, wired):

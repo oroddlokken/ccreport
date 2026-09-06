@@ -10,7 +10,7 @@ import pytest
 import server_fixture as sf
 from fastapi.testclient import TestClient
 from rich.console import Console
-from test_push import TS, _cached_file, _write_config
+from test_push import TS, _cached_file, _captured, _write_config
 
 from ccreport import cache_db, protocol, push
 from ccreport import ccreport as ccr
@@ -23,6 +23,16 @@ def isolate_server_globals(monkeypatch):
 
     monkeypatch.setattr(exchange, "_store", exchange._store)
     monkeypatch.setattr(exchange, "load_rates", lambda dates, prefetch=None: {})
+
+
+@pytest.fixture(autouse=True)
+def captured_account():
+    """Every test here is about redaction, which happens after attribution.
+
+    A push sends only what the change log covers, so without a capture these
+    would send nothing and say nothing about what redaction did to it.
+    """
+    _captured()
 
 
 def _server(**over) -> push.ServerConfig:
