@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Development
+
+- **No test reaches the live Norges Bank API, and none reads another test's rate store.** `server.factory.create_app` points `exchange._store` at the server database it opened and nothing put it back, so a test that built an app left every later test on the same xdist worker saving rates to the isolated cache and loading them from a closed database in a previous test's `tmp_path`. `ccreport.main` calls `exchange.start_prefetch()` before the corpus load, and six CLI tests put a Norges Bank request on a daemon thread that outlived them. `tests/conftest.py` now restores the store per test, returns `None` from `start_prefetch` unless a test asks for `live_prefetch`, and takes `urlopen` away for the whole session rather than per test — a daemon thread runs after a function-scoped patch is undone. The block raises a `RuntimeError` subclass, since `exchange._fetch_api` catches `OSError` and reports it as an API with nothing to say.
+
 ## 0.1.2 (2026-09-05)
 
 ### Added

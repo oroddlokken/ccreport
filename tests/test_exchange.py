@@ -298,14 +298,14 @@ def _cache_recent_days(n: int) -> None:
     )
 
 
-def test_prefetch_is_skipped_when_the_recent_tail_is_cached(spy_api):
+def test_prefetch_is_skipped_when_the_recent_tail_is_cached(spy_api, live_prefetch):
     calls = spy_api({})
     _cache_recent_days(exchange._PREFETCH_LOOKBACK_DAYS + exchange._MAX_WALKBACK_DAYS)
     assert exchange.start_prefetch() is None
     assert calls == []
 
 
-def test_prefetch_spares_load_rates_a_second_call(spy_api):
+def test_prefetch_spares_load_rates_a_second_call(spy_api, live_prefetch):
     today = today_oslo()
     calls = spy_api(
         {(today - timedelta(days=i)).isoformat(): 10.0 for i in range(1, 40)}
@@ -318,7 +318,7 @@ def test_prefetch_spares_load_rates_a_second_call(spy_api):
     assert rates[(today - timedelta(days=1)).isoformat()] == 10.0
 
 
-def test_prefetch_that_covers_nothing_leaves_load_rates_to_fetch(spy_api):
+def test_prefetch_that_covers_nothing_leaves_load_rates_to_fetch(spy_api, live_prefetch):
     """An old corpus is outside the speculative window; it still gets its rates."""
     today = today_oslo()
     calls = spy_api(

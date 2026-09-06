@@ -20,9 +20,10 @@ TODAY = NOW.strftime("%Y-%m-%d")
 
 @pytest.fixture(autouse=True)
 def isolate_server_globals(monkeypatch):
+    """Price these pages in USD alone; conftest's isolate_rate_store puts the
+    store back."""
     from ccreport import exchange
 
-    monkeypatch.setattr(exchange, "_store", exchange._store)
     monkeypatch.setattr(exchange, "load_rates", lambda dates, prefetch=None: {})
 
 

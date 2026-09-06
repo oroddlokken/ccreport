@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import pytest
 
+from ccreport import exchange as _exchange
+
+_real_start_prefetch = _exchange.start_prefetch
+"""Captured at import, before no_speculative_prefetch swaps the module attribute."""
+
 CONFIGURED_BY_ENV = (
     "CCQUOTA_STOP",
     "CCQUOTA_STOP_SESSION",
@@ -81,6 +86,86 @@ def isolate_cache_db(tmp_path, monkeypatch, isolate_environment):
     monkeypatch.setattr(cache_db, "_conn", None)
     yield
     cache_db.close_connection()
+
+
+class BlockedNetworkError(RuntimeError):
+    """Raised in place of an HTTP request a test did not stub."""
+
+
+@pytest.fixture(autouse=True, scope="session")
+def block_network():
+    """Take urlopen away from the whole session, not just from a test.
+
+    exchange.RateFetch runs its request on a daemon thread, so a prefetch
+    started by one test can call urlopen after that test's monkeypatch has been
+    undone — and land its rows in whichever database the next test installed.
+    A session-scoped swap is what a function-scoped one cannot be: still in
+    place between tests. Every per-test patch layers on top and is restored to
+    this, not to the real function.
+
+    BlockedNetwork rather than OSError, which exchange._fetch_api catches and
+    reports as an empty range: a test that reaches out has to fail, not read as
+    an API with nothing to say.
+    """
+    import urllib.request
+
+    from ccreport import usage_api
+
+    def blocked(*args, **kwargs):
+        raise BlockedNetworkError("the suite does not reach the network; stub this call")
+
+    original = urllib.request.urlopen
+    original_usage = usage_api.urlopen
+    # usage_api binds the name at import, so the module attribute is a second
+    # door into the same function and closing one leaves the other open.
+    urllib.request.urlopen = blocked
+    usage_api.urlopen = blocked
+    yield
+    urllib.request.urlopen = original
+    usage_api.urlopen = original_usage
+
+
+@pytest.fixture(autouse=True)
+def no_speculative_prefetch(monkeypatch):
+    """Stop the CLI's rate prefetch before it opens a socket.
+
+    ccreport.main calls exchange.start_prefetch() before the corpus load, so
+    every test that drives the CLI puts a Norges Bank request on a daemon
+    thread that outlives the test — six of them did. block_network refuses the
+    request, and this keeps the thread from being started at all. A test that
+    is about the prefetch asks for live_prefetch.
+    """
+    from ccreport import exchange
+
+    monkeypatch.setattr(exchange, "start_prefetch", lambda: None)
+
+
+@pytest.fixture
+def live_prefetch(monkeypatch):
+    """Give start_prefetch back to a test that is about the prefetch itself.
+
+    Such a test stubs exchange._fetch_api, so the thread this starts reaches no
+    further than the stub.
+    """
+    from ccreport import exchange
+
+    monkeypatch.setattr(exchange, "start_prefetch", _real_start_prefetch)
+
+
+@pytest.fixture(autouse=True)
+def isolate_rate_store(monkeypatch):
+    """Put exchange's rate store back where the next test expects it.
+
+    server.factory.create_app points exchange._store at the server database it
+    just opened, and nothing puts it back: a test that builds an app leaves
+    every later test on the same xdist worker reading rates out of that app's
+    file, which by then is a closed database in a previous test's tmp_path.
+    isolate_cache_db redirects cache_db.DB_PATH and cannot see this, so the
+    write went to the isolated cache and the read went elsewhere.
+    """
+    from ccreport import exchange
+
+    monkeypatch.setattr(exchange, "_store", exchange._store)
 
 
 @pytest.fixture(autouse=True)
