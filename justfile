@@ -20,7 +20,7 @@ lint:
 
 # lint using pyright
 # latest unless the caller pins one, which ci.yml does to the version uv.lock
-# resolves: a pyright release upstream must not turn master red on its own
+# resolves: a pyright release upstream must not turn main red on its own
 lint-pyright:
     PYRIGHT_PYTHON_FORCE_VERSION=${PYRIGHT_PYTHON_FORCE_VERSION:-latest} uv run pyright src tests
 
@@ -112,4 +112,4 @@ next:
 release-prep *args:
     ./scripts/release-prep {{args}}
     git fetch --all --tags --prune
-    git pull origin master
+    git pull origin main

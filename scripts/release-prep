@@ -105,7 +105,7 @@ if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
     git checkout --quiet "${BRANCH}"
 elif git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null 2>&1; then
     # The branch is on origin but not in this clone — a previous RC cut
-    # elsewhere, or a local branch since deleted. Branching off master instead
+    # elsewhere, or a local branch since deleted. Branching off main instead
     # would fork a sibling of the real tip that no push can fast-forward.
     info "Fetching existing ${BRANCH} from origin"
     git fetch --quiet origin "${BRANCH}:${BRANCH}"
@@ -116,13 +116,13 @@ else
 fi
 
 if [[ "$REUSING_BRANCH" == true ]]; then
-    # If master has new commits the release branch doesn't include, hard-reset
-    # the branch to master so any fixes that landed since the previous RC are
+    # If main has new commits the release branch doesn't include, hard-reset
+    # the branch to main so any fixes that landed since the previous RC are
     # picked up. The changelog stamp gets re-created below.
-    NEW_ON_MASTER=$(git rev-list --count "HEAD..master")
-    if [[ "$NEW_ON_MASTER" -gt 0 ]]; then
-        info "Syncing ${BRANCH} to master (${NEW_ON_MASTER} new commit(s) since previous RC)"
-        git reset --hard --quiet master
+    NEW_ON_MAIN=$(git rev-list --count "HEAD..main")
+    if [[ "$NEW_ON_MAIN" -gt 0 ]]; then
+        info "Syncing ${BRANCH} to main (${NEW_ON_MAIN} new commit(s) since previous RC)"
+        git reset --hard --quiet main
         NEEDS_FORCE_PUSH=true
     fi
 fi
@@ -174,7 +174,7 @@ Merging this PR will:
 4. Update the Homebrew formula
 EOF
 )" \
-        --base master)
+        --base main)
     ok "PR created: ${PR_URL}"
 else
     PR_URL=$(gh pr view "${BRANCH}" --json url -q .url)

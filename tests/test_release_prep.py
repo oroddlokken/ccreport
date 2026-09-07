@@ -127,18 +127,18 @@ def _run_script(
 
 @pytest.fixture
 def remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
-    """Return a bare remote plus a clone on ``master`` holding a CHANGELOG."""
+    """Return a bare remote plus a clone on ``main`` holding a CHANGELOG."""
     remote = tmp_path / "remote.git"
-    git(tmp_path, "init", "--bare", "-b", "master", "-q", str(remote))
+    git(tmp_path, "init", "--bare", "-b", "main", "-q", str(remote))
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    git(repo, "init", "-b", "master", "-q")
+    git(repo, "init", "-b", "main", "-q")
     git(repo, "remote", "add", "origin", str(remote))
     (repo / "CHANGELOG.md").write_text(CHANGELOG, encoding="utf-8")
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "Initial")
-    git(repo, "push", "-qu", "origin", "master")
+    git(repo, "push", "-qu", "origin", "main")
     return remote, repo
 
 
@@ -176,7 +176,7 @@ class TestRemoteOnlyBranch:
     ) -> None:
         """The rerun builds on the remote tip and pushes without a conflict.
 
-        Probing only ``refs/heads/<branch>`` would branch off master and
+        Probing only ``refs/heads/<branch>`` would branch off main and
         produce a sibling of the remote tip that no push can fast-forward.
         """
         remote, repo = remote_and_clone
@@ -193,15 +193,15 @@ class TestRemoteOnlyBranch:
         git(repo, "commit", "-qam", "Prepare changelog for v9.9.9")
         git(repo, "tag", "-a", "v9.9.9-rc.1", "-m", "rc1")
         git(repo, "push", "-q", "origin", "release/v9.9.9", "--tags")
-        git(repo, "checkout", "-q", "master")
+        git(repo, "checkout", "-q", "main")
         git(repo, "branch", "-qD", "release/v9.9.9")
         git(repo, "tag", "-d", "v9.9.9-rc.1")
 
-        # A fix lands on master after that RC, which is why another is cut.
+        # A fix lands on main after that RC, which is why another is cut.
         (repo / "fix.txt").write_text("fix\n", encoding="utf-8")
         git(repo, "add", "-A")
         git(repo, "commit", "-qm", "Fix something")
-        git(repo, "push", "-q", "origin", "master")
+        git(repo, "push", "-q", "origin", "main")
 
         result = _run_script(repo, gh_stub, ["-W", "--skip-checks", "9.9.9"])
 
@@ -209,7 +209,7 @@ class TestRemoteOnlyBranch:
 
         remote_tip = git(remote, "rev-parse", "release/v9.9.9").strip()
         assert git(repo, "rev-parse", "release/v9.9.9").strip() == remote_tip
-        # The branch carries the fix, so it was re-cut from master rather than
+        # The branch carries the fix, so it was re-cut from main rather than
         # left at the previous RC.
         assert "fix.txt" in git(repo, "ls-tree", "--name-only", remote_tip)
         assert git(remote, "rev-parse", "v9.9.9-rc.2^{}").strip() == remote_tip
@@ -225,7 +225,7 @@ class TestRemoteOnlyBranch:
         result = _run_script(repo, gh_stub, ["-W", "--skip-checks", "9.9.7"])
 
         assert result.returncode == 0, result.stdout + result.stderr
-        assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "master"
+        assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
 
 
 class TestRejectedBranchPush:
@@ -246,16 +246,16 @@ class TestRejectedBranchPush:
         git(repo, "add", "-A")
         git(repo, "commit", "-qm", "Their release work")
         git(repo, "push", "-q", "origin", "release/v9.9.8")
-        git(repo, "checkout", "-q", "master")
+        git(repo, "checkout", "-q", "main")
         # Rewind the local branch so it no longer contains the remote tip.
-        git(repo, "branch", "-f", "release/v9.9.8", "master")
+        git(repo, "branch", "-f", "release/v9.9.8", "main")
 
         result = _run_script(repo, gh_stub, ["-W", "--skip-checks", "9.9.8"])
 
         assert result.returncode != 0, result.stdout
         assert git(remote, "tag", "-l", "v9.9.8-rc.1").strip() == ""
         assert git(repo, "tag", "-l", "v9.9.8-rc.1").strip() == ""
-        assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "master"
+        assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
 
 
 class TestDirtyTree:

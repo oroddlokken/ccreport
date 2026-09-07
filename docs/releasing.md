@@ -5,14 +5,14 @@ Releasing is the user's call. Read this before running anything in it.
 ## `just release-prep` is irreversible past the PR merge
 
 `just release-prep <version>` runs `just lint-all` and `just test-all`, stamps `CHANGELOG.md`,
-resets an existing `release/v<version>` branch to `master`, force-pushes it with lease, pushes a
+resets an existing `release/v<version>` branch to `main`, force-pushes it with lease, pushes a
 `vX.Y.Z-rc.N` tag, and opens a pull request.
 
 The branch work happens in this clone rather than in a worktree. The tree has to be clean, and
 the script checks out `release/v<version>` and returns you to the branch you started on.
 
 An existing branch counts whether or not this clone has it. A remote-only branch is fetched,
-because branching off `master` instead forks a sibling commit no push can fast-forward.
+because branching off `main` instead forks a sibling commit no push can fast-forward.
 
 The tag goes out only after the branch push lands, and a rejected push deletes the local tag and
 stops. `tests/test_release_prep.py` drives both paths against a bare local remote.
@@ -31,7 +31,7 @@ branch starts with `release/v`; landing the same commits any other way publishes
 `publish.yml` and `ci.yml` both run `just lint-all`, the test suite and `just check-sdist`, and
 each sets up its own toolchain and pins its own `PYRIGHT_PYTHON_FORCE_VERSION`. A step added to
 one has to be added to the other, or the failure surfaces at release time, when the merge has
-already landed on `master`.
+already landed on `main`.
 
 ## Homebrew formula
 
@@ -78,7 +78,7 @@ uses, and `docker/metadata-action` writes it into the OCI labels with the revisi
 The image's CMD is the one-worker, no-reload form. `docker-compose.yml` overrides it with
 `--reload` for `just docker-up`, and `tests/test_docker_image.py` fails if either side drifts.
 
-A checkout is still the other way in: `git pull` in it tracks `master`, and the wheel and sdist
+A checkout is still the other way in: `git pull` in it tracks `main`, and the wheel and sdist
 ride along on the GitHub Release as assets. Only a Homebrew install is told it is out of date —
 `statusline._render_update` names `brew upgrade` and there is no other upgrade route it can
 name.

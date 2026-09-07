@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # The version uv.lock resolves. `just lint-pyright` tracks latest when
-      # this is unset, so an upstream release cannot turn master red on its
+      # this is unset, so an upstream release cannot turn main red on its
       # own. Bump it when the lock moves pyright.
       PYRIGHT_PYTHON_FORCE_VERSION: "1.1.411"
     steps:
