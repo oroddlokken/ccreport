@@ -6,6 +6,10 @@
 
 - **A push no longer sends records under a placeholder account.** A cache whose `account_events` table does not reach back to a record stamped it `"unknown"`, and the server grouped those rows as an account of their own — one cold-cache run put 80,078 records and $4,256 of real spend under a name no alias reaches. `push._attribution` is now the one place the record, sample and Extra-reading builders resolve an account, and a row it cannot attribute stays on the machine. A file whose every record is uncovered is left out of the batch rather than offered empty, because the server replaces what it holds per (machine, path); a file the log covers in part sends that part. `ccreport server push` reports the count it left and names `ccreport adopt`.
 
+### Changed
+
+- **The Homebrew formula runs on `python@3.14`, the interpreter `dogcat` already uses.** With `python@3.13` and `python@3.14` both installed, each patch release of either left its unbottled dependents outdated, and `brew upgrade` skipped them with a warning. One interpreter means one `brew reinstall` after a bump covers all three tools. `requires-python` stays `>=3.13`.
+
 ## 0.1.3 (2026-09-06)
 
 ### Development
