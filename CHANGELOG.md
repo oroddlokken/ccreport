@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.1.4 (2026-09-22)
+
 ### Added
 
 - **Claude Opus 5.5 has its own price: $4 input, $20 output, $5 cache write and $0.20 cache read per MTok.** Until now `claude-opus-5-5` substring-matched the `claude-opus-5` key and was charged at Opus 5's $5/$25. Adding the key alone would have reversed the error, because the lookup walks periods newest-first and `claude-opus-5` is a substring of the new key. It now takes an exact key from any period before it tries a substring, so Opus 5 keeps its own price. The status line's per-file cost cache re-scans once. The server prices at ingest, so after it runs this release, a `ccreport server push --full` reprices Opus 5.5 rows it already holds.
