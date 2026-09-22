@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Claude Opus 5.5 has its own price: $4 input, $20 output, $5 cache write and $0.20 cache read per MTok.** Until now `claude-opus-5-5` substring-matched the `claude-opus-5` key and was charged at Opus 5's $5/$25. Adding the key alone would have reversed the error, because the lookup walks periods newest-first and `claude-opus-5` is a substring of the new key. It now takes an exact key from any period before it tries a substring, so Opus 5 keeps its own price. The status line's per-file cost cache re-scans once. The server prices at ingest, so after it runs this release, a `ccreport server push --full` reprices Opus 5.5 rows it already holds.
+
 ### Fixed
 
 - **A push no longer sends records under a placeholder account.** A cache whose `account_events` table does not reach back to a record stamped it `"unknown"`, and the server grouped those rows as an account of their own — one cold-cache run put 80,078 records and $4,256 of real spend under a name no alias reaches. `push._attribution` is now the one place the record, sample and Extra-reading builders resolve an account, and a row it cannot attribute stays on the machine. A file whose every record is uncovered is left out of the batch rather than offered empty, because the server replaces what it holds per (machine, path); a file the log covers in part sends that part. `ccreport server push` reports the count it left and names `ccreport adopt`.

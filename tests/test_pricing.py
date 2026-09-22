@@ -92,6 +92,21 @@ class TestFindPricing:
         prices = find_pricing("claude-opus-4-6")
         assert prices is not None
 
+    def test_opus_5_5_has_its_own_price(self):
+        prices = present(find_pricing("claude-opus-5-5", datetime(2026, 9, 23, tzinfo=UTC)))
+        assert (prices["input"], prices["output"]) == (4e-06, 20e-06)
+        assert (prices["cache_create"], prices["cache_read"]) == (5e-06, 0.2e-06)
+
+    def test_opus_5_keeps_its_price_after_opus_5_5_ships(self):
+        """claude-opus-5 is a substring of claude-opus-5-5; the exact key must win."""
+        prices = present(find_pricing("claude-opus-5", datetime(2026, 9, 23, tzinfo=UTC)))
+        assert (prices["input"], prices["output"]) == (5e-06, 25e-06)
+        assert (prices["cache_create"], prices["cache_read"]) == (6.25e-06, 0.5e-06)
+
+    def test_dated_opus_5_5_id_resolves_to_opus_5_5(self):
+        prices = present(find_pricing("claude-opus-5-5-20260922", datetime(2026, 9, 23, tzinfo=UTC)))
+        assert prices["input"] == 4e-06
+
 
 class TestTieredCost:
     def test_below_threshold_no_tier(self):
@@ -1924,19 +1939,21 @@ class TestPricingPeriodIndex:
 
     @staticmethod
     def _walk(model, ts):
-        """find_pricing as it was before the index: newest matching period wins."""
+        """find_pricing without the index: newest exact key wins, then newest substring."""
         from ccreport.pricing import _FREE_PRICING
 
         resolved = str(MODEL_ALIASES.get(model, model))
         if ":" in resolved:
             return _FREE_PRICING
-        for period in reversed(PRICING_HISTORY):
-            if ts is not None and _parse_effective(period["effective"]) > ts:
-                continue
-            models = period["models"]
-            if resolved in models:
-                return models[resolved]
-            for key, prices in models.items():
+        periods = [
+            p for p in reversed(PRICING_HISTORY)
+            if ts is None or _parse_effective(p["effective"]) <= ts
+        ]
+        for period in periods:
+            if resolved in period["models"]:
+                return period["models"][resolved]
+        for period in periods:
+            for key, prices in period["models"].items():
                 if key in resolved or resolved in key:
                     return prices
         return None

@@ -544,7 +544,7 @@ _ADDED_COLUMNS: list[tuple[str, str, str]] = [
 # or loses a field, and when the rule that priced one changes: a row from before
 # either still matches on mtime and size, so nothing else would ever make it
 # re-scan, and it reads back as a total rather than as an error.
-_COST_ENTRY_SCHEMA = "3"
+_COST_ENTRY_SCHEMA = "4"
 
 
 def _add_column(

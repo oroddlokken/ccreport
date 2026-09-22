@@ -113,7 +113,7 @@ def _tz_from_env(tz_env: str | None) -> ZoneInfo:
         return ZoneInfo("UTC")
 
 # Source: https://github.com/BerriAI/litellm model_prices_and_context_window.json
-LAST_CHECKED = "2026-08-12"
+LAST_CHECKED = "2026-09-22"
 
 PRICING_HISTORY: list[dict[str, Any]] = [
     {
@@ -239,6 +239,19 @@ PRICING_HISTORY: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        # Opus 5.5 first seen 2026-09-22 16:46 UTC, $4/$20 per MTok, cache
+        # write $5 and cache read $0.20. Opus 5 keeps its own period's price:
+        # claude-opus-5 is a substring of this key, which is why
+        # _pricing_in_effect takes an exact key before any substring match.
+        "effective": "2026-09-22",
+        "models": {
+            "claude-opus-5-5": {
+                "input": 4e-06, "output": 20e-06,
+                "cache_create": 5e-06, "cache_read": 0.2e-06,
+            },
+        },
+    },
 ]
 
 MODEL_ALIASES: dict[str, str] = {
@@ -340,15 +353,20 @@ def find_pricing(model: str, ts: datetime | None = None) -> Mapping[str, float] 
 def _pricing_in_effect(resolved: str, periods: int) -> Mapping[str, float] | None:
     """Prices from the newest of the first *periods* pricing periods naming *resolved*.
 
-    Matched exactly, then as a substring either way: the table keys some models
-    by dated ID and some by family, and a record's model ID carries whichever
-    suffix the API sent.
+    Matched exactly in any period, then as a substring either way: the table
+    keys some models by dated ID and some by family, and a record's model ID
+    carries whichever suffix the API sent. The exact pass spans every period
+    first because one model's ID can be a substring of a newer one's —
+    claude-opus-5 of claude-opus-5-5 — and the newer period would win it.
     """
     _, order = _period_index()
-    for i in reversed(order[:periods]):
+    in_effect = order[:periods]
+    for i in reversed(in_effect):
         models = PRICING_HISTORY[i]["models"]
         if resolved in models:
             return models[resolved]
+    for i in reversed(in_effect):
+        models = PRICING_HISTORY[i]["models"]
         for key, prices in models.items():
             if key in resolved or resolved in key:
                 return prices
