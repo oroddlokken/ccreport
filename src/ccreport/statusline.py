@@ -92,9 +92,6 @@ Other environment variables:
                                               with both set and no Sonnet or scoped reading,
                                               the pair governs nothing and is dropped
   CLAUDE_CODE_PACE_DAYS                     — pace window in days (1-7, default 7)
-  CF_BADGE                                  — badge text after the model name, rendered cyan
-                                              (set to CF by the cff wrapper; legacy
-                                              "1" reads as CF)
 """
 
 from __future__ import annotations
@@ -2265,20 +2262,6 @@ def _render_session(
         # name reads the same across models.
         base = re.sub(r"\s*\(\d+\w+\s+context\)", "", model)
         parts.append(banner or f"{SUBDUED}{base}{RST}")
-
-    # Orchestrator sessions (claudem-shorthand exports CF_BADGE=CF for cff). Cyan
-    # — no model banner uses it, and the 1;97 run lets _BADGE_RE stash it whole.
-    # Glued to the model part so the two badges sit flush.
-    cf_badge = os.environ.get("CF_BADGE", "")
-    if cf_badge:
-        # The wrapper exported a bare 1 before the label carried the name;
-        # sessions started under it keep that value until they are restarted.
-        label = "CF" if cf_badge == "1" else cf_badge
-        badge = f"\033[1;97;46m {label} \033[0m"
-        if parts:
-            parts[-1] += badge
-        else:
-            parts.append(badge)
 
     # Reasoning config sits with the model it configures. The banner already
     # carries the effort, so only the plain-name fallback repeats it here.

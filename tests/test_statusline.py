@@ -36,7 +36,7 @@ def _clean_statusline_env(monkeypatch):
     """
     for name in [k for k in os.environ if k.startswith("CLAUDE_STATUSLINE_")]:
         monkeypatch.delenv(name, raising=False)
-    for name in ("CLAUDE_CODE_PACE_DAYS", "CF_BADGE", "CLAUDE_CACHE_DB_TIMEOUT"):
+    for name in ("CLAUDE_CODE_PACE_DAYS", "CLAUDE_CACHE_DB_TIMEOUT"):
         monkeypatch.delenv(name, raising=False)
     # main() puts this one into the real environ itself. Set then deleted so
     # monkeypatch has an entry to undo — otherwise any test that renders end to
@@ -168,37 +168,6 @@ class TestCtxPct:
         assert sl._render_ctx_pct(160_000, 200_000, label=False).endswith(
             "\033[0;31m80%\033[0m"
         )
-
-
-class TestCfBadge:
-    """The wrapper's own name is the label, so cf and co sessions read apart."""
-
-    @pytest.mark.parametrize(
-        ("value", "label"),
-        [
-            ("CF", "CF"),
-            ("CO", "CO"),
-            # cf exported a bare 1 before the value carried a label; sessions
-            # launched under that wrapper keep it until they are restarted.
-            ("1", "CF"),
-        ],
-    )
-    def test_value_is_the_label(self, monkeypatch, value, label):
-        monkeypatch.setenv("CF_BADGE", value)
-        out = sl._render_session("Opus 5", "", False, 0, 200_000, 0, 0, 0, "")
-        assert f"\033[1;97;46m {label} \033[0m" in out
-
-    def test_badge_stays_stashable_by_force_red(self, monkeypatch):
-        monkeypatch.setenv("CF_BADGE", "CO")
-        out = sl._render_session("Opus 5", "", False, 0, 200_000, 0, 0, 0, "")
-        assert " CO " in present(sl._BADGE_RE.search(out)).group(0)
-
-    @pytest.mark.parametrize("value", ["", None])
-    def test_no_value_renders_no_badge(self, monkeypatch, value):
-        if value is not None:
-            monkeypatch.setenv("CF_BADGE", value)
-        out = sl._render_session("Opus 5", "", False, 0, 200_000, 0, 0, 0, "")
-        assert "1;97;46m" not in out
 
 
 class TestKill:
