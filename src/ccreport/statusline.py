@@ -93,7 +93,7 @@ Other environment variables:
                                               the pair governs nothing and is dropped
   CLAUDE_CODE_PACE_DAYS                     — pace window in days (1-7, default 7)
   CF_BADGE                                  — badge text after the model name, rendered cyan
-                                              (set to CF/CO by the cf/co wrappers; legacy
+                                              (set to CF by the cff wrapper; legacy
                                               "1" reads as CF)
 """
 
@@ -2266,7 +2266,7 @@ def _render_session(
         base = re.sub(r"\s*\(\d+\w+\s+context\)", "", model)
         parts.append(banner or f"{SUBDUED}{base}{RST}")
 
-    # Orchestrator sessions (claudem-shorthand exports CF_BADGE=CF or CO). Cyan
+    # Orchestrator sessions (claudem-shorthand exports CF_BADGE=CF for cff). Cyan
     # — no model banner uses it, and the 1;97 run lets _BADGE_RE stash it whole.
     # Glued to the model part so the two badges sit flush.
     cf_badge = os.environ.get("CF_BADGE", "")
