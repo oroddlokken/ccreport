@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Claude Haiku 5.5 is priced instead of counted as free.** `claude-haiku-5-5` matched no price key, so every call (subagents included) was stored at $0 and read as idle time. It now costs $0.10 input, $0.50 output, $0.125 cache write and $0.01 cache read per MTok, and $0.50/$2.50/$0.625/$0.05 once a prompt passes 100k tokens. That tier covers the whole prompt: once input, cache write and cache read together pass 100k, every token in the call is billed at the higher rate, output included. Models with the older per-type 200k tier price exactly as before. The status line's per-file cost cache re-scans once. The server prices records when they arrive, so after it runs this release, a `ccreport server push --full` reprices Haiku 5.5 rows it rejected or holds.
+
 ## 0.1.4 (2026-09-22)
 
 ### Added

@@ -113,7 +113,7 @@ def _tz_from_env(tz_env: str | None) -> ZoneInfo:
         return ZoneInfo("UTC")
 
 # Source: https://github.com/BerriAI/litellm model_prices_and_context_window.json
-LAST_CHECKED = "2026-09-22"
+LAST_CHECKED = "2026-10-08"
 
 PRICING_HISTORY: list[dict[str, Any]] = [
     {
@@ -252,6 +252,21 @@ PRICING_HISTORY: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        # Haiku 5.5 released 2026-10-07, $0.10/$0.50 per MTok up to a 100k
+        # prompt and $0.50/$2.50 over it. Its tier is whole-prompt rather than
+        # per-type: see LONG_PROMPT_KEY.
+        "effective": "2026-10-07",
+        "models": {
+            "claude-haiku-5-5": {
+                "input": 0.1e-06, "output": 0.5e-06,
+                "cache_create": 0.125e-06, "cache_read": 0.01e-06,
+                "long_prompt": 100_000,
+                "input_long": 0.5e-06, "output_long": 2.5e-06,
+                "cache_create_long": 0.625e-06, "cache_read_long": 0.05e-06,
+            },
+        },
+    },
 ]
 
 MODEL_ALIASES: dict[str, str] = {
@@ -262,6 +277,12 @@ MODEL_ALIASES: dict[str, str] = {
 }
 
 TIER_THRESHOLD = 200_000
+
+# The other long-context rule, set per model: a call whose prompt — input, cache
+# write and cache read together — exceeds `long_prompt` tokens bills every token
+# type, output included, at its `*_long` rate. The `*_200k` keys keep the
+# per-type rule above, so the models priced that way do not reprice their history.
+LONG_PROMPT_KEY = "long_prompt"
 
 # Families the per-model week split buckets by, matched as substrings so a
 # model ID ("claude-fable-5"), an API display name ("Fable") and a statusline
@@ -579,14 +600,24 @@ def calc_cost(
 ) -> float:
     """Calculate total cost for a set of token counts using model-specific pricing.
 
-    The 200K tier is applied per token type independently: each type's count
-    is checked against the threshold separately.
+    A model with `long_prompt` is tiered on the whole prompt (LONG_PROMPT_KEY);
+    any other model's 200K tier is applied per token type independently: each
+    type's count is checked against the threshold separately.
     """
     prices = find_pricing(model, ts)
     if not prices:
         if model and not model.startswith("<"):
             print(f"Warning: no pricing found for model '{model}'", file=sys.stderr)
         return 0.0
+    long_prompt = prices.get(LONG_PROMPT_KEY)
+    if long_prompt is not None:
+        suffix = "_long" if input_tokens + cache_create_tokens + cache_read_tokens > long_prompt else ""
+        return (
+            input_tokens * prices[f"input{suffix}"]
+            + output_tokens * prices[f"output{suffix}"]
+            + cache_create_tokens * prices[f"cache_create{suffix}"]
+            + cache_read_tokens * prices[f"cache_read{suffix}"]
+        )
     return (
         tiered_cost(input_tokens, prices.get("input", 0.0), prices.get("input_200k"))
         + tiered_cost(output_tokens, prices.get("output", 0.0), prices.get("output_200k"))

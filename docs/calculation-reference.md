@@ -35,6 +35,11 @@ PRICING_HISTORY = [
                 "output_200k":        $/token,  # tiered output rate (optional)
                 "cache_create_200k":  $/token,  # tiered cache write rate (optional)
                 "cache_read_200k":    $/token,  # tiered cache read rate (optional)
+                "long_prompt":        tokens,   # whole-prompt tier threshold (optional)
+                "input_long":         $/token,  # rates over long_prompt (with long_prompt)
+                "output_long":        $/token,
+                "cache_create_long":  $/token,
+                "cache_read_long":    $/token,
             }
         }
     },
@@ -88,7 +93,22 @@ _tiered_cost(count, base_rate, tiered_rate):
         cost = count * base_rate
 ```
 
-### Total Message Cost
+### Whole-Prompt Tier
+
+A model that sets `long_prompt` (Haiku 5.5, at 100,000) is tiered on the whole
+prompt instead of per type, and ignores the `*_200k` keys:
+
+```
+prompt = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+rates  = *_long if prompt > long_prompt else base
+message_cost = Σ count(type) * rates(type)      # output included
+```
+
+The per-type rule stays on the models priced with it so their history does not
+reprice. Anthropic's page does not say whether cached tokens count toward the
+threshold; counting them follows its earlier long-context pricing.
+
+### Total Message Cost (per-type models)
 
 ```
 message_cost = _tiered_cost(input_tokens,                 prices.input,        prices.input_200k)
@@ -656,6 +676,7 @@ from this module:
 | `PRICING_HISTORY` | `pricing.py` |
 | `MODEL_ALIASES` | `pricing.py` |
 | `TIER_THRESHOLD` | `pricing.py` (200,000) |
+| `LONG_PROMPT_KEY` | `pricing.py` |
 | `tiered_cost()` | `pricing.py` |
 | `find_pricing()` | `pricing.py` |
 | `calc_cost()` | `pricing.py` |

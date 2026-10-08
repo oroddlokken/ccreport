@@ -9,6 +9,7 @@ from _narrow import present
 
 from ccreport import pricing
 from ccreport.pricing import (
+    LONG_PROMPT_KEY,
     MODEL_ALIASES,
     OTHER_FAMILY,
     PRICING_HISTORY,
@@ -220,6 +221,40 @@ class TestCalcCost:
         assert cost == pytest.approx(250_000 * 5e-06)
 
 
+class TestHaiku55WholePromptTier:
+    """Haiku 5.5 bills a whole call at the long rate once its prompt passes 100k."""
+
+    TS = datetime(2026, 10, 8, tzinfo=UTC)
+
+    def test_prompt_at_threshold_prices_every_type_at_base(self):
+        cost = calc_cost(40_000, 2_000, 10_000, 50_000, "claude-haiku-5-5", self.TS)
+        expected = 40_000 * 0.1e-06 + 2_000 * 0.5e-06 + 10_000 * 0.125e-06 + 50_000 * 0.01e-06
+        assert cost == pytest.approx(expected)
+
+    def test_prompt_over_threshold_prices_every_type_long(self):
+        """Cached tokens count toward the prompt, and output follows the prompt's tier."""
+        cost = calc_cost(1, 2_000, 10_000, 90_000, "claude-haiku-5-5", self.TS)
+        expected = 1 * 0.5e-06 + 2_000 * 2.5e-06 + 10_000 * 0.625e-06 + 90_000 * 0.05e-06
+        assert cost == pytest.approx(expected)
+
+    def test_output_alone_does_not_cross_the_threshold(self):
+        cost = calc_cost(1_000, 150_000, 0, 0, "claude-haiku-5-5", self.TS)
+        assert cost == pytest.approx(1_000 * 0.1e-06 + 150_000 * 0.5e-06)
+
+    def test_dated_id_resolves_to_haiku_5_5(self):
+        prices = present(find_pricing("claude-haiku-5-5-20261007", self.TS))
+        assert prices["input"] == 0.1e-06
+
+    def test_haiku_4_5_keeps_its_price(self):
+        prices = present(find_pricing("claude-haiku-4-5-20251001", self.TS))
+        assert prices["input"] == 1e-06
+
+    def test_per_type_models_keep_the_per_type_rule(self):
+        """Sonnet 4 is still tiered per type: only the input above 200k gets the 200k rate."""
+        cost = calc_cost(250_000, 1_000, 0, 0, "claude-sonnet-4-20250514", datetime(2025, 6, 1, tzinfo=UTC))
+        assert cost == pytest.approx(TIER_THRESHOLD * 3e-06 + 50_000 * 6e-06 + 1_000 * 15e-06)
+
+
 class TestWindowStartEpoch:
     NOW = 1_700_000_000.0
 
@@ -424,6 +459,15 @@ class TestPricingDataIntegrity:
 
     def test_tier_threshold_is_200k(self):
         assert TIER_THRESHOLD == 200_000
+
+    def test_long_prompt_models_carry_every_long_rate(self):
+        """calc_cost indexes all four *_long keys once a model sets long_prompt."""
+        for period in PRICING_HISTORY:
+            for model, prices in period["models"].items():
+                if LONG_PROMPT_KEY not in prices:
+                    continue
+                for key in ("input", "output", "cache_create", "cache_read"):
+                    assert prices[f"{key}_long"] >= prices[key], f"{model}.{key}_long"
 
 
 class TestExtractAssistantFields:
