@@ -335,6 +335,48 @@ class TestPayload:
         assert expected is not None
         assert self._built(None)["utc_offset"] == int(expected.total_seconds())
 
+    def test_a_turn_carries_no_session_and_no_project(self, tmp_path):
+        """Nothing for redact() to strip, so a restricted project's turn hands
+        back nothing its records withheld."""
+        from ccreport.scan import Turn
+
+        cache_db.save_ccreport_files(
+            [("/p/a.jsonl", 1, 100, [{
+                "mid": "m", "model": "claude-haiku-4-5", "ts": TS, "sid": "s",
+                "project": "p", "cwd": None, "repo": None, "dk": "d", "cost": None,
+                "t": [1, 2, 3, 4],
+            }])],
+            turns={"/p/a.jsonl": [Turn("t1", TS, "s", "claude-haiku-4-5", 1000)]},
+        )
+        conn = push._read_only(cache_db.DB_PATH)
+        built = push.build_files(conn, [("/p/a.jsonl", 1, 100)], _Attributed(), None)
+        conn.close()
+        assert built.files[0]["turns"] == [{
+            "uuid": "t1", "ts": TS, "model": "claude-haiku-4-5", "duration_ms": 1000,
+            "account_uuid": "u-acct",
+        }]
+
+    def test_a_turn_no_account_covers_is_left_here(self, tmp_path):
+        from ccreport.accounts import AccountTimeline
+        from ccreport.scan import Turn
+
+        cache_db.save_ccreport_files(
+            [("/p/a.jsonl", 1, 100, [{
+                "mid": "m", "model": "claude-haiku-4-5", "ts": TS + 172800, "sid": "s",
+                "project": "p", "cwd": None, "repo": None, "dk": "d", "cost": None,
+                "t": [1, 2, 3, 4],
+            }])],
+            turns={"/p/a.jsonl": [Turn("early", TS, "s", "claude-haiku-4-5", 1000),
+                                  Turn("late", TS + 172800, "s", "claude-haiku-4-5", 1000)]},
+        )
+        _captured(ts=TS + 86400)
+        conn = push._read_only(cache_db.DB_PATH)
+        built = push.build_files(
+            conn, [("/p/a.jsonl", 1, 100)], AccountTimeline(cache_db.load_account_events()), None,
+        )
+        conn.close()
+        assert [t["uuid"] for t in built.files[0]["turns"]] == ["late"]
+
     def test_the_batch_never_names_its_machine(self, tmp_path):
         """The server takes that from the token."""
         _cached_file()
@@ -576,6 +618,32 @@ class TestAgainstAServer:
         assert result.records == 1
         assert cache_db.load_push_state(config.url) == {"/p/a.jsonl": (1, 100)}
         assert len(sf.stored(app, "laptop-1")) == 1
+
+    def test_request_timing_and_turns_round_trip(self, wired):
+        """The span and the turns are derived here, off the log's line order, and
+        the server stores them as sent so its speed page can fold them."""
+        from ccreport.scan import Turn
+
+        app, _client, config = wired
+        cache_db.save_ccreport_files(
+            [("/p/a.jsonl", 1, 100, [{
+                "mid": "msg_1", "model": "claude-sonnet-4-5-20250929", "ts": TS,
+                "sid": "sess-1", "project": "ccr-projA", "cwd": None, "repo": None,
+                "dk": "msg_1:req_1", "cost": None, "t": [1000, 200, 5000, 30000],
+                "req_start": TS - 12.5, "req_end": TS,
+            }])],
+            turns={"/p/a.jsonl": [Turn(uuid="t1", ts=TS + 1, sid="sess-1",
+                                       model="claude-sonnet-4-5-20250929", duration_ms=30_000)]},
+        )
+        push.push_to(config)
+        rec = sf.stored(app, "laptop-1")[0]
+        assert (rec["req_start"], rec["req_end"]) == (TS - 12.5, TS)
+        from ccreport.server import db as server_db
+
+        turns = server_db.load_file_turns(app.state.db.connect(), "laptop-1", "/p/a.jsonl")
+        assert [(t["uuid"], t["duration_ms"], t["account_uuid"]) for t in turns] == [
+            ("t1", 30_000, "u-acct"),
+        ]
 
     def test_a_second_push_of_the_same_file_sends_nothing(self, wired):
         _app, _client, config = wired

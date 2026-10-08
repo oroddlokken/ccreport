@@ -82,7 +82,8 @@ one rule.
 `speed.py` derives a request's span from log timestamps — the user line it
 answered to its last block — for `ccreport speed`. It imports nothing from
 ccreport, because scan.py stamps the span at parse time and the status line
-reads the same derivation.
+reads the same derivation. The span and the turns are pushed (protocol 3), and
+`server/speed.py` folds them through the same `SpeedBucket` for `/speed`.
 
 `scan.py` reads the JSONL logs into `ccreport_files`, `ccreport_records` and
 `ccreport_turns` and is the only writer of any of them. It imports no rich, because the push refreshes

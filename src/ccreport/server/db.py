@@ -16,8 +16,12 @@ from __future__ import annotations
 import sqlite3
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ccreport import migrations, tier_timeline
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 MIGRATION_BASELINE = 3
 """The version the schema below leaves a database at, before any chain step.
@@ -105,7 +109,15 @@ CREATE TABLE IF NOT EXISTS server_records (
     output_tokens INTEGER NOT NULL,
     cache_create  INTEGER NOT NULL,
     cache_read    INTEGER NOT NULL,
-    dup           INTEGER NOT NULL DEFAULT 0
+    dup           INTEGER NOT NULL DEFAULT 0,
+    -- The request's span as the client's speed.RequestClock read it: the user
+    -- line it answered to its last content block, epoch seconds. After dup
+    -- because migration 11 appends them there on a database that predates
+    -- them, and both shapes have to agree. NULL where the log could not say,
+    -- where a client older than protocol 3 pushed the file, and on every row
+    -- stored before the columns arrived until a `--full` push replaces it.
+    req_start     REAL,
+    req_end       REAL
 );
 
 -- Read-time dedup groups by (account, dedup key): the same call pushed from
@@ -130,6 +142,27 @@ CREATE INDEX IF NOT EXISTS idx_srec_ts ON server_records(ts);
 -- before migration 10 does not have yet, and this script runs before the chain
 -- that adds it -- so `_add_dup_column` creates the index as well. Its shape and
 -- the reasoning behind it are there.
+
+-- One row per `turn_duration` line a machine pushed: a whole turn, prompt to
+-- done, tool runs and permission waits included. The client's ccreport_turns,
+-- keyed on the file it came from so a re-push replaces a file's turns with its
+-- records, and with no session or project: what the speed page reads is the
+-- model and the duration, and a turn sent with neither cannot leak the name a
+-- restricted machine withheld from its records. uuid is what the reader
+-- dedups on, as the client does — a resumed session copies the line into a
+-- second log, and two machines sharing logs push it twice.
+CREATE TABLE IF NOT EXISTS server_turns (
+    machine_id   TEXT NOT NULL REFERENCES machines(machine_id) ON DELETE CASCADE,
+    file_path    TEXT NOT NULL,
+    account_uuid TEXT NOT NULL,
+    uuid         TEXT,
+    ts           REAL NOT NULL,
+    model        TEXT NOT NULL,
+    duration_ms  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sturn_file ON server_turns(machine_id, file_path);
+CREATE INDEX IF NOT EXISTS idx_sturn_ts ON server_turns(ts);
 
 -- What each machine has already pushed, so a re-push of an unchanged file is a
 -- no-op and a re-push of a grown file replaces that file's rows. A request
@@ -261,8 +294,10 @@ _REC_FIELD_COLS = (
     "mid", "model", "ts", "day", "oslo_date", "sid", "project", "cwd", "repo", "dk", "cost", "log_cost",
 )
 _REC_TOKEN_COLS = ("input_tokens", "output_tokens", "cache_create", "cache_read")
-REC_COLS = (*_REC_SOURCE_COLS, *_REC_FIELD_COLS, *_REC_TOKEN_COLS)
-"""Every server_records column but the rowid, in CREATE TABLE order.
+REC_TIMING_COLS = ("req_start", "req_end")
+"""The request span. Behind dup in the table, which REC_COLS leaves out."""
+REC_COLS = (*_REC_SOURCE_COLS, *_REC_FIELD_COLS, *_REC_TOKEN_COLS, *REC_TIMING_COLS)
+"""Every server_records column but the rowid and dup, in CREATE TABLE order.
 
 test_server_db asserts that order against PRAGMA table_info, so a column added
 to the DDL alone, or to this tuple alone, fails there rather than silently
@@ -272,9 +307,10 @@ shifting every insert one place to the left.
 _REC_SELECT = ", ".join(REC_COLS)
 _REC_PLACEHOLDERS = ", ".join("?" * len(REC_COLS))
 
-# The token counts trail the rest so a record dict can keep them in one compact
+# The token counts sit together so a record dict can keep them in one compact
 # "t" list, as the client's does — every other column is read by column name.
 _TOKEN_BASE = len(_REC_SOURCE_COLS) + len(_REC_FIELD_COLS)
+_TIMING_BASE = _TOKEN_BASE + len(_REC_TOKEN_COLS)
 
 
 def record_to_row(rec: dict) -> tuple:
@@ -283,14 +319,23 @@ def record_to_row(rec: dict) -> tuple:
         *(rec.get(name) for name in _REC_SOURCE_COLS),
         *(rec.get(name) for name in _REC_FIELD_COLS),
         *rec["t"][:len(_REC_TOKEN_COLS)],
+        *(rec.get(name) for name in REC_TIMING_COLS),
     )
 
 
 def row_to_record(row: tuple) -> dict:
     """A REC_COLS row as a record dict, token counts folded back into "t"."""
     rec: dict = dict(zip(REC_COLS[:_TOKEN_BASE], row[:_TOKEN_BASE], strict=True))
-    rec["t"] = list(row[_TOKEN_BASE:])
+    rec["t"] = list(row[_TOKEN_BASE:_TIMING_BASE])
+    rec.update(zip(REC_TIMING_COLS, row[_TIMING_BASE:], strict=True))
     return rec
+
+
+TURN_COLS = ("machine_id", "file_path", "account_uuid", "uuid", "ts", "model", "duration_ms")
+"""Every server_turns column, in CREATE TABLE order, for the reason REC_COLS is."""
+
+_TURN_SELECT = ", ".join(TURN_COLS)
+_TURN_PLACEHOLDERS = ", ".join("?" * len(TURN_COLS))
 
 
 _ACCOUNT_AT = REC_COLS.index("account_uuid")
@@ -445,6 +490,20 @@ def _add_dup_column(conn: sqlite3.Connection) -> None:
     conn.execute(_GROUP_INDEX_SQL)
 
 
+def _add_request_timing(conn: sqlite3.Connection) -> None:
+    """Give server_records the request span; server_turns arrives by the script.
+
+    Idempotent on the columns for the reason `_add_dup_column` is. No backfill:
+    a span is read off the log's line order, which only the machine holding
+    the log can do, so an existing row stays NULL until a `--full` push
+    replaces its file.
+    """
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(server_records)")]
+    for col in REC_TIMING_COLS:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE server_records ADD COLUMN {col} REAL")
+
+
 MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(4, "machines.label_updated_at", _add_label_updated_at),
     migrations.Step(5, "project_aliases"),
@@ -453,6 +512,7 @@ MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(8, "account_tiers"),
     migrations.Step(9, "idx_srec_group"),
     migrations.Step(10, "server_records.dup", _add_dup_column),
+    migrations.Step(11, "server_records.req_start/req_end, server_turns", _add_request_timing),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 
@@ -1159,12 +1219,15 @@ def replace_file_records(
     size: int,
     rows: list[tuple],
     now: float,
+    turns: Sequence[tuple] = (),
 ) -> None:
-    """Store one file's records, replacing whatever that file held before.
+    """Store one file's records and turns, replacing whatever that file held before.
 
     One transaction per file, which is the grain a push request carries: a
     partial file would leave the merged history with half a session in it and
-    no fingerprint able to say so.
+    no fingerprint able to say so. *turns* are TURN_COLS rows, and a file that
+    carries none clears the turns it held, as a client older than the turns
+    section re-pushing it would.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -1185,6 +1248,14 @@ def replace_file_records(
         )
         _reconcile_dup(conn, keys)
         conn.execute(
+            "DELETE FROM server_turns WHERE machine_id = ? AND file_path = ?",
+            (machine_id, file_path),
+        )
+        conn.executemany(
+            f"INSERT INTO server_turns ({_TURN_SELECT}) VALUES ({_TURN_PLACEHOLDERS})",  # noqa: S608
+            turns,
+        )
+        conn.execute(
             "INSERT INTO ingest_files (machine_id, file_path, mtime_ns, size, n_records, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(machine_id, file_path) DO UPDATE SET "
@@ -1196,6 +1267,16 @@ def replace_file_records(
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+
+
+def load_file_turns(conn: sqlite3.Connection, machine_id: str, file_path: str) -> list[dict]:
+    """Every turn stored for one machine's file, as TURN_COLS dicts."""
+    rows = conn.execute(
+        f"SELECT {_TURN_SELECT} FROM server_turns "  # noqa: S608
+        "WHERE machine_id = ? AND file_path = ? ORDER BY ts",
+        (machine_id, file_path),
+    ).fetchall()
+    return [dict(zip(TURN_COLS, row, strict=True)) for row in rows]
 
 
 def load_file_records(conn: sqlite3.Connection, machine_id: str, file_path: str) -> list[dict]:

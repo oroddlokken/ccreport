@@ -29,6 +29,7 @@ def _record(**over) -> dict:
         "sid": "sess-1", "project": "proj", "cwd": "/tmp/proj", "repo": "github.com/o/p",
         "dk": "msg_1:req_1", "cost": 1.25, "log_cost": None,
         "t": [10, 20, 30, 40],
+        "req_start": 1_699_999_990.0, "req_end": 1_700_000_000.0,
     }
     rec.update(over)
     return rec
@@ -42,7 +43,7 @@ class TestSchema:
         one and not the other shifts every insert one place and lands here.
         """
         cols = [row[1] for row in conn.execute("PRAGMA table_info(server_records)")]
-        assert cols == ["id", *db.REC_COLS, "dup"]
+        assert cols == ["id", *db.REC_COLS[:-2], "dup", *db.REC_TIMING_COLS]
 
     @pytest.mark.parametrize(
         ("table", "cols"),
@@ -162,6 +163,34 @@ class TestSchema:
             assert second.execute(
                 "SELECT machine_id FROM server_records WHERE dup = 0",
             ).fetchall() == [("m1",)]
+            assert second.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+        finally:
+            second.close()
+
+    def test_a_database_written_before_request_timing_gains_it_empty(self, tmp_path):
+        """The span is read off a log's line order, which the server never had,
+        so the step adds the columns and the turns table and backfills nothing:
+        a stored row stays untimed until its machine re-pushes the file."""
+        path = tmp_path / "server.db"
+        first = db.connect(path)
+        db.upsert_machine(first, "m1", "m1", 100.0)
+        db.replace_file_records(
+            first, "m1", "/p/a.jsonl", 1, 10, [db.record_to_row(_record())], 500.0,
+        )
+        first.execute("DROP TABLE server_turns")
+        for col in db.REC_TIMING_COLS:
+            first.execute(f"ALTER TABLE server_records DROP COLUMN {col}")
+        first.execute("PRAGMA user_version = 10")
+        first.close()
+
+        second = db.connect(path)
+        try:
+            cols = [row[1] for row in second.execute("PRAGMA table_info(server_records)")]
+            assert cols == ["id", *db.REC_COLS[:-2], "dup", *db.REC_TIMING_COLS]
+            rec = db.load_file_records(second, "m1", "/p/a.jsonl")[0]
+            assert (rec["mid"], rec["req_start"], rec["req_end"]) == ("msg_1", None, None)
+            assert [row[1] for row in second.execute("PRAGMA table_info(server_turns)")] == list(
+                db.TURN_COLS)
             assert second.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
         finally:
             second.close()
@@ -296,7 +325,8 @@ class TestRecordRows:
         row = db.record_to_row(_record())
         assert row[db.REC_COLS.index("cost")] == 1.25
         assert row[db.REC_COLS.index("machine_id")] == "m1"
-        assert row[-4:] == (10, 20, 30, 40)
+        assert row[-6:-2] == (10, 20, 30, 40)
+        assert row[-2:] == (1_699_999_990.0, 1_700_000_000.0)
 
     def test_a_missing_field_becomes_null_rather_than_a_key_error(self):
         """The pusher omits what a redacted project strips; that is not an error."""
@@ -387,6 +417,44 @@ class TestWholeFileIngest:
 
     def test_an_unpushed_file_has_no_fingerprint(self, conn):
         assert db.file_fingerprint(conn, "m1", "/p/never.jsonl") is None
+
+
+def _turn(uuid: str = "t1", ts: float = 1_700_000_000.0, duration_ms: int = 4000) -> tuple:
+    return ("m1", "/p/a.jsonl", "acct-1", uuid, ts, "claude-opus-4", duration_ms)
+
+
+class TestTurns:
+    def test_a_file_stores_its_turns_beside_its_records(self, conn):
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        db.replace_file_records(
+            conn, "m1", "/p/a.jsonl", 1, 10, [db.record_to_row(_record())], 500.0,
+            turns=[_turn()],
+        )
+        assert db.load_file_turns(conn, "m1", "/p/a.jsonl") == [
+            dict(zip(db.TURN_COLS, _turn(), strict=True)),
+        ]
+
+    def test_a_re_push_replaces_the_turns_rather_than_adding_to_them(self, conn):
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        for mtime, turns in ((1, [_turn("t1"), _turn("t2")]), (2, [_turn("t3")])):
+            db.replace_file_records(
+                conn, "m1", "/p/a.jsonl", mtime, 10, [db.record_to_row(_record())], 500.0,
+                turns=turns,
+            )
+        assert [t["uuid"] for t in db.load_file_turns(conn, "m1", "/p/a.jsonl")] == ["t3"]
+
+    def test_a_push_with_no_turns_clears_what_the_file_held(self, conn):
+        """What a client older than the turns section does on its next push."""
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        db.replace_file_records(conn, "m1", "/p/a.jsonl", 1, 10, [], 500.0, turns=[_turn()])
+        db.replace_file_records(conn, "m1", "/p/a.jsonl", 2, 10, [], 500.0)
+        assert db.load_file_turns(conn, "m1", "/p/a.jsonl") == []
+
+    def test_deleting_the_machine_takes_its_turns(self, conn):
+        db.upsert_machine(conn, "m1", "laptop", 100.0)
+        db.replace_file_records(conn, "m1", "/p/a.jsonl", 1, 10, [], 500.0, turns=[_turn()])
+        db.delete_machine(conn, "m1")
+        assert conn.execute("SELECT COUNT(*) FROM server_turns").fetchone()[0] == 0
 
 
 class TestDedupFlag:

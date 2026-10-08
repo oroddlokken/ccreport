@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from ccreport import tier_timeline
-from ccreport.server import dashboard, db, limits, reports, tokens
+from ccreport.server import dashboard, db, limits, reports, speed, tokens
 
 router = APIRouter(tags=["pages"])
 
@@ -498,6 +498,22 @@ def limit_window(request: Request, window: str, resets_at: float,
     return templates.TemplateResponse(request, "limit.html", {
         "view": view,
         "charts": _chart_payload(view.charts),
+    })
+
+
+@router.get("/speed", response_class=HTMLResponse)
+def speed_page(request: Request, days: int = Query(default=dashboard.DEFAULT_RANGE)):
+    """Per-model request latency and output rate, merged across the machines.
+
+    Named above the catch-all for the reason /limits is. Cached through
+    `speed.cached_build` on the stamp and local date the index is.
+    """
+    view = speed.cached_build(request.app.state.db, days)
+    return templates.TemplateResponse(request, "speed.html", {
+        "view": view,
+        "min_rate_tokens": speed.MIN_RATE_OUTPUT_TOKENS,
+        "ranges": dashboard.RANGES,
+        "range_labels": dashboard.RANGE_LABELS,
     })
 
 

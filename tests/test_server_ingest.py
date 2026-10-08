@@ -132,6 +132,34 @@ class TestStoring:
         assert sf.stored(app, "laptop-1")[0]["cost"] == 0.0
 
 
+class TestRequestTiming:
+    def test_the_span_round_trips(self, app, client, token):
+        rec = sf.record(req_start=1_769_999_990.0, req_end=1_770_000_000.0)
+        client.post("/v1/ingest", json=sf.batch([rec]), headers=sf.auth(token))
+        stored = sf.stored(app, "laptop-1")[0]
+        assert (stored["req_start"], stored["req_end"]) == (1_769_999_990.0, 1_770_000_000.0)
+
+    def test_a_record_from_an_older_client_is_stored_untimed(self, app, client, token):
+        """Protocol 2 sent no span, and a behind client pushes normally."""
+        resp = client.post("/v1/ingest", json={**sf.batch(), "protocol": 2},
+                           headers=sf.auth(token))
+        assert resp.status_code == 200
+        stored = sf.stored(app, "laptop-1")[0]
+        assert (stored["req_start"], stored["req_end"]) == (None, None)
+
+    def test_a_files_turns_are_stored_with_it(self, app, client, token):
+        body = sf.batch()
+        body["files"][0]["turns"] = [{
+            "uuid": "t1", "ts": 1_770_000_100.0, "model": "claude-sonnet-4-5-20250929",
+            "duration_ms": 12_000, "account_uuid": "acct-1",
+        }]
+        client.post("/v1/ingest", json=body, headers=sf.auth(token))
+        turns = db.load_file_turns(app.state.db.connect(), "laptop-1", "/p/a.jsonl")
+        assert [(t["uuid"], t["duration_ms"], t["account_uuid"]) for t in turns] == [
+            ("t1", 12_000, "acct-1"),
+        ]
+
+
 class TestUnknownModel:
     def test_an_unpriced_model_fails_its_file_loudly(self, app, client, token):
         """A silent zero is a week of money that looks like an idle week."""

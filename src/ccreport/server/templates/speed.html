@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% macro secs(value) %}{% if value is none %}—{% else %}{{ "%.1f" | format(value) }}s{% endif %}{% endmacro %}
+{% macro cells(row) %}
+        <td class="num" data-int="{{ row.calls }}">{{ "{:,}".format(row.calls) }}</td>
+        <td class="num">{% if row.timed_share is none %}—{% else %}{{ (row.timed_share * 100) | round | int }}%{% endif %}</td>
+        <td class="num">{{ secs(row.latency_mid) }}</td>
+        <td class="num">{{ secs(row.latency_p90) }}</td>
+        <td class="num">{% if row.rate_mid is none %}—{% else %}{{ "%.1f" | format(row.rate_mid) }}{% endif %}</td>
+        <td class="num" data-int="{{ row.turns }}">{{ "{:,}".format(row.turns) }}</td>
+        <td class="num">{{ secs(row.turn_mid) }}</td>
+{% endmacro %}
+{% block content %}
+
+<div class="range">
+  <span class="dim span">request speed ·
+    <a href="/day/{{ view.start }}" data-day="{{ view.start }}">{{ view.start }}</a> —
+    <a href="/day/{{ view.end }}" data-day="{{ view.end }}">{{ view.end }}</a>
+  </span>
+  <span class="toggles">
+    {% for days in ranges %}
+    <a class="toggle {% if days == view.days %}on{% endif %}"
+       {% if days == view.days %}aria-current="true"{% endif %}
+       href="/speed?days={{ days }}">{{ range_labels[days] }}</a>
+    {% endfor %}
+  </span>
+</div>
+
+{% if view.groups %}
+<section>
+  <div class="chart-head">
+    <h2>By model</h2>
+    <span class="dim">{{ "{:,}".format(view.requests) }} of {{ "{:,}".format(view.calls) }} calls timed</span>
+  </div>
+  <div class="table-clip">
+  <table class="breakdown">
+    <thead>
+      <tr>
+        <th scope="col">Model</th>
+        <th scope="col">Machine</th>
+        <th scope="col" class="num">Calls</th>
+        <th scope="col" class="num">Timed</th>
+        <th scope="col" class="num">Latency p50</th>
+        <th scope="col" class="num">p90</th>
+        <th scope="col" class="num">tok/s p50</th>
+        <th scope="col" class="num">Turns</th>
+        <th scope="col" class="num">Turn p50</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for group in view.groups %}
+      <tr>
+        <td><a href="/model/{{ group.total.model | urlencode }}">{{ group.total.model }}</a></td>
+        <td class="dim">{% if group.machines %}all{% endif %}</td>
+        {{ cells(group.total) }}
+      </tr>
+      {% for row in group.machines %}
+      <tr>
+        <td></td>
+        <td>{{ row.machine }}</td>
+        {{ cells(row) }}
+      </tr>
+      {% endfor %}
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% else %}
+<section>
+  <p class="dim">No machine has pushed a call in this range.</p>
+</section>
+{% endif %}
+
+<section>
+  <p class="dim">A request is timed from the user line it answered to its last
+  content block, so latency includes queueing and prefill and is an
+  approximation. tok/s counts replies of at least {{ min_rate_tokens }} output
+  tokens. A turn is the whole prompt-to-done span Claude Code logged, tool runs
+  and permission waits included. Timing comes only from logs still on a
+  machine&#39;s disk: an archived file is never pushed, and calls pushed before
+  the server learned to store timing stay untimed until that machine runs
+  <code>ccreport server push --full</code>.</p>
+</section>
+{% endblock %}

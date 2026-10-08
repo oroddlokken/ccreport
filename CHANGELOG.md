@@ -6,6 +6,11 @@
 
 - **`ccreport speed` shows how fast each model answered.** For each model, by day, ISO week or month (`--by`, default week) and over the whole range, it shows the request count, median and p90 latency, median turn time and median output tok/s. It takes `--since`, `--until`, `--project`, `--account` and `--json`. The session log has no latency field, so a request is timed from the user line it answered to the last block of its reply. That span includes queueing and prefill, and tok/s counts only replies of 100+ output tokens. Days folded by `ccreport archive` keep sums rather than samples, so a cell that includes one shows means instead of medians and is marked `†`. The cache migrates and re-parses the logs once.
 - **`CLAUDE_STATUSLINE_TOK_S=1` adds the session's latest output rate to the status line.** It shows the tok/s of the newest finished reply of 100+ tokens, subagent logs included. The value comes from the incremental read the status line already does for the session cost. It is off by default.
+- **The server's new `/speed` page compares models across machines.** A push now sends each request's span and each turn's duration. For the range toggle, the page shows calls, the share of them that were timed, median and p90 latency, median tok/s and median turn time per model, with one row per machine under a model when more than one machine contributed. A call two machines both pushed is timed once. The server stores no timing for rows it already holds, and archived files are never pushed, so run `ccreport server push --full` to time the files still on disk.
+
+### Changed
+
+- **Push protocol 3: update the server before its clients.** The ingest payload gained a span on each record and a `turns` list on each file. A server older than this refuses a protocol-3 client with 409, and the push stops until the server is updated. An older client keeps pushing to a new server, and its rows are stored without timing.
 
 ## 0.1.5 (2026-10-08)
 

@@ -236,6 +236,8 @@ def _as_merged(
         dedup_key=rec["dk"],
         account=account,
         oslo_date=date.fromisoformat(rec["oslo_date"]),
+        req_start=rec["req_start"],
+        req_end=rec["req_end"],
     )
     # The stored day is the machine's calendar day. Priming the memo is what
     # makes the daily and monthly reports bucket by it rather than by the
@@ -434,6 +436,69 @@ def load_spend(
             (ts, cost, float(cache_read), float(tokens_in + cache_create + cache_read), family),
         )
     return per_account
+
+
+_SPEED_SQL = """
+    SELECT a.model, a.machine_id, a.output_tokens, a.req_start, a.req_end
+      FROM server_records a
+     WHERE %s
+"""
+
+SpeedRow = tuple[str, str, int, float | None, float | None]
+"""(model, machine_id, output_tokens, req_start, req_end) of one deduped call."""
+
+
+def load_speed(conn: sqlite3.Connection, filters: Filters | None = None) -> list[SpeedRow]:
+    """Every deduped call the filters admit, timed or not, as the speed fold reads it.
+
+    The untimed ones come back too, with a NULL span: the page says what share
+    of the calls it measured, and a row the server stored before the span
+    columns arrived is a call nobody timed rather than one that was not made.
+    Here rather than beside the page because it counts server_records, and
+    every count goes through `_dedup_clause` — a call two machines pushed is one
+    request, and timing it twice would weigh its model's median toward it.
+    """
+    filters = filters or Filters()
+    aliased = db.accounts_with_alias(conn, filters.account)
+    pairs = db.projects_with_alias(conn, filters.project)
+    dedup, dedup_params = _dedup_clause(filters, aliased, pairs)
+    clauses, params = _clauses(filters, table="a", aliased=aliased, pairs=pairs)
+    return conn.execute(
+        _SPEED_SQL % " AND ".join([dedup, *clauses]), dedup_params + params,
+    ).fetchall()
+
+
+def load_turns(
+    conn: sqlite3.Connection, since: float | None, until: float | None,
+) -> list[tuple[str, str, int]]:
+    """(model, machine_id, duration_ms) per turn inside [since, until), deduped on uuid.
+
+    A turn names no project or session, so no filter but the date reaches it.
+    The first copy by rowid wins, the rule a record's dedup keeps; a turn with
+    no uuid stands for itself.
+    """
+    clauses, params = [], []
+    if since is not None:
+        clauses.append("ts >= ?")
+        params.append(since)
+    if until is not None:
+        clauses.append("ts < ?")
+        params.append(until)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        f"SELECT uuid, model, machine_id, duration_ms FROM server_turns{where} "  # noqa: S608
+        "ORDER BY rowid",
+        params,
+    ).fetchall()
+    seen: set[str] = set()
+    out = []
+    for uuid, model, machine_id, duration_ms in rows:
+        if uuid:
+            if uuid in seen:
+                continue
+            seen.add(uuid)
+        out.append((model, machine_id, duration_ms))
+    return out
 
 
 def _as_grouped(

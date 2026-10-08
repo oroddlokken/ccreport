@@ -9,7 +9,8 @@ commit differs from every other, which makes it advisory and nothing more.
 Bump PROTOCOL_VERSION when, and only when, the bytes on the wire change:
 
 - a new section on the ingest request or response (`samples`, `extra`, `pull`
-  were three such changes, and `pull.tiers` a fourth)
+  were three such changes, `pull.tiers` a fourth, and a file's `turns` beside
+  its records' `req_start`/`req_end` the fifth)
 - a field renamed, retyped, or given a new meaning
 - a response key a client reads
 
@@ -25,7 +26,7 @@ can both reach has to cost neither of them an import.
 
 from __future__ import annotations
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 """What this build speaks. See the bump rule above."""
 
 PRE_VERSIONING = 0

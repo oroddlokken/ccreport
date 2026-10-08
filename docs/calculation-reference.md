@@ -1722,9 +1722,8 @@ The report reads the full record path, never the rollups, and takes the usual
 but no project, so the filters reach turns through their session: a turn is
 included when any kept record shares its session id. `--json` prints one entry
 per cell, then one per model for the whole range (`period: null`), with
-`estimate` saying `median` or `mean`. The report is local only. Nothing is
-pushed, so `protocol.PROTOCOL_VERSION` is untouched. Sending speed to the server
-would add a payload field and need a bump.
+`estimate` saying `median` or `mean`. The merged counterpart is the server's
+`/speed` page (10.6).
 
 ### 10.5 Status line
 
@@ -1739,3 +1738,30 @@ finished when the next reply starts or a turn ends, because until then a later
 block can still move its end. The value travels in `_Fetched.last_rate`
 (`_FAST_CACHE_SCHEMA` 9), and `_SESSION_STATE_VERSION` 4 makes stored session
 states reparse once. No render reads the record cache for it.
+
+### 10.6 Server
+
+Protocol 3 carries the timing. `push._payload_record` sends each record's
+`req_start` and `req_end` as this machine derived them: the span is read off
+the log's line order, and the server never sees the log. Each file object also
+carries `turns`, one entry per `ccreport_turns` row with uuid, ts, model,
+duration and the account the change log resolves at that instant. A turn sends
+no session id and no project, so `redact()` has nothing to strip. A turn that no
+account event covers stays on the machine, like a record.
+
+On the server, migration 11 appends `req_start` and `req_end` to
+`server_records` after `dup`, and the script adds `server_turns`.
+`replace_file_records` replaces a file's turns along with its records. The
+migration backfills nothing. A row stored before the columns existed, or pushed
+by a protocol-2 client, has NULL timing until its machine runs
+`ccreport server push --full`. Archived files are never pushed
+(`push.changed_files`), so the server gets timing only for logs still on disk.
+
+`/speed` (`server/speed.py`) folds the deduped calls in the range toggle with
+`speed.SpeedBucket`, giving one row per model and one per machine label under it
+when more than one machine contributed. The calls come from
+`reports.load_speed`, which goes through `_dedup_clause` like every count. A call
+two machines pushed is timed once, on the copy that won the dedup. Turns are
+deduped on uuid, first rowid wins. Every call is counted, timed or not, so a row
+can say what share of its calls was measured. Archived sums have no server-side
+counterpart, so every figure on the page is a median.

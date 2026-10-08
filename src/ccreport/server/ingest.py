@@ -58,6 +58,28 @@ class IngestRecord(BaseModel):
     cache_read: int = 0
     account_uuid: str
     account_label: str | None = None
+    req_start: float | None = None
+    req_end: float | None = None
+    """The request's span, epoch seconds: the user line it answered to its last
+    block, as the client's speed.RequestClock reads it off the log's line
+    order — which is why the client derives it and the server cannot. Absent
+    from a client before protocol 3, and stored NULL then."""
+
+
+class IngestTurn(BaseModel):
+    """One `turn_duration` line: a whole turn, prompt to done.
+
+    No session and no project, so there is nothing for a restricted machine to
+    strip: the speed page reads the model and the duration, and a turn naming
+    a session would hand back what the file's records were redacted of. The
+    account is resolved on the client, as a record's is.
+    """
+
+    uuid: str | None = None
+    ts: float
+    model: str
+    duration_ms: int
+    account_uuid: str
 
 
 class IngestFile(BaseModel):
@@ -65,6 +87,10 @@ class IngestFile(BaseModel):
     mtime_ns: int
     size: int
     records: list[IngestRecord] = Field(default_factory=list)
+    turns: list[IngestTurn] = Field(default_factory=list)
+    """The file's turn durations, replaced with its records. Empty from a client
+    before protocol 3, which clears what the file held — the same thing that
+    client's re-push does to the request spans."""
     replace: bool = False
     """Store this file even though its fingerprint has not moved.
 
@@ -337,7 +363,14 @@ def _row(machine_id: str, path: str, rec: IngestRecord) -> tuple:
         "cost": _priced(rec),
         "log_cost": rec.cost,
         "t": [rec.input_tokens, rec.output_tokens, rec.cache_create, rec.cache_read],
+        "req_start": rec.req_start,
+        "req_end": rec.req_end,
     })
+
+
+def _turn_row(machine_id: str, path: str, turn: IngestTurn) -> tuple:
+    """One turn as a server_turns insert row."""
+    return (machine_id, path, turn.account_uuid, turn.uuid, turn.ts, turn.model, turn.duration_ms)
 
 
 def _ingest_file(conn, machine_id: str, item: IngestFile, now: float) -> FileResult:
@@ -355,6 +388,7 @@ def _ingest_file(conn, machine_id: str, item: IngestFile, now: float) -> FileRes
         )
     db.replace_file_records(
         conn, machine_id, item.path, item.mtime_ns, item.size, rows, now,
+        turns=[_turn_row(machine_id, item.path, turn) for turn in item.turns],
     )
     return FileResult(path=item.path, status=ACCEPTED, records=len(rows))
 

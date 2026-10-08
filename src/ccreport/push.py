@@ -754,8 +754,40 @@ def _payload_record(rec: dict, timeline, override) -> dict | None:
         "output_tokens": rec["output_tokens"],
         "cache_create": rec["cache_create"],
         "cache_read": rec["cache_read"],
+        # The span is read off the log's line order, which the server never
+        # sees, so it travels as this machine derived it.
+        "req_start": rec["req_start"],
+        "req_end": rec["req_end"],
         **account,
     }
+
+
+def _turns_for(conn: sqlite3.Connection, path: str) -> list[tuple]:
+    """One file's cached turns as (uuid, ts, model, duration_ms), oldest first."""
+    return conn.execute(
+        "SELECT t.uuid, t.ts, t.model, t.duration_ms FROM ccreport_turns t "
+        "JOIN ccreport_files f ON f.id = t.file_id WHERE f.path = ? ORDER BY t.ts",
+        (path,),
+    ).fetchall()
+
+
+def _payload_turns(rows: list[tuple], timeline) -> list[dict]:
+    """A file's turns as the ingest accepts them, the unattributed ones left out.
+
+    No session id rides along, so there is nothing for redact() to strip: the
+    server reads a turn for its model and its duration, and a session id on a
+    restricted project's turn would hand back what its records withheld.
+    """
+    turns = []
+    for uuid, ts, model, duration_ms in rows:
+        account = _attribution(timeline, datetime.fromtimestamp(ts, tz=UTC))
+        if account is None:
+            continue
+        turns.append({
+            "uuid": uuid, "ts": ts, "model": model, "duration_ms": duration_ms,
+            "account_uuid": account["account_uuid"],
+        })
+    return turns
 
 
 class Built(NamedTuple):
@@ -789,6 +821,7 @@ def build_files(
             "mtime_ns": mtime_ns,
             "size": size,
             "records": kept,
+            "turns": _payload_turns(_turns_for(conn, path), timeline),
         })
     return Built(files, unattributed)
 
