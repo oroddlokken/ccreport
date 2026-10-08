@@ -22,6 +22,10 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, TypedDict
 
+# Light on purpose: no dataclasses, no statistics, no ccreport import. The
+# session scan below tracks each reply's span through it on slow renders.
+from ccreport.speed import ReplyTracker, timed_model
+
 if TYPE_CHECKING:
     # Both are slow-path only: zoneinfo's package init resolves TZPATH through
     # sysconfig, and project_identity reads the repo-roots config. A fast render
@@ -988,7 +992,13 @@ def _line_cost(
         rec = json.loads(line)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
+    return _record_cost(rec, seen_keys)
 
+
+def _record_cost(
+    rec: dict, seen_keys: set[str],
+) -> tuple[float, datetime, str | None, str] | None:
+    """_line_cost for a line already parsed, for a caller that reads it for more."""
     fields = extract_assistant_fields(rec)
     if fields is None:
         return None
@@ -1050,7 +1060,7 @@ def _iter_jsonl_costs(
 # counted, which is the part a rewrite changes first.
 _TAIL_BYTES = 256
 
-_SESSION_STATE_VERSION = 3
+_SESSION_STATE_VERSION = 4
 
 
 def _digest(data: bytes) -> str:
@@ -1092,12 +1102,15 @@ class _FileCursor(NamedTuple):
 
     *tail* digests the last _TAIL_BYTES before *offset*; *mtime_ns* and *size*
     are the cheap "nothing moved" test that avoids opening the file at all.
+    *reply* is the speed.ReplyTracker the bytes before *offset* left, dumped,
+    so a resume picks up a reply that straddles two renders.
     """
 
     mtime_ns: int
     size: int
     offset: int
     tail: str
+    reply: list | None = None
 
 
 class _SessionCostState(NamedTuple):
@@ -1146,7 +1159,9 @@ def _decode_session_state(blob: str, cost: float) -> _SessionCostState | None:
         return None
     try:
         files = {
-            str(path): _FileCursor(int(c[0]), int(c[1]), int(c[2]), str(c[3]))
+            str(path): _FileCursor(
+                int(c[0]), int(c[1]), int(c[2]), str(c[3]), ReplyTracker.load(c[4]).dump(),
+            )
             for path, c in data["f"].items()
         }
         keys = _DigestKeys.load([str(k) for k in data["k"]])
@@ -1170,8 +1185,14 @@ def _scan_session_file(
     seen_keys: set[str],
     cursor: _FileCursor | None,
     families: set[str],
-) -> tuple[float, int, str] | None:
-    """Cost of the records after *cursor*, with the offset and tail it reached.
+) -> tuple[float, int, str, list] | None:
+    """Cost of the records after *cursor*, with the offset, tail and reply it reached.
+
+    The reply is the file's speed.ReplyTracker, dumped: every reply block, user
+    line and turn end goes through it, which is why this parses user and
+    turn-duration lines where the cost alone would skip them. A block the dedup
+    drops still counts there — the later blocks of a reply are duplicates of
+    its first, and they are what move its end.
 
     Adds every scanned record's model family to *families* — mutated in place,
     and only reliable when the caller keeps it for as long as it keeps the
@@ -1188,6 +1209,7 @@ def _scan_session_file(
     partial last line, and the next render sees it complete.
     """
     offset = cursor.offset if cursor else 0
+    reply = ReplyTracker.load(cursor.reply) if cursor and cursor.reply else ReplyTracker()
     try:
         with open(path, "rb") as f:
             if offset:
@@ -1199,13 +1221,64 @@ def _scan_session_file(
                 if not raw.endswith(b"\n"):
                     break
                 offset += len(raw)
-                got = _line_cost(raw, seen_keys)
-                if got is not None:
-                    total += got[0]
-                    families.add(model_family(got[3]))
-            return total, offset, _tail_digest(f, offset)
+                rec = _timing_line(raw)
+                if rec is None:
+                    continue
+                kind = rec.get("type")
+                if kind == "assistant":
+                    _track_reply(reply, rec)
+                    got = _record_cost(rec, seen_keys)
+                    if got is not None:
+                        total += got[0]
+                        families.add(model_family(got[3]))
+                elif kind == "user":
+                    ts = _line_epoch(rec)
+                    if ts is not None:
+                        reply.user(ts)
+                elif kind == "system" and rec.get("subtype") == "turn_duration":
+                    reply.turn_end()
+            return total, offset, _tail_digest(f, offset), reply.dump()
     except OSError:
         return None
+
+
+def _timing_line(line: bytes) -> dict | None:
+    """A line parsed if it can be a reply, a user line or a turn end, else None.
+
+    The byte checks are a prefilter alone; the caller dispatches on the parsed
+    type, since a tool_result can quote "assistant" in an object of its own.
+    """
+    if b'"assistant"' not in line and b'"user"' not in line and b'"turn_duration"' not in line:
+        return None
+    try:
+        rec = json.loads(line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _line_epoch(rec: dict) -> float | None:
+    raw = rec.get("timestamp")
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return ts.timestamp()
+
+
+def _track_reply(reply: ReplyTracker, rec: dict) -> None:
+    """Feed one reply line to *reply*, keyed the way scan.parse_jsonl keys it."""
+    fields = extract_assistant_fields(rec)
+    if fields is None:
+        return
+    msg, usage, mid, _rid, dk, ts = fields
+    key = dk or mid
+    if key and timed_model(msg.get("model") or "unknown"):
+        reply.block(key, ts.timestamp(), usage.get("output_tokens") or 0)
 
 
 def _resume_session_cost(
@@ -1241,9 +1314,9 @@ def _resume_session_cost(
             # A file that has never been counted and cannot be read now: leave
             # it out and let a later render pick it up whole.
             continue
-        cost, offset, tail = scanned
+        cost, offset, tail, reply = scanned
         total += cost
-        files[path] = _FileCursor(mtime_ns, size, offset, tail)
+        files[path] = _FileCursor(mtime_ns, size, offset, tail, reply)
         changed = True
 
     return _SessionCostState(files, total, state.keys, families) if changed else state
@@ -1259,9 +1332,9 @@ def _reparse_session_cost(stats: dict[str, tuple[int, int]]) -> _SessionCostStat
         scanned = _scan_session_file(path, keys, None, families)
         if scanned is None:
             continue
-        cost, offset, tail = scanned
+        cost, offset, tail, reply = scanned
         total += cost
-        files[path] = _FileCursor(mtime_ns, size, offset, tail)
+        files[path] = _FileCursor(mtime_ns, size, offset, tail, reply)
     return _SessionCostState(files, total, keys, families)
 
 
@@ -1274,6 +1347,23 @@ class SessionUsage(NamedTuple):
 
     cost: float
     families: frozenset[str]
+    last_rate: float | None = None
+    """Output tok/s of the session's newest finished reply that has one
+    (speed.ReplyTracker), across its files, subagents included. None for a
+    session with none yet, and for a purged one: the cached records carry
+    the span, but nothing renders a session whose log is gone."""
+
+
+def _last_rate(state: _SessionCostState) -> float | None:
+    """The rate of the newest finished reply in any of *state*'s files."""
+    newest: tuple[float, float] | None = None
+    for cursor in state.files.values():
+        if not cursor.reply:
+            continue
+        last = ReplyTracker.load(cursor.reply).last()
+        if last is not None and (newest is None or last[0] > newest[0]):
+            newest = last
+    return newest[1] if newest else None
 
 
 def _purged_session_usage(session_id: str, cwd: str) -> SessionUsage:
@@ -1351,10 +1441,10 @@ def compute_session_usage(session_id: str, cwd: str) -> SessionUsage:
     if updated is None:
         updated = _reparse_session_cost(stats)
     elif state is not None and updated is state:
-        return SessionUsage(state.cost, frozenset(state.families))
+        return SessionUsage(state.cost, frozenset(state.families), _last_rate(state))
 
     write_session_cost(session_id, _encode_session_state(updated), updated.cost)
-    return SessionUsage(updated.cost, frozenset(updated.families))
+    return SessionUsage(updated.cost, frozenset(updated.families), _last_rate(updated))
 
 
 def _accumulate_orphaned_costs(

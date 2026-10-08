@@ -12,6 +12,7 @@ import subprocess
 from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
+from typing import NamedTuple
 
 import orjson
 
@@ -25,6 +26,7 @@ from ccreport.cache_db import (
     save_ccreport_files,
 )
 from ccreport.pricing import extract_assistant_fields
+from ccreport.speed import RequestClock, timed_model
 
 _CONFIG_PATH = project_identity.CONFIG_PATH
 _repo_from_path = project_identity.repo_from_path
@@ -152,6 +154,8 @@ def _serialize_records(records: list) -> list[dict]:
             "dk": r.dedup_key,
             "cost": r.cost_usd,
             "t": [r.tokens.input, r.tokens.output, r.tokens.cache_create, r.tokens.cache_read],
+            "req_start": r.req_start,
+            "req_end": r.req_end,
         }
         for r in records
     ]
@@ -174,6 +178,8 @@ def _deserialize_records(raw: list[dict]) -> list:
                 input=r["t"][0], output=r["t"][1],
                 cache_create=r["t"][2], cache_read=r["t"][3],
             ),
+            req_start=r.get("req_start"),
+            req_end=r.get("req_end"),
         )
         for r in raw
     ]
@@ -233,14 +239,63 @@ def _derive_project(path: Path) -> str:
     return project_display_name(path.parent.name)
 
 
+class Turn(NamedTuple):
+    """One `system`/`turn_duration` line: a whole turn, prompt to done.
+
+    Tool execution and permission waits are inside it, which is what makes it
+    the wait a person sat through rather than the model's own speed. The line
+    names no model, so the turn takes the model of the last reply before it.
+    """
+
+    uuid: str | None
+    """The line's own uuid: a resumed session copies the line into a second
+    log, and this is what the report dedups the two on."""
+    ts: float
+    sid: str
+    model: str
+    duration_ms: int
+
+
+class ParsedLog(NamedTuple):
+    records: list[UsageRecord]
+    turns: list[Turn]
+
+
+def _epoch(rec: dict) -> float | None:
+    """A log line's timestamp as an epoch second, None if it carries none."""
+    raw = rec.get("timestamp")
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return ts.timestamp()
+
+
 def parse_jsonl_file(path: Path) -> list[UsageRecord]:
-    """Parse a single JSONL file and extract usage records.
+    """The usage records of one JSONL file; parse_jsonl without the turns."""
+    return parse_jsonl(path).records
+
+
+def parse_jsonl(path: Path) -> ParsedLog:
+    """Parse a single JSONL file into its usage records and its turn durations.
+
+    Each record carries its request's span (speed.RequestClock): the user line
+    before the reply's first block to the reply's last block. Every line of a
+    reply is stamped with the same pair once the file is read, because which
+    line of it survives the read-time dedup is not decided here.
 
     A read error propagates rather than yielding the lines read so far: the
     caller writes whatever comes back over the file's complete cache entry,
     so a truncated return is silent, permanent data loss.
     """
     records = []
+    turns: list[Turn] = []
+    clock = RequestClock()
+    last_model: str | None = None
     cwd_from_records: str | None = None
 
     with open(path, "rb") as f:
@@ -257,6 +312,24 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
                 c = rec.get("cwd")
                 if isinstance(c, str) and c:
                     cwd_from_records = c
+
+            kind = rec.get("type")
+            if kind == "user":
+                ts_user = _epoch(rec)
+                if ts_user is not None:
+                    clock.user(ts_user)
+                continue
+            if kind == "system":
+                if rec.get("subtype") == "turn_duration" and last_model is not None:
+                    ts_turn = _epoch(rec)
+                    duration = rec.get("durationMs")
+                    if ts_turn is not None and isinstance(duration, int | float):
+                        turns.append(Turn(
+                            uuid=rec.get("uuid"), ts=ts_turn,
+                            sid=rec.get("sessionId") or path.stem,
+                            model=last_model, duration_ms=int(duration),
+                        ))
+                continue
 
             fields = extract_assistant_fields(rec)
             if fields is None:
@@ -280,9 +353,16 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
                 except (ValueError, TypeError):
                     cost_usd = None
 
+            model = msg.get("model") or "unknown"
+            if timed_model(model):
+                last_model = model
+                request_key = dedup_key or message_id
+                if request_key:
+                    clock.block(request_key, ts.timestamp())
+
             records.append(UsageRecord(
                 message_id=message_id,
-                model=msg.get("model") or "unknown",
+                model=model,
                 tokens=tokens,
                 timestamp=ts,
                 session_id=rec.get("sessionId") or path.stem,
@@ -305,8 +385,12 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
         r.project = project
         r.cwd = cwd_from_records
         r.repo = repo
+        if timed_model(r.model):
+            request_key = r.dedup_key or r.message_id
+            if request_key:
+                r.req_start, r.req_end = clock.span(request_key)
 
-    return records
+    return ParsedLog(records, turns)
 
 
 def _refresh_changed_files(
@@ -324,6 +408,7 @@ def _refresh_changed_files(
     fresh: dict[str, list[UsageRecord]] = {}
     unreadable: set[str] = set()
     pending: list[tuple[str, int, int, list[dict]]] = []
+    pending_turns: dict[str, list[Turn]] = {}
     for path in files:
         key = str(path)
         try:
@@ -335,7 +420,7 @@ def _refresh_changed_files(
         if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
             continue
         try:
-            records = parse_jsonl_file(path)
+            records, turns = parse_jsonl(path)
         except (OSError, UnicodeDecodeError):
             # Skipping the save leaves the file's previous cache entry whole;
             # this run under-reports it, the next readable parse restores it.
@@ -344,10 +429,13 @@ def _refresh_changed_files(
             continue
         fresh[key] = records
         pending.append((key, st.st_mtime_ns, st.st_size, _serialize_records(records)))
+        if turns:
+            pending_turns[key] = turns
         if len(pending) >= _SAVE_BATCH:
-            save_ccreport_files(pending)
+            save_ccreport_files(pending, turns=pending_turns)
             pending = []
-    save_ccreport_files(pending)
+            pending_turns = {}
+    save_ccreport_files(pending, turns=pending_turns)
     return fresh, unreadable
 
 

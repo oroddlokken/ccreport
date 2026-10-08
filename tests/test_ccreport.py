@@ -145,6 +145,19 @@ class TestKeep:
         assert rec.project == "new-name"
 
 
+@pytest.fixture(autouse=True)
+def restore_console(monkeypatch):
+    """Put ccr.console back after every test here, however a test replaced it.
+
+    Several tests point the module console at a StringIO by plain assignment.
+    Left in place, every later test that reads output through capsys sees an
+    empty string — test_push and test_speed in a serial run. monkeypatch records
+    the console as it stands now and sets it back at teardown, which undoes a
+    direct assignment as well as its own.
+    """
+    monkeypatch.setattr(ccr, "console", ccr.console)
+
+
 @pytest.fixture
 def loader(tmp_path, monkeypatch):
     """load_all_records wired to a temp DB and a temp project tree."""

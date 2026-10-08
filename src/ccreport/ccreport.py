@@ -29,6 +29,7 @@ from ccreport import (
     pricing,
     project_identity,
     protocol,
+    speed,
     tier_timeline,
 )
 from ccreport.accounts import AccountTimeline
@@ -88,6 +89,7 @@ from ccreport.scan import (
     _script_hash,
     discover_jsonl_files,
 )
+from ccreport.speed import SpeedSums, timed_model
 from ccreport.windows import (
     LIMIT_WINDOW_LABELS as _LIMIT_WINDOW_LABELS,
 )
@@ -550,7 +552,7 @@ def _archive_records(
     """
     pairs: list[tuple[float, UsageRecord]] = []
     for (_day, oslo_date, sid, project, model, cwd, repo, _prefix,
-         min_ts, max_ts, tin, tout, tcc, tcr, cost, n) in rows:
+         min_ts, max_ts, tin, tout, tcc, tcr, cost, n, *timing) in rows:
         rec = UsageRecord(
             message_id="",
             model=model,
@@ -565,6 +567,7 @@ def _archive_records(
             cost_usd=cost,
             count=n,
             oslo_date=date.fromisoformat(oslo_date),
+            speed=SpeedSums(*timing),
         )
         if override:
             rec.project = override(rec.repo, rec.cwd, rec.project)
@@ -2780,7 +2783,7 @@ def _plan_archive(min_age_days: int) -> tuple[ArchivePlan, float]:
         for rec in kept:
             _fold_archive_row(rows, rec, prefix)
     plan = ArchivePlan(
-        rows=[(*key, *row) for key, row in rows.items()],
+        rows=[(*key, *row[:8], *row[8].as_tuple()) for key, row in rows.items()],
         paths=set(kept_by_path),
         records=n_records,
         held_back=held_back,
@@ -2813,9 +2816,7 @@ def _fold_archive_row(rows: dict[tuple, list], rec: UsageRecord, prefix: str) ->
     t = rec.tokens
     row = rows.get(key)
     if row is None:
-        rows[key] = [ts, ts, t.input, t.output, t.cache_create, t.cache_read,
-                     rec.cost(), rec.count]
-        return
+        row = rows[key] = [ts, ts, 0, 0, 0, 0, 0.0, 0, SpeedSums()]
     row[0] = min(row[0], ts)
     row[1] = max(row[1], ts)
     row[2] += t.input
@@ -2824,6 +2825,10 @@ def _fold_archive_row(rows: dict[tuple, list], rec: UsageRecord, prefix: str) ->
     row[5] += t.cache_read
     row[6] += rec.cost()
     row[7] += rec.count
+    # The live records the archive folds are one call each, deduped already;
+    # an archived synthetic record never comes back through here.
+    if timed_model(rec.model):
+        row[8].add(t.output, rec.req_start, rec.req_end)
 
 
 def cmd_archive(args) -> None:
@@ -2858,6 +2863,140 @@ def cmd_archive(args) -> None:
     console.print(f"Archived. [green]{deleted}[/green] record rows deleted; "
                   f"run [cyan]sqlite3 {cache_db.DB_PATH} 'VACUUM'[/cyan] "
                   "to give the space back.")
+
+
+def _speed_turns(
+    records: list[UsageRecord], since: datetime | None, until: datetime | None,
+) -> list[tuple[str, str, int]]:
+    """The turns of the sessions *records* came from, as (day, model, duration_ms).
+
+    A turn row names a session and no project or account, so the filters reach
+    it through the records: a turn is in when its session is. Deduped on the
+    line's uuid, since a resumed session copies the line into a second log.
+    """
+    sessions = {rec.session_id for rec in records}
+    seen: set[str] = set()
+    out = []
+    for uuid, ts, sid, model, duration_ms in cache_db.load_ccreport_turns(
+        since.timestamp() if since else None, until.timestamp() if until else None,
+    ):
+        if sid not in sessions:
+            continue
+        if uuid:
+            if uuid in seen:
+                continue
+            seen.add(uuid)
+        day = datetime.fromtimestamp(ts, tz=UTC).astimezone().strftime("%Y-%m-%d")
+        out.append((day, model, duration_ms))
+    return out
+
+
+def _speed_entry(period: str, model: str, cell: speed.SpeedBucket) -> dict[str, Any]:
+    """One cell as the --json entry, every figure in seconds or tokens/second."""
+    return {
+        "period": period or None,
+        "model": model,
+        "requests": cell.requests,
+        "turns": len(cell.turns_ms),
+        "estimate": "mean" if cell.archived else "median",
+        "latency_s": cell.latency_mid(),
+        "latency_p90_s": cell.latency_p90(),
+        "turn_s": cell.turn_mid(),
+        "output_tok_s": cell.rate_mid(),
+    }
+
+
+def _fmt_secs(value: float | None) -> str:
+    return _ABSENT if value is None else f"{value:.1f}s"
+
+
+def _speed_table(
+    title: str, label: str, cells: dict[tuple[str, str], speed.SpeedBucket],
+) -> tuple[Table, bool]:
+    """The rows of one fold, newest period first. Returns (table, any_archived)."""
+    table = Table(title=title, title_style="bold", box=box.ROUNDED, expand=False)
+    if label:
+        table.add_column(label, style="white", no_wrap=True)
+    table.add_column("Model", style="magenta", no_wrap=True)
+    table.add_column("Requests", justify="right", no_wrap=True)
+    table.add_column("Latency p50", justify="right", no_wrap=True)
+    table.add_column("p90", justify="right", no_wrap=True)
+    table.add_column("Turn p50", justify="right", no_wrap=True)
+    table.add_column("Tok/s p50", justify="right", no_wrap=True)
+    any_archived = False
+    last_period = None
+    order = sorted(cells, key=lambda k: (k[0], -cells[k].requests, k[1]))
+    if label:
+        order.sort(key=lambda k: k[0], reverse=True)
+    for period, model in order:
+        cell = cells[(period, model)]
+        mark = "†" if cell.archived else ""
+        any_archived = any_archived or cell.archived
+        rate = cell.rate_mid()
+        row = [
+            short_model(model),
+            f"{cell.requests:,}",
+            _fmt_secs(cell.latency_mid()) + mark,
+            _fmt_secs(cell.latency_p90()),
+            _fmt_secs(cell.turn_mid()),
+            (_ABSENT if rate is None else f"{rate:.0f}") + mark,
+        ]
+        if label:
+            # The period once per group, as the daily table names a day once.
+            row.insert(0, period if period != last_period else "")
+            last_period = period
+        table.add_row(*row)
+    return table, any_archived
+
+
+def report_speed(
+    records: list[UsageRecord], turns: list[tuple[str, str, int]], by: str,
+) -> None:
+    """Per-model latency and output rate, by *by* and over the whole range."""
+    def live(cells):
+        return {k: c for k, c in cells.items() if c.requests or c.turns_ms}
+
+    periods = live(speed.fold(records, turns, by))
+    totals = live(speed.fold(records, turns, None))
+    if not totals:
+        console.print("No timed requests found.")
+        return
+    table, archived = _speed_table(f"Speed by {by}", by.capitalize(), periods)
+    _print_report(table)
+    total_table, total_archived = _speed_table("Speed, whole range", "", totals)
+    _print_report(total_table)
+    console.print(
+        "[dim]Latency: the user line a request answered to its last block, so "
+        "queueing and prefill are in it. Turn: prompt to done, tools and "
+        f"permission waits included. Tok/s: replies of {speed.MIN_RATE_OUTPUT_TOKENS}+ "
+        "output tokens only.[/dim]"
+    )
+    if archived or total_archived:
+        console.print(
+            "[dim]† includes archived days, which keep sums and no samples: latency "
+            "is the mean and tok/s is total tokens over total seconds.[/dim]"
+        )
+
+
+def cmd_speed(args) -> None:
+    """How fast each model answered, from the timestamps in the session logs."""
+    since = parse_date(args.since) if args.since else None
+    until = parse_date(args.until) if args.until else None
+    records = load_all_records(
+        since=since, until=until,
+        project_filter=args.project, account_filter=args.account,
+    )
+    turns = _speed_turns(records, since, until)
+    if args.json:
+        entries = [
+            _speed_entry(period, model, cell)
+            for fold_by in (args.by, None)
+            for (period, model), cell in sorted(speed.fold(records, turns, fold_by).items())
+            if cell.requests or cell.turns_ms
+        ]
+        print(json.dumps(entries, indent=2))
+        return
+    report_speed(records, turns, args.by)
 
 
 def cmd_limits(args) -> None:
@@ -2957,6 +3096,7 @@ def main() -> None:
                "  ccreport adopt            # claim pre-capture history\n"
                "  ccreport tiers plans.toml # declare plan changes off the receipts\n"
                "  ccreport limits -w session\n"
+               "  ccreport speed --by month # latency and tok/s per model\n"
                "  ccreport archive --dry-run  # what the purged half folds to\n"
                "  ccreport migrate --dry-run\n"
                "  ccreport --server https://ccreport.example.net monthly\n"
@@ -3116,6 +3256,15 @@ def main() -> None:
                           f"(default: {ARCHIVE_MIN_AGE_DAYS}). The rate-limit "
                           f"history can push the cutoff further back, never nearer")
 
+    psp = sub.add_parser("speed", help="Per-model latency and output tokens/sec")
+    psp.add_argument("--by", choices=speed.PERIODS, default="week",
+                     help="Period to group by (default: week, ISO, Monday start)")
+    psp.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
+    psp.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
+    psp.add_argument("--project", "-p", help="Filter by project name (substring match)")
+    psp.add_argument("--account", "-a", help="Filter by account email (substring match)")
+    psp.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+
     pl = sub.add_parser("limits", help="Rate-limit window utilization history")
     pl.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
     pl.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
@@ -3160,6 +3309,11 @@ def main() -> None:
     # the report it has no use for.
     if args.command == "limits":
         cmd_limits(args)
+        return
+    # The full record path, never the rollups: a rollup row has folded away the
+    # span each call carries. It prints its own tables and none of the others.
+    if args.command == "speed":
+        cmd_speed(args)
         return
     # Writes the cache and prints its own summary; there is no report behind it.
     if args.command == "archive":

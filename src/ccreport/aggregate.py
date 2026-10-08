@@ -20,10 +20,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from types import MappingProxyType
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
 from ccreport.exchange import get_rate, to_oslo_date
 from ccreport.pricing import calc_cost
+
+if TYPE_CHECKING:
+    from ccreport.speed import SpeedSums
 
 UNKNOWN_ACCOUNT = "unknown"
 
@@ -75,6 +78,15 @@ class UsageRecord:
     group, and a local day can straddle two Oslo dates, so the date the group
     was actually rolled up under travels with it. None everywhere else, where
     to_oslo_date(timestamp) is the answer by construction."""
+    req_start: float | None = None
+    """Epoch of the user line this reply answered, per speed.RequestClock.
+    Every line of one reply carries the same pair, so whichever survives the
+    dedup carries the request's span. None where the log could not say."""
+    req_end: float | None = None
+    """Epoch of the reply's last content block."""
+    speed: SpeedSums | None = None
+    """An archive record's folded timing, standing in for the span a single
+    call would carry. None everywhere else."""
     _cost: float | None = field(default=None, repr=False, compare=False)
     """Memo for cost(). Deliberately not cost_usd: that field means 'the log gave
     us this' and is what _serialize_records writes to the SQLite cache, so a

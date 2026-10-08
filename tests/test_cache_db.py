@@ -924,6 +924,8 @@ class TestCcreportRows:
         "dk": "dk1",
         "cost": 0.25,
         "t": [1, 2, 3, 4],
+        "req_start": 0.5,
+        "req_end": 1.5,
     }
     PATH = "/tmp/proj/a.jsonl"
 
@@ -1005,6 +1007,10 @@ class TestCcreportRows:
             len(cache_db._CCR_FIELD_COLS) + i
             for i in range(len(cache_db._CCR_TOKEN_COLS))
         ]
+        timing_at = len(cache_db._CCR_FIELD_COLS) + len(cache_db._CCR_TOKEN_COLS)
+        expected.update({
+            name: timing_at + i for i, name in enumerate(cache_db._CCR_TIMING_COLS)
+        })
         assert record == expected
 
 
@@ -1145,6 +1151,8 @@ class TestCcreportSaltGate:
         "dk": "dk1",
         "cost": 0.25,
         "t": [1, 2, 3, 4],
+        "req_start": None,
+        "req_end": None,
     }
 
     @pytest.fixture
@@ -1540,6 +1548,8 @@ class TestProjectScopeCache:
         "dk": "dk1",
         "cost": 0.25,
         "t": [1, 2, 3, 4],
+        "req_start": None,
+        "req_end": None,
     }
 
     @pytest.fixture

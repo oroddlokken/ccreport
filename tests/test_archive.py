@@ -158,7 +158,7 @@ class TestFoldAndDrop:
         _purge(corpus / "a.jsonl")
         plan, _cutoff = ccr._plan_archive(30)
         assert plan.records == 2
-        assert sum(row[-1] for row in plan.rows) == 1
+        assert sum(row[cache_db._CCR_ARCHIVE_COLS.index("n")] for row in plan.rows) == 1
         deleted = ccr.save_ccreport_archive(plan.rows, plan.paths)
         assert deleted == plan.records
 

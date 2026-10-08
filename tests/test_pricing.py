@@ -2122,13 +2122,13 @@ class TestIncrementalSessionCost:
         from ccreport import pricing
 
         lines: list[bytes] = []
-        real = pricing._line_cost
+        real = pricing._timing_line
 
-        def counting(line, seen_keys):
+        def counting(line):
             lines.append(line)
-            return real(line, seen_keys)
+            return real(line)
 
-        monkeypatch.setattr(pricing, "_line_cost", counting)
+        monkeypatch.setattr(pricing, "_timing_line", counting)
         return lines
 
     def test_an_append_parses_only_the_appended_bytes(self, proj, monkeypatch):

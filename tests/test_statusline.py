@@ -903,7 +903,7 @@ class TestDspVerdictIsMemoized:
         monkeypatch.setattr(sl, "_fetch_dcat", lambda cwd: {})
         monkeypatch.setattr(sl, "_capture_account", lambda memo=None, now=None: None)
         monkeypatch.setattr(sl, "_accumulate_cache_stats", lambda *a: (0, 0, 0))
-        monkeypatch.setattr(sl, "compute_session_usage", lambda *a: (0.0, frozenset()))
+        monkeypatch.setattr(sl, "compute_session_usage", lambda *a: sl.SessionUsage(0.0, frozenset()))
         inp = sl._InputData(
             cwd=str(tmp_path),
             model="Opus",
@@ -1225,7 +1225,7 @@ class TestARenderServesTheStoredProjectSplit:
         monkeypatch.setattr(sl, "_fetch_dcat", lambda cwd: {})
         monkeypatch.setattr(sl, "_capture_account", lambda memo=None, now=None: None)
         monkeypatch.setattr(sl, "_accumulate_cache_stats", lambda *a: (0, 0, 0))
-        monkeypatch.setattr(sl, "compute_session_usage", lambda *a: (0.0, frozenset()))
+        monkeypatch.setattr(sl, "compute_session_usage", lambda *a: sl.SessionUsage(0.0, frozenset()))
         inp = sl._InputData(
             cwd=str(tmp_path),
             model="Opus",
@@ -2094,6 +2094,7 @@ class TestFastCache:
             "usage": {"session_percent": 23, "week_cost": 12.5},
             "chat_cost": 1.25,
             "chat_families": ["fable", "opus"],
+            "last_rate": 87.5,
             "cums": (10, 20, 30),
             "total_in": 42_000,
             "sandbox": "sbx",
@@ -2250,6 +2251,7 @@ class TestCatchUpCacheStats:
             usage={},
             chat_cost=0.0,
             chat_families=[],
+            last_rate=None,
             cums=(1, 2, 3),
             total_in=total_in,
             sandbox="",

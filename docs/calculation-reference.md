@@ -11,6 +11,7 @@
 7. [Shared Pricing Module & Maintenance](#7-shared-pricing-module--maintenance)
 8. [Display & Formatting](#8-display--formatting)
 9. [Account Attribution](#9-account-attribution)
+10. [Request Speed (speed.py)](#10-request-speed)
 
 ---
 
@@ -1651,3 +1652,90 @@ a year ago is unreconstructible once dropped: the live percentages were the only
 source. The ~100 assumes normalized reset times; against the raw floats one
 scoped week reached 80 rows in a day, each a window of its own as far as the gate
 could tell.
+
+---
+
+## 10. Request Speed
+
+`ccreport speed` reports how long each model took to answer. The session log has
+no latency field, so every figure is derived from line timestamps
+(`src/ccreport/speed.py`), and every one is an approximation.
+
+### 10.1 What the log carries
+
+- Each content block of a reply — thinking, text, each tool_use — is its own
+  `assistant` line, stamped when that block **finished**. All lines of one reply
+  share `message.id` and `requestId`, and repeat the reply's `usage`.
+- The request began at the `user` line before the reply's first block: the
+  prompt, or the tool_result it answers.
+- `type: system, subtype: turn_duration` lines carry `durationMs` for a whole
+  turn, prompt to done, tool execution and permission waits included. They name
+  no model.
+
+### 10.2 Per-request span
+
+`speed.RequestClock` walks one file in order. A `user` line sets the pending
+start; the first block of a reply (keyed on its dedup key, else its message id)
+fixes `req_start` to it, and every later block moves `req_end` forward. A start
+stamped after the block is dropped rather than read as a negative span.
+`scan.parse_jsonl` stamps the pair on every line of the reply, so whichever line
+survives the read-time dedup carries it. `<synthetic>` replies are never timed.
+
+| Metric | Formula |
+|---|---|
+| Latency | `req_end - req_start` |
+| Output rate (tok/s) | `output_tokens / latency`, only when `output_tokens >= MIN_RATE_OUTPUT_TOKENS` (100) |
+| Turn | `durationMs / 1000`, attributed to the model of the last reply before the line |
+
+Latency includes queueing and prefill. Because a block is written when it ends,
+there is no true time to first token: a long thinking block hides when output
+began. The 100-token floor applies to the rate alone. Below it the span is mostly
+prefill, and on a 21k-request corpus the per-model median moved by less than 5%
+from 100 up, where with no floor a model that mostly answers with short tool
+calls read at an eighth of its rate.
+
+### 10.3 Storage
+
+- `ccreport_records.req_start` / `req_end`, NULL where the log could not say.
+  Cache migration step 16 adds the columns, and the `scan._script_hash` change
+  re-parses every live file. Records whose log is already gone keep NULL.
+- `ccreport_turns` holds one row per turn line, keyed to its file and cascading
+  with it. Archiving a file leaves its turns alone, so turn medians survive an
+  archive. A resumed session copies the line into a second log, and the report
+  dedups on the line's `uuid`.
+- `ccreport_archive` gains `timed_n`, `latency_s`, `rate_output` and `rate_s`
+  (`speed.SpeedSums`). A median cannot be folded, so a day keeps sums. Rows
+  folded before the columns existed read 0, which means untimed.
+
+### 10.4 Report
+
+`speed.fold` keys cells on (period, model). Periods are the local day, the ISO
+week (Monday start, `YYYY-Www`) and the month, plus a whole-range fold. Each cell
+shows timed request count, median and p90 latency, median turn and median
+output rate. A cell that includes any archived day reports means for the whole
+cell, marked `†`: latency `Σlatency_s / Σtimed_n`, rate `Σrate_output / Σrate_s`.
+Because sums add, a week of archived days weights each day by its requests
+rather than averaging daily means. p90 is absent there.
+
+The report reads the full record path, never the rollups, and takes the usual
+`--since`, `--until`, `--project` and `--account`. A turn row names a session
+but no project, so the filters reach turns through their session: a turn is
+included when any kept record shares its session id. `--json` prints one entry
+per cell, then one per model for the whole range (`period: null`), with
+`estimate` saying `median` or `mean`. The report is local only. Nothing is
+pushed, so `protocol.PROTOCOL_VERSION` is untouched. Sending speed to the server
+would add a payload field and need a bump.
+
+### 10.5 Status line
+
+`CLAUDE_STATUSLINE_TOK_S=1` (default off) adds `N tok/s` to the session segment:
+the output rate of the session's newest finished reply that clears the 100-token
+floor, across the main log and its subagent logs. `pricing._scan_session_file`
+already reads the session incrementally for its cost, and it now also feeds each
+reply line, user line and turn end to a per-file `speed.ReplyTracker`. That
+tracker applies RequestClock's rule a line at a time and is stored in the file's
+cursor, so a reply that spans two renders is rated whole. A reply counts as
+finished when the next reply starts or a turn ends, because until then a later
+block can still move its end. The value travels in `_Fetched.last_rate`
+(`_FAST_CACHE_SCHEMA` 9), and `_SESSION_STATE_VERSION` 4 makes stored session
+states reparse once. No render reads the record cache for it.

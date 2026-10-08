@@ -79,8 +79,13 @@ one rule.
 `forecast.py` projects spend to a ceiling. It is pure and stdlib-light, because
 `ccu` and the status line read it.
 
-`scan.py` reads the JSONL logs into `ccreport_files` and `ccreport_records` and
-is the only writer of either. It imports no rich, because the push refreshes
+`speed.py` derives a request's span from log timestamps — the user line it
+answered to its last block — for `ccreport speed`. It imports nothing from
+ccreport, because scan.py stamps the span at parse time and the status line
+reads the same derivation.
+
+`scan.py` reads the JSONL logs into `ccreport_files`, `ccreport_records` and
+`ccreport_turns` and is the only writer of any of them. It imports no rich, because the push refreshes
 that cache before it sends and the CLI is not always what runs first.
 
 `pricing.py`, `cache_db.py`, `exchange.py`, `aggregate.py`,

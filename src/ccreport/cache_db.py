@@ -16,7 +16,7 @@ import os
 import sqlite3
 import sys
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, date, datetime
 from itertools import groupby
@@ -197,7 +197,28 @@ CREATE TABLE IF NOT EXISTS ccreport_records (
     input_tokens  INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
     cache_create  INTEGER NOT NULL,
-    cache_read    INTEGER NOT NULL
+    cache_read    INTEGER NOT NULL,
+    -- The request's span, per speed.RequestClock: the user line it answered to
+    -- its last content block, epoch seconds. Every line of one reply carries
+    -- the same pair. NULL where the log could not say, and on every row parsed
+    -- before the columns arrived whose log is gone.
+    req_start     REAL,
+    req_end       REAL
+);
+
+-- One row per `turn_duration` line: a whole turn, prompt to done, tool runs and
+-- permission waits included. A table of its own rather than a column, because
+-- a turn is not an API call and has no record to ride on. Written by scan.py
+-- alone, beside the file's records and cascading away with them; archiving a
+-- file deletes its records and leaves these, since a few thousand rows is the
+-- whole corpus of them and a median of turns survives that way.
+CREATE TABLE IF NOT EXISTS ccreport_turns (
+    file_id     INTEGER NOT NULL REFERENCES ccreport_files(id) ON DELETE CASCADE,
+    uuid        TEXT,
+    ts          REAL NOT NULL,
+    sid         TEXT NOT NULL,
+    model       TEXT NOT NULL,   -- the last reply's before the line; it names none
+    duration_ms INTEGER NOT NULL
 );
 
 -- Per-day aggregates of the records ccreport has already read, for the days
@@ -291,6 +312,13 @@ CREATE TABLE IF NOT EXISTS ccreport_archive (
     cache_read    INTEGER NOT NULL,
     cost          REAL NOT NULL,
     n             INTEGER NOT NULL,
+    -- speed.SpeedSums: a median cannot be folded, so a day keeps the sums its
+    -- means come back out of. Zero on a row folded before the columns arrived,
+    -- which reads as a day with no timing rather than a fast one.
+    timed_n       INTEGER NOT NULL DEFAULT 0,
+    latency_s     REAL    NOT NULL DEFAULT 0,
+    rate_output   INTEGER NOT NULL DEFAULT 0,
+    rate_s        REAL    NOT NULL DEFAULT 0,
     PRIMARY KEY (day, oslo_date, sid, project, model, cwd, repo, dir_prefix)
 ) WITHOUT ROWID;
 
@@ -488,6 +516,8 @@ _INDEX_SQL = """\
 -- bounding file_id.
 CREATE INDEX IF NOT EXISTS idx_ccr_file_ts ON ccreport_records(file_id, ts);
 CREATE INDEX IF NOT EXISTS idx_ccr_sid ON ccreport_records(sid);
+-- What the cascade from ccreport_files looks a file's turns up by.
+CREATE INDEX IF NOT EXISTS idx_ccturn_file ON ccreport_turns(file_id);
 """
 """Indexes, run after the migration chain rather than with the tables.
 
@@ -1108,11 +1138,34 @@ def _migrate_account_source(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_request_timing(conn: sqlite3.Connection) -> None:
+    """Add the request span to ccreport_records and the speed sums to the archive.
+
+    ccreport_turns arrives through the script this step's version re-runs. The
+    record columns fill on the re-parse that scan._script_hash already forces;
+    a record whose log is gone keeps NULL, and an archived day keeps zeros.
+    """
+    records = _table_columns(conn, "ccreport_records")
+    for col in ("req_start", "req_end"):
+        if col not in records:
+            conn.execute(f"ALTER TABLE ccreport_records ADD COLUMN {col} REAL")
+    archive = _table_columns(conn, "ccreport_archive")
+    for col, col_type in (
+        ("timed_n", "INTEGER"), ("latency_s", "REAL"),
+        ("rate_output", "INTEGER"), ("rate_s", "REAL"),
+    ):
+        if col not in archive:
+            conn.execute(
+                f"ALTER TABLE ccreport_archive ADD COLUMN {col} {col_type} NOT NULL DEFAULT 0"
+            )
+
+
 MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(12, "ccreport_records_file_id", _migrate_records_file_id),
     migrations.Step(13, "ccreport_archive", _migrate_files_archived),
     migrations.Step(14, "remote_costs"),
     migrations.Step(15, "account_events.source", _migrate_account_source),
+    migrations.Step(16, "request_timing", _migrate_request_timing),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 
@@ -2480,7 +2533,10 @@ _CCR_FIELD_COLS = (
     "mid", "model", "ts", "sid", "project", "cwd", "repo", "dk", "cost",
 )
 _CCR_TOKEN_COLS = ("input_tokens", "output_tokens", "cache_create", "cache_read")
-_CCR_COLS = (*_CCR_FIELD_COLS, *_CCR_TOKEN_COLS)
+# After the tokens rather than among the fields, so the positions
+# _group_by_file reads the tokens at did not move when these arrived.
+_CCR_TIMING_COLS = ("req_start", "req_end")
+_CCR_COLS = (*_CCR_FIELD_COLS, *_CCR_TOKEN_COLS, *_CCR_TIMING_COLS)
 
 # What the readers interpolate. Every loader joins ccreport_files back in and
 # leads its row with that table's path, which _group_by_file then strips off;
@@ -2500,6 +2556,7 @@ def _ccr_record_to_row(file_id: int, rec: dict) -> tuple:
         file_id,
         *(rec.get(name) for name in _CCR_FIELD_COLS),
         *rec["t"][:len(_CCR_TOKEN_COLS)],
+        *(rec.get(name) for name in _CCR_TIMING_COLS),
     )
 
 
@@ -2522,6 +2579,7 @@ def _group_by_file(rows: list[tuple]) -> dict[str, list[dict]]:
             "mid": row[1], "model": row[2], "ts": row[3], "sid": row[4],
             "project": row[5], "cwd": row[6], "repo": row[7], "dk": row[8],
             "cost": row[9], "t": [row[10], row[11], row[12], row[13]],
+            "req_start": row[14], "req_end": row[15],
         })
     return grouped
 
@@ -2719,6 +2777,29 @@ def load_ccreport_records_in_range(
         f"{where}ORDER BY r.id",
         params,
     ).fetchall())
+
+
+def load_ccreport_turns(
+    since_ts: float | None, until_ts: float | None,
+) -> list[tuple[str | None, float, str, str, int]]:
+    """Turn durations inside an inclusive timestamp window, oldest first.
+
+    Tuples of (uuid, ts, sid, model, duration_ms), the scan.Turn order. A turn a
+    resumed session copied into a second log comes back once per log; the
+    caller dedups on uuid, as it dedups records on their key.
+    """
+    conn = get_connection()
+    if not _ccreport_readable(conn):
+        return []
+    bounds = [("ts >= ?", since_ts), ("ts <= ?", until_ts)]
+    clauses = [sql for sql, value in bounds if value is not None]
+    params = tuple(value for _sql, value in bounds if value is not None)
+    where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+    return conn.execute(
+        "SELECT uuid, ts, sid, model, duration_ms FROM ccreport_turns "  # noqa: S608
+        f"{where}ORDER BY ts",
+        params,
+    ).fetchall()
 
 
 # The fingerprint the ccreport_orphan_costs rows were summed under.
@@ -3008,8 +3089,16 @@ def _save_invalidates_scopes(
     return False
 
 
-def save_ccreport_files(entries: list[tuple[str, int, int, list[dict]]]) -> None:
+def save_ccreport_files(
+    entries: list[tuple[str, int, int, list[dict]]],
+    *,
+    turns: Mapping[str, Sequence[tuple]] | None = None,
+) -> None:
     """Save/replace several (path, mtime_ns, size, records) entries at once.
+
+    *turns* maps a path among *entries* to its scan.Turn tuples. A file it does
+    not name is saved with none: the DELETE below cascades the old ones away
+    either way, so leaving a path out says the file has no turns now.
 
     One transaction for the whole batch. A full rebuild re-parses every file
     in the corpus, and committing per file made that thousands of WAL
@@ -3055,6 +3144,18 @@ def save_ccreport_files(entries: list[tuple[str, int, int, list[dict]]]) -> None
                 f"INSERT INTO ccreport_records ({_CCR_INSERT_COLS}) "  # noqa: S608
                 f"VALUES ({_CCR_INSERT_PLACEHOLDERS})",
                 rows,
+            )
+        turn_rows = [
+            (file_ids[path], *turn)
+            for path, file_turns in (turns or {}).items()
+            if path in file_ids
+            for turn in file_turns
+        ]
+        if turn_rows:
+            conn.executemany(
+                "INSERT INTO ccreport_turns (file_id, uuid, ts, sid, model, duration_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                turn_rows,
             )
         if scopes_stale:
             _clear_project_scopes(conn)
@@ -3164,13 +3265,14 @@ def save_ccreport_rollups(rows: list[tuple], fingerprint: str) -> None:
 
 
 # The archive columns, in table order: the eight-part key, the timestamp span,
-# the four token sums, then cost and record count. Both the SELECT and the
+# the four token sums, cost and record count, then the speed.SpeedSums four. Both the SELECT and the
 # INSERT are built from this.
 _CCR_ARCHIVE_COLS = (
     "day", "oslo_date", "sid", "project", "model", "cwd", "repo", "dir_prefix",
     "min_ts", "max_ts",
     "input_tokens", "output_tokens", "cache_create", "cache_read",
     "cost", "n",
+    "timed_n", "latency_s", "rate_output", "rate_s",
 )
 _CCR_ARCHIVE_SELECT = ", ".join(_CCR_ARCHIVE_COLS)
 _CCR_ARCHIVE_PLACEHOLDERS = ", ".join("?" * len(_CCR_ARCHIVE_COLS))

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`ccreport speed` shows how fast each model answered.** For each model, by day, ISO week or month (`--by`, default week) and over the whole range, it shows the request count, median and p90 latency, median turn time and median output tok/s. It takes `--since`, `--until`, `--project`, `--account` and `--json`. The session log has no latency field, so a request is timed from the user line it answered to the last block of its reply. That span includes queueing and prefill, and tok/s counts only replies of 100+ output tokens. Days folded by `ccreport archive` keep sums rather than samples, so a cell that includes one shows means instead of medians and is marked `†`. The cache migrates and re-parses the logs once.
+- **`CLAUDE_STATUSLINE_TOK_S=1` adds the session's latest output rate to the status line.** It shows the tok/s of the newest finished reply of 100+ tokens, subagent logs included. The value comes from the incremental read the status line already does for the session cost. It is off by default.
+
 ## 0.1.5 (2026-10-08)
 
 ### Fixed

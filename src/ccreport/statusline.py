@@ -36,6 +36,8 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
   CLAUDE_STATUSLINE_SESSION                 — model, context window %
     CLAUDE_STATUSLINE_COST                  — session cost
     CLAUDE_STATUSLINE_CACHE_HIT             — cache hit rate % (default 0)
+    CLAUDE_STATUSLINE_TOK_S                 — output tok/s of the session's last
+                                              finished reply of 100+ tokens (default 0)
     CLAUDE_STATUSLINE_EFFORT                — reasoning effort level, as Extra; folded
                                               into MODEL_BANNER when that is on
     CLAUDE_STATUSLINE_THINKING              — nothink marker when thinking is off
@@ -125,6 +127,7 @@ from ccreport.pricing import (
     ROLLING_WINDOWS,
     SESSION_WINDOW_S,
     WEEK_WINDOW_S,
+    SessionUsage,
     compute_costs,
     compute_session_usage,
     model_family,
@@ -2250,6 +2253,7 @@ def _render_session(
     cum_create: int,
     cum_read: int,
     session_cost: str,
+    last_rate: float | None = None,
 ) -> str:
     if not _on("SESSION"):
         return ""
@@ -2277,6 +2281,10 @@ def _render_session(
                 parts.append(f"\033[0;90m${fmt}\033[0m")
         except ValueError:
             pass
+
+    # The last finished reply's output rate (dynamic, like the cost)
+    if _on("TOK_S", default=False) and last_rate is not None:
+        parts.append(f"\033[0;90m{last_rate:.0f} tok/s\033[0m")
 
     # Cumulative cache hit rate (structural)
     if _on("CACHE_HIT", default=False):
@@ -2542,6 +2550,7 @@ class _Fetched(NamedTuple):
     usage: dict            # post cost-merge, pre native-S/W merge — native comes from stdin
     chat_cost: float
     chat_families: list[str]  # model families this session logged, subagents included
+    last_rate: float | None   # output tok/s of the session's newest finished reply
     cums: tuple[int, int, int]
     total_in: int          # the change key fetched.cums was accumulated at
     sandbox: str           # rendered badge — three settings files to resolve it
@@ -2551,7 +2560,7 @@ class _Fetched(NamedTuple):
 
 # Cache-file layout guard: bump when _Fetched gains, loses or retypes a field,
 # so a render never rebuilds a NamedTuple from a stale shape.
-_FAST_CACHE_SCHEMA = 8
+_FAST_CACHE_SCHEMA = 9
 
 
 def _session_state_path(session_id: str, suffix: str = "") -> Path:
@@ -2643,6 +2652,7 @@ def _load_fetched(session_id: str, cwd: str, now: float) -> tuple[_Fetched, floa
             usage=f["usage"],
             chat_cost=f["chat_cost"],
             chat_families=list(f["chat_families"]),
+            last_rate=f["last_rate"],
             cums=tuple(f["cums"]),
             total_in=f["total_in"],
             sandbox=f["sandbox"],
@@ -2678,6 +2688,7 @@ def _save_fetched(session_id: str, cwd: str, ts: float, fetched: _Fetched) -> No
                 "usage": fetched.usage,
                 "chat_cost": fetched.chat_cost,
                 "chat_families": fetched.chat_families,
+                "last_rate": fetched.last_rate,
                 "cums": list(fetched.cums),
                 "total_in": fetched.total_in,
                 "sandbox": fetched.sandbox,
@@ -2799,9 +2810,9 @@ def _fetch_all(
         except sqlite3.OperationalError:
             cums = (0, 0, 0)
         try:
-            chat_cost_val, chat_families = compute_session_usage(inp.session_id, inp.cwd)
+            chat_usage = compute_session_usage(inp.session_id, inp.cwd)
         except sqlite3.OperationalError:
-            chat_cost_val, chat_families = 0.0, frozenset()
+            chat_usage = SessionUsage(0.0, frozenset())
 
         # Collect subprocess results
         git = _collect_git(git_procs)
@@ -2826,11 +2837,11 @@ def _fetch_all(
     # finds nothing and the segment vanishes mid-session. Retry at the repo root
     # before concluding the cost is really zero. This is the one part of the
     # cost that needs git, so it is all that waits for the join.
-    if not chat_cost_val and git.toplevel and git.toplevel != inp.cwd:
+    if not chat_usage.cost and git.toplevel and git.toplevel != inp.cwd:
         try:
-            chat_cost_val, chat_families = compute_session_usage(inp.session_id, git.toplevel)
+            chat_usage = compute_session_usage(inp.session_id, git.toplevel)
         except sqlite3.OperationalError:
-            chat_cost_val, chat_families = 0.0, frozenset()
+            chat_usage = SessionUsage(0.0, frozenset())
 
     if memo != memo_before:
         _save_memo(inp.session_id, memo)
@@ -2841,8 +2852,9 @@ def _fetch_all(
         dsp=dsp_active,
         dcat=dcat_data,
         usage=usage_data,
-        chat_cost=chat_cost_val,
-        chat_families=sorted(chat_families),
+        chat_cost=chat_usage.cost,
+        chat_families=sorted(chat_usage.families),
+        last_rate=chat_usage.last_rate,
         cums=cums,
         total_in=inp.total_in,
         sandbox=_render_sandbox(inp.cwd, git.toplevel),
@@ -2953,7 +2965,7 @@ def main() -> None:
     used_tokens = _used_tokens(inp.used, inp.ctx_size, inp.total_in)
     session = _render_session(
         inp.model, inp.effort, inp.thinking_off, used_tokens, inp.ctx_size,
-        cum_fresh, cum_create, cum_read, chat_cost,
+        cum_fresh, cum_create, cum_read, chat_cost, fetched.last_rate,
     )
     # ctx% glues onto the token counts it summarizes; stays independent of
     # SESSION, and with SESSION off there are no counts, so it carries a label
