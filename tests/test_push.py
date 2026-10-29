@@ -201,7 +201,7 @@ class TestCacheRefresh:
         def locked():
             raise sqlite3.OperationalError("database is locked")
 
-        monkeypatch.setattr(scan, "refresh_cache", locked)
+        monkeypatch.setattr(scan, "discover_jsonl_files", locked)
         sent = self._sent(monkeypatch)
         _cached_file()
         push.run_once(config_path=_write_config(tmp_path), force=True)

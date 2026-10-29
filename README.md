@@ -216,6 +216,15 @@ ccreport --tool codex --json                # local calls, including reasoning m
 ccreport limits -w session                  # rate-limit window history
 ```
 
+Interactive local reports show a temporary status while updating logs. When
+the last index is unknown or at least a day old, a matching saved report appears
+with its date, followed by the updated report. Warm runs, JSON and pipes show
+only the final report. The saved report (`report-preview.json`) and startup
+timings (`startup-timings.json`) live beside `cache.db`, normally in
+`~/.local/share/ccreport/`. `ccreport --debug` also prints timings to stderr;
+see the [calculation reference](docs/calculation-reference.md#13-interactive-report-startup-and-diagnostics)
+for details.
+
 Costs are priced per record from a pricing table in `src/ccreport/pricing.py`,
 deduplicated by the log's own `message.id`/`requestId`, and grouped into
 projects by git remote, then repo-root path, then directory name. A rename the

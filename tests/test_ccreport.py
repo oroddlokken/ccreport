@@ -421,7 +421,7 @@ def test_the_script_hash_is_memoized():
 
 
 class TestSaveBatching:
-    """A full re-parse commits per batch, not per file."""
+    """File rows commit per batch; completed scans get one metadata transaction."""
 
     def _commits(self, conn):
         seen: list[str] = []
@@ -437,20 +437,20 @@ class TestSaveBatching:
                 ids=[f"msg-{i}"],
             )
 
-    def test_a_whole_corpus_under_one_batch_commits_once(self, loader):
+    def test_a_whole_corpus_under_one_batch_plus_scan_stamp(self, loader):
         self._corpus(loader, 12)
         commits = self._commits(cache_db.get_connection())
         assert len(ccr.load_all_records()) == 12
-        assert commits() == 1
+        assert commits() == 2  # one file batch and the completed-scan stamp
 
     def test_the_batch_size_bounds_each_transaction(self, loader, monkeypatch):
         monkeypatch.setattr(scan, "_SAVE_BATCH", 5)
         self._corpus(loader, 12)
         commits = self._commits(cache_db.get_connection())
         ccr.load_all_records()
-        assert commits() == 3  # 5 + 5 + the trailing 2
+        assert commits() == 4  # 5 + 5 + the trailing 2, then the scan stamp
 
-    def test_batching_caches_every_file_and_then_writes_nothing(
+    def test_batching_caches_every_file_and_then_only_stamps_scan(
         self, loader, monkeypatch
     ):
         monkeypatch.setattr(scan, "_SAVE_BATCH", 5)
@@ -460,9 +460,16 @@ class TestSaveBatching:
         assert len(file_meta) == 12
         assert sum(len(v) for v in by_file.values()) == 12
 
-        commits = self._commits(cache_db.get_connection())
+        seen: list[str] = []
+        cache_db.get_connection().set_trace_callback(seen.append)
         assert len(ccr.load_all_records()) == 12
-        assert commits() == 0, "an all-hit run must not write"
+        writes = [sql for sql in seen if sql.startswith(("INSERT", "UPDATE", "DELETE"))]
+        # Previously an all-hit report wrote nothing. Its one meta commit now
+        # dates completed indexing (also on detached pushes); file/record rows
+        # must still stay untouched on cache hits.
+        assert len(writes) == 1, "an all-hit run writes only its completion timestamp"
+        assert "ccreport_indexed_at" in writes[0]
+        assert sum(sql == "COMMIT" for sql in seen) == 1
 
 
 class _FlakyFile:

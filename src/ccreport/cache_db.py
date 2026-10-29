@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -2561,6 +2562,28 @@ def init_ccreport_meta(version: int, script_hash: str) -> None:
     _set_meta(conn, "ccreport_version", str(version))
     _set_meta(conn, "ccreport_script_hash", script_hash)
     _set_meta(conn, "ccreport_schema_salt", CACHE_SCHEMA_SALT)
+    conn.commit()
+
+
+def read_ccreport_indexed_at() -> float | None:
+    """Completion time of the latest scan, shared by reports and detached pushes."""
+    raw = _get_meta(get_connection(), "ccreport_indexed_at")
+    try:
+        stamp = float(raw) if raw is not None else None
+    except ValueError:
+        return None
+    return stamp if stamp is not None and math.isfinite(stamp) and stamp > 0 else None
+
+
+def record_ccreport_indexed_at(when: float) -> None:
+    """Stamp a completed scan without letting overlapping writers move time back."""
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('ccreport_indexed_at', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value "
+        "WHERE CAST(excluded.value AS REAL) > CAST(meta.value AS REAL)",
+        (str(when),),
+    )
     conn.commit()
 
 

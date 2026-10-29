@@ -2026,3 +2026,54 @@ multiple parts, fallback usage, forked history, child sessions, legacy/SQLite
 overlap, metadata fingerprints, malformed data, unsupported V2 and the absence
 of credential/account reads. Integration tests cover the shared cache and
 report pipeline separately.
+
+## 13. Interactive report startup and diagnostics
+
+A local terminal report shows a transient status while logs and exchange rates
+load. It looks for a saved rendering in `report-preview.json` beside `cache.db`
+only when the last completed index is unknown or at least 24 hours old
+(`startup.PREVIEW_STALE_AFTER_S`). Warm runs print a single report. When a
+snapshot is shown, the final report is labelled **Updated report**; otherwise
+it prints normally. The status disappears before the final report is rendered.
+A snapshot matches only
+the same CLI options (excluding `--debug`), enabled sources, installed package
+version, configuration file contents and terminal width.
+It is labelled cached with its save time and remains in scrollback while the
+normal refresh runs. Missing, corrupt, incompatible or differently scoped
+snapshots are ignored. JSON and non-terminal stdout skip both preview and
+snapshot writes. Terminal detection uses `sys.stdout.isatty()`, so `FORCE_COLOR`
+does not enable preview output in a pipe.
+
+The normal renderer emits its updated tables while Rich records that output;
+the plain text is saved only after the complete rendering succeeds. This adds
+no second database load, deduplication or aggregation. There is one snapshot,
+limited to 1 MiB, atomically replaced with mode 0600. A larger report removes
+an older snapshot rather than leaving it as the last successful rendering.
+A dated snapshot can be stale; it retains the prior exchange rates, account
+attribution and project names until refresh completes. It is not used to
+calculate any new total. The first run after upgrading has no snapshot.
+
+`startup.ReportRun` atomically replaces `startup-timings.json` beside the
+client database. It records the latest local report's phase durations, counts,
+active phase stack and status; writes are best effort. Nested durations overlap,
+and exchange-rate prefetch overlaps corpus loading. Discovery, cache
+validation, changed-file parsing, record loading/rollups, rollup construction,
+exchange-rate wait/loading and rendering are measured separately. The shared
+`meta.ccreport_indexed_at` timestamp is written by `_load_full`,
+`_load_with_rollups` and `push.refresh_cache` after `_refresh_changed_files`
+returns, provided no file was unreadable. A rollup rebuild passes its refresh
+result into `_load_full`, so it stamps only once. The scanner source stays
+unchanged to preserve its parse fingerprint across this feature's upgrade.
+Even an all-hit report or push commits this one metadata write; cached files
+and records are untouched. A single SQLite upsert keeps the later completion
+time when processes overlap.
+Failed or cancelled scans leave the previous value intact. The age message
+reads this key after printing initial feedback; it never derives age from
+log mtimes or the diagnostic JSON. An empty but successfully indexed corpus
+still records a completed diagnostic run, while the CLI returns exit status 1.
+
+Both the saved report and diagnostic JSON use explicit UTF-8 encoding. A phase
+is marked stopped only when an exception leaves that phase; an outer exception
+already under handling does not mark a successful phase as stopped. Until the
+first completed scan, the index time is unknown. `--debug` echoes durations to
+stderr.

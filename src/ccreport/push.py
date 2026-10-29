@@ -1325,10 +1325,17 @@ def refresh_cache() -> None:
     A database another process holds costs this run its fresh records, not its
     push: what is already cached still goes out.
     """
-    from ccreport import scan
+    from ccreport import cache_db, scan
+    from ccreport.scan import _ensure_cache_valid, _refresh_changed_files
 
     try:
-        scan.refresh_cache()
+        # Keep completion metadata outside scan.py: its source is part of the
+        # parse fingerprint, so changing it would re-parse every existing log.
+        files = scan.discover_jsonl_files()
+        _ensure_cache_valid({str(p) for p in files})
+        _, unreadable = _refresh_changed_files(files, cache_db.load_ccreport_file_meta())
+        if not unreadable:
+            cache_db.record_ccreport_indexed_at(time.time())
     except sqlite3.Error:
         pass
 

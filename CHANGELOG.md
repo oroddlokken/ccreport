@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Local reports show progress while updating logs and a dated saved report after a day without indexing.** Warm runs keep a single report; JSON and pipes stay clean. Startup timings are saved beside the cache, and `--debug` prints them to stderr.
+
 ### Development
 
 - **Dependencies move to latest: fastapi 0.143.5, orjson 3.13.0, ruff 0.17.1 and pyright 1.1.414.**
