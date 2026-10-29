@@ -58,6 +58,18 @@ def test_saved_preview_never_opens_database_or_logs(monkeypatch):
     assert "SPEND 1.0 [project] :smile:" in output.getvalue()
 
 
+def test_saved_preview_heading_is_one_bold_run(monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(ccr, "console", Console(file=output, force_terminal=True, color_system="standard"))
+    args = argparse.Namespace(command=None, tool=None, all=False, debug=False)
+    startup.save_preview(ccr._preview_options(args), "SPEND 1.0\n")
+    ccr._show_saved_report(args)
+    heading = output.getvalue().splitlines()[1]
+    # The highlighter would split the date and time into coloured runs of their own.
+    assert heading.count("\x1b[") == 2
+    assert heading.startswith("\x1b[1mCached report (saved ")
+
+
 @pytest.mark.parametrize("interactive", [True, False])
 @pytest.mark.parametrize("as_json", [True, False])
 @pytest.mark.parametrize("index_age", [None, 0, 86399, 86400, 7 * 86400])

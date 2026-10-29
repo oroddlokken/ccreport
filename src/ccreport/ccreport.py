@@ -3661,7 +3661,8 @@ def _show_saved_report(args: argparse.Namespace) -> bool:
         return False
     text, stamp = saved
     when = datetime.fromtimestamp(stamp).astimezone().strftime("%Y-%m-%d %H:%M")
-    console.print(f"\n[bold]Cached report (saved {when}; awaiting updated information)[/bold]")
+    console.print(f"\n[bold]Cached report (saved {when}; awaiting updated information)[/bold]",
+                  highlight=False)
     # Already laid out at this width. Avoid interpreting project names as
     # markup or turning URLs into links a second time.
     console.print(text, end="", markup=False, highlight=False, emoji=False, soft_wrap=True)
