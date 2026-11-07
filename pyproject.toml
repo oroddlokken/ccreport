@@ -267,6 +267,11 @@ exclude_lines = [
 
 [tool.py-project-template]
 commit = "d042c03cf3a980d7c59e220f8dff40b58a429c23"
+project_name = "ccreport"
+project_name_lowercase = "ccreport"
+systems = [
+    "base",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
