@@ -210,7 +210,12 @@ CREATE TABLE IF NOT EXISTS ccreport_records (
     thread_id     TEXT,
     reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
     provider      TEXT,
-    reported_cost_usd REAL
+    reported_cost_usd REAL,
+    -- What calc_cost reads beyond the four counts: the 1-hour share of
+    -- cache_create and whether the call ran in fast mode. Zero on a row whose
+    -- log is gone and was parsed before the columns arrived.
+    cache_create_1h INTEGER NOT NULL DEFAULT 0,
+    fast          INTEGER NOT NULL DEFAULT 0
 );
 
 -- One row per `turn_duration` line: a whole turn, prompt to done, tool runs and
@@ -333,7 +338,13 @@ CREATE TABLE IF NOT EXISTS ccreport_archive (
     latency_s     REAL    NOT NULL DEFAULT 0,
     rate_output   INTEGER NOT NULL DEFAULT 0,
     rate_s        REAL    NOT NULL DEFAULT 0,
-    PRIMARY KEY (day, oslo_date, sid, project, model, cwd, repo, dir_prefix)
+    -- The 1-hour share of cache_create, and fast mode as part of the key so a
+    -- day keeps its fast and standard calls apart. cost is already priced
+    -- with both, and a row folded before the columns arrived reads as standard.
+    -- No semicolon in a comment here: step 19 cuts this table's DDL at one.
+    cache_create_1h INTEGER NOT NULL DEFAULT 0,
+    fast          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, oslo_date, sid, project, model, cwd, repo, dir_prefix, fast)
 ) WITHOUT ROWID;
 
 -- Manual project-grouping rules, applied as a pure function over the signals
@@ -588,7 +599,7 @@ _ADDED_COLUMNS: list[tuple[str, str, str]] = [
 # or loses a field, and when the rule that priced one changes: a row from before
 # either still matches on mtime and size, so nothing else would ever make it
 # re-scan, and it reads back as a total rather than as an error.
-_COST_ENTRY_SCHEMA = "5"
+_COST_ENTRY_SCHEMA = "6"
 
 
 def _add_column(
@@ -1203,6 +1214,39 @@ def _migrate_opencode_records(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM meta WHERE key = 'ccreport_rollup_fp'")
 
 
+# The archive columns as they stood at step 18, for the step 19 rebuild to copy.
+# Written out for the reason _V12_RECORD_COLS is.
+_V18_ARCHIVE_COLS = (
+    "day", "oslo_date", "sid", "project", "model", "cwd", "repo", "dir_prefix",
+    "min_ts", "max_ts", "input_tokens", "output_tokens", "cache_create", "cache_read",
+    "cost", "n", "timed_n", "latency_s", "rate_output", "rate_s",
+)
+
+
+def _migrate_fast_and_1h_writes(conn: sqlite3.Connection) -> None:
+    """Add fast mode and the 1-hour cache-write count to records and archive.
+
+    The record columns fill on the re-parse scan._script_hash forces. The
+    archive gains `fast` in its primary key, which a WITHOUT ROWID table cannot
+    take by ALTER, so it is rebuilt: every existing row copies across as
+    standard, which is all a row folded before the field existed can say.
+    """
+    for name in ("cache_create_1h", "fast"):
+        if name not in _table_columns(conn, "ccreport_records"):
+            conn.execute(f"ALTER TABLE ccreport_records ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
+    if "fast" in _table_columns(conn, "ccreport_archive"):
+        return
+    conn.execute("ALTER TABLE ccreport_archive RENAME TO ccreport_archive_v18")
+    start = _SCHEMA_SQL.index("CREATE TABLE IF NOT EXISTS ccreport_archive (")
+    end = _SCHEMA_SQL.index(";", start) + 1
+    conn.execute(_SCHEMA_SQL[start:end])
+    cols = ", ".join(_V18_ARCHIVE_COLS)
+    conn.execute(
+        f"INSERT INTO ccreport_archive ({cols}) SELECT {cols} FROM ccreport_archive_v18"  # noqa: S608
+    )
+    conn.execute("DROP TABLE ccreport_archive_v18")
+
+
 MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(12, "ccreport_records_file_id", _migrate_records_file_id),
     migrations.Step(13, "ccreport_archive", _migrate_files_archived),
@@ -1211,6 +1255,7 @@ MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(16, "request_timing", _migrate_request_timing),
     migrations.Step(17, "codex_records", _migrate_codex_records),
     migrations.Step(18, "opencode_records", _migrate_opencode_records),
+    migrations.Step(19, "fast_and_1h_writes", _migrate_fast_and_1h_writes),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 
@@ -2606,7 +2651,10 @@ _CCR_TOKEN_COLS = ("input_tokens", "output_tokens", "cache_create", "cache_read"
 # _group_by_file reads the tokens at did not move when these arrived.
 _CCR_TIMING_COLS = ("req_start", "req_end")
 _CCR_PROVIDER_COLS = ("provider", "reported_cost_usd")
-_CCR_COLS = (*_CCR_FIELD_COLS, *_CCR_TOKEN_COLS, *_CCR_TIMING_COLS, *_CCR_PROVIDER_COLS)
+_CCR_PRICING_COLS = ("cache_create_1h", "fast")
+_CCR_COLS = (
+    *_CCR_FIELD_COLS, *_CCR_TOKEN_COLS, *_CCR_TIMING_COLS, *_CCR_PROVIDER_COLS, *_CCR_PRICING_COLS,
+)
 
 # What the readers interpolate. Every loader joins ccreport_files back in and
 # leads its row with that table's path, which _group_by_file then strips off;
@@ -2628,6 +2676,7 @@ def _ccr_record_to_row(file_id: int, rec: dict) -> tuple:
           for name in _CCR_FIELD_COLS),
         *rec["t"][:len(_CCR_TOKEN_COLS)],
         *(rec.get(name) for name in (*_CCR_TIMING_COLS, *_CCR_PROVIDER_COLS)),
+        *(int(rec.get(name) or 0) for name in _CCR_PRICING_COLS),
     )
 
 
@@ -2653,6 +2702,7 @@ def _group_by_file(rows: list[tuple]) -> dict[str, list[dict]]:
             "req_start": row[18], "req_end": row[19],
             **({"provider": row[20], "reported_cost_usd": row[21]}
                if row[20] is not None or row[21] is not None else {}),
+            **({"cache_create_1h": row[22], "fast": row[23]} if row[22] or row[23] else {}),
             **({"source": row[10], "account_uuid": row[11], "thread_id": row[12],
                 "reasoning_output_tokens": row[13]}
                if row[10] != "claude" or row[11] is not None or row[12] is not None or row[13] else {}),
@@ -3360,8 +3410,9 @@ def save_ccreport_rollups(rows: list[tuple], fingerprint: str) -> None:
         raise
 
 
-# The archive columns, in table order: the eight-part key, the timestamp span,
-# the four token sums, cost and record count, then the speed.SpeedSums four. Both the SELECT and the
+# The archive columns, in table order: eight parts of the key, the timestamp span,
+# the four token sums, cost and record count, the speed.SpeedSums four, then the
+# 1-hour write sum and fast, the key's ninth part. Both the SELECT and the
 # INSERT are built from this.
 _CCR_ARCHIVE_COLS = (
     "day", "oslo_date", "sid", "project", "model", "cwd", "repo", "dir_prefix",
@@ -3369,6 +3420,7 @@ _CCR_ARCHIVE_COLS = (
     "input_tokens", "output_tokens", "cache_create", "cache_read",
     "cost", "n",
     "timed_n", "latency_s", "rate_output", "rate_s",
+    "cache_create_1h", "fast",
 )
 _CCR_ARCHIVE_SELECT = ", ".join(_CCR_ARCHIVE_COLS)
 _CCR_ARCHIVE_PLACEHOLDERS = ", ".join("?" * len(_CCR_ARCHIVE_COLS))

@@ -139,6 +139,15 @@ PRICING_HISTORY: list[dict[str, Any]] = [
     {
         "effective": "2025-01-01",
         "models": {
+            # Opus 4 and 4.1 per platform.claude.com pricing on 2026-11-09.
+            "claude-opus-4-20250514": {
+                "input": 15e-06, "output": 75e-06,
+                "cache_create": 18.75e-06, "cache_read": 1.5e-06,
+            },
+            "claude-opus-4-1-20250805": {
+                "input": 15e-06, "output": 75e-06,
+                "cache_create": 18.75e-06, "cache_read": 1.5e-06,
+            },
             "claude-opus-4-5-20251101": {
                 "input": 5e-06, "output": 25e-06,
                 "cache_create": 6.25e-06, "cache_read": 0.5e-06,
@@ -277,6 +286,7 @@ PRICING_HISTORY: list[dict[str, Any]] = [
             "claude-opus-4-8": {
                 "input": 5e-06, "output": 25e-06,
                 "cache_create": 6.25e-06, "cache_read": 0.5e-06,
+                "fast": 2.0,
             },
         },
     },
@@ -335,14 +345,14 @@ PRICING_HISTORY: list[dict[str, Any]] = [
     },
     {
         # Opus 5 released 2026-07-24, same pricing as 4.8 ($5/$25 per MTok),
-        # 1M context with no long-context premium. Fast mode is 2x base
-        # ($10/$50) but rides the same model ID — records carry a separate
-        # "speed" field we don't read, so fast-mode usage costs as standard.
+        # 1M context with no long-context premium. Fast mode is 2x ($10/$50),
+        # read off the record's usage.speed: see FAST_KEY.
         "effective": "2026-07-24",
         "models": {
             "claude-opus-5": {
                 "input": 5e-06, "output": 25e-06,
                 "cache_create": 6.25e-06, "cache_read": 0.5e-06,
+                "fast": 2.0,
             },
         },
     },
@@ -379,6 +389,10 @@ PRICING_HISTORY: list[dict[str, Any]] = [
         },
     },
     {
+        # Fable 5.1 first seen 2026-09-03 17:51 UTC. $10/$50 like Fable 5, but
+        # cache read is $0.25 (0.025x input) per LiteLLM on 2026-11-09. Mythos
+        # 5.1 has not been seen in a log here; dated with Fable 5.1 and priced
+        # as LiteLLM lists it, which is the same.
         "effective": "2026-09-03",
         "models": {
             "gpt-6-astra": {
@@ -387,6 +401,14 @@ PRICING_HISTORY: list[dict[str, Any]] = [
                 "long_prompt": 272_000,
                 "input_long": 20e-06, "output_long": 75e-06,
                 "cache_create_long": 25e-06, "cache_read_long": 2e-06,
+            },
+            "claude-fable-5-1": {
+                "input": 10e-06, "output": 50e-06,
+                "cache_create": 12.5e-06, "cache_read": 0.25e-06,
+            },
+            "claude-mythos-5-1": {
+                "input": 10e-06, "output": 50e-06,
+                "cache_create": 12.5e-06, "cache_read": 0.25e-06,
             },
         },
     },
@@ -407,6 +429,7 @@ PRICING_HISTORY: list[dict[str, Any]] = [
             "claude-opus-5-5": {
                 "input": 4e-06, "output": 20e-06,
                 "cache_create": 5e-06, "cache_read": 0.2e-06,
+                "fast": 2.0,
             },
         },
     },
@@ -419,6 +442,19 @@ PRICING_HISTORY: list[dict[str, Any]] = [
                 "long_prompt": 272_000,
                 "input_long": 4e-06, "output_long": 15e-06,
                 "cache_create_long": 5e-06, "cache_read_long": 0.2e-06,
+            },
+        },
+    },
+    {
+        # Sonnet 5.5 first seen 2026-09-30 16:43 UTC. $2/$10 like Sonnet 5, but
+        # cache read is $0.10 rather than $0.20, per platform.claude.com
+        # pricing on 2026-11-09. claude-sonnet-5 is a substring of this key;
+        # _pricing_in_effect's exact pass keeps Sonnet 5 at its own price.
+        "effective": "2026-09-30",
+        "models": {
+            "claude-sonnet-5-5": {
+                "input": 2e-06, "output": 10e-06,
+                "cache_create": 2.5e-06, "cache_read": 0.1e-06,
             },
         },
     },
@@ -437,6 +473,26 @@ PRICING_HISTORY: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        # Fable 5.2 and Mythos 5.2 launched 2026-11-09. $8/$40 per MTok, cache
+        # write $10 and cache read $0.20, per platform.claude.com/docs/en/
+        # about-claude/pricing on that day (LiteLLM had no 5.2 entry yet).
+        # claude-mythos-5-2 follows Fable's ID pattern; no log has shown it.
+        # Fast mode is 2x ($16/$80).
+        "effective": "2026-11-09",
+        "models": {
+            "claude-fable-5-2": {
+                "input": 8e-06, "output": 40e-06,
+                "cache_create": 10e-06, "cache_read": 0.2e-06,
+                "fast": 2.0,
+            },
+            "claude-mythos-5-2": {
+                "input": 8e-06, "output": 40e-06,
+                "cache_create": 10e-06, "cache_read": 0.2e-06,
+                "fast": 2.0,
+            },
+        },
+    },
 ]
 
 MODEL_ALIASES: dict[str, str] = {
@@ -452,6 +508,8 @@ MODEL_ALIASES: dict[str, str] = {
     "claude-haiku-4.5": "claude-haiku-4-5-20251001",
     "claude-sonnet-4.5": "claude-sonnet-4-5-20250929",
     "claude-sonnet-4-0": "claude-sonnet-4-20250514",
+    "claude-opus-4-0": "claude-opus-4-20250514",
+    "claude-opus-4-1": "claude-opus-4-1-20250805",
     "gpt-5.6": "gpt-5.6-sol",
     "gpt-5.5-2026-04-23": "gpt-5.5",
     "claude-opus-4-5": "claude-opus-4-5-20251101",
@@ -461,6 +519,20 @@ MODEL_ALIASES: dict[str, str] = {
 }
 
 TIER_THRESHOLD = 200_000
+
+# A model that offers fast mode carries its multiplier under this key, in the
+# period that priced it: platform.claude.com/docs/en/build-with-claude/fast-mode
+# names the models and their rates, all 2x on 2026-11-09. It multiplies the
+# whole call, cache writes and reads included ("prompt caching multipliers
+# apply on top of fast mode pricing"). A fast call to a model with no key
+# prices as standard: the key is a documented price, never an assumed one.
+FAST_KEY = "fast"
+
+# A 1-hour cache write costs twice the input rate, where `cache_create` is the
+# 5-minute write at 1.25x. True of every Claude model on the pricing page on
+# 2026-11-09, so it is one ratio rather than a key per model. The 1-hour count
+# is a subset of the cache-write count, not an addition to it.
+CACHE_WRITE_1H_INPUT_MULTIPLE = 2.0
 
 # The other long-context rule, set per model: a call whose prompt — input, cache
 # write and cache read together — exceeds `long_prompt` tokens bills every token
@@ -803,6 +875,9 @@ def calc_cost(
     cache_read_tokens: int,
     model: str,
     ts: datetime | None = None,
+    *,
+    cache_create_1h: int = 0,
+    fast: bool = False,
 ) -> float:
     """Calculate total cost for a set of token counts using model-specific pricing.
 
@@ -812,26 +887,54 @@ def calc_cost(
     >272K input tier prices the whole request, including cached input, at the
     long-context rates. This is Standard API value, not a subscription bill;
     service-tier premiums and GPT-5.5 session-wide repricing are not inferred.
+
+    *cache_create_1h* is how many of the cache-write tokens were 1-hour writes,
+    priced at CACHE_WRITE_1H_INPUT_MULTIPLE times the input rate of the same
+    tier; the rest are 5-minute writes at `cache_create`. Under the per-type
+    200K tier each part is tiered on its own count. *fast* applies the model's
+    FAST_KEY multiplier, if it has one, to the whole call.
     """
     prices = find_pricing(model, ts)
     if not prices:
         if model and not model.startswith("<"):
             print(f"Warning: no pricing found for model '{model}'", file=sys.stderr)
         return 0.0
+    write_1h = min(max(cache_create_1h, 0), cache_create_tokens)
+    write_5m = cache_create_tokens - write_1h
+    multiple = prices.get(FAST_KEY, 1.0) if fast else 1.0
     threshold = prices.get("long_prompt")
     if threshold is not None:
         long = input_tokens + cache_create_tokens + cache_read_tokens > threshold
         suffix = "_long" if long else ""
-        return sum(count * prices.get(kind + suffix, 0.0) for count, kind in (
-            (input_tokens, "input"), (output_tokens, "output"),
-            (cache_create_tokens, "cache_create"), (cache_read_tokens, "cache_read"),
+        rate_1h = CACHE_WRITE_1H_INPUT_MULTIPLE * prices.get("input" + suffix, 0.0)
+        return multiple * (write_1h * rate_1h + sum(
+            count * prices.get(kind + suffix, 0.0) for count, kind in (
+                (input_tokens, "input"), (output_tokens, "output"),
+                (write_5m, "cache_create"), (cache_read_tokens, "cache_read"),
+            )
         ))
-    return (
-        tiered_cost(input_tokens, prices.get("input", 0.0), prices.get("input_200k"))
+    input_200k = prices.get("input_200k")
+    return multiple * (
+        tiered_cost(input_tokens, prices.get("input", 0.0), input_200k)
         + tiered_cost(output_tokens, prices.get("output", 0.0), prices.get("output_200k"))
-        + tiered_cost(cache_create_tokens, prices.get("cache_create", 0.0), prices.get("cache_create_200k"))
+        + tiered_cost(write_5m, prices.get("cache_create", 0.0), prices.get("cache_create_200k"))
+        + tiered_cost(
+            write_1h, CACHE_WRITE_1H_INPUT_MULTIPLE * prices.get("input", 0.0),
+            None if input_200k is None else CACHE_WRITE_1H_INPUT_MULTIPLE * input_200k,
+        )
         + tiered_cost(cache_read_tokens, prices.get("cache_read", 0.0), prices.get("cache_read_200k"))
     )
+
+
+def usage_pricing_fields(usage: dict) -> tuple[int, bool]:
+    """(1-hour cache-write tokens, fast) off a JSONL record's `message.usage`.
+
+    The two things calc_cost needs beyond the four counts. Both absent from a
+    log older than the fields, which reads as no 1-hour writes at standard speed.
+    """
+    split = usage.get("cache_creation")
+    write_1h = split.get("ephemeral_1h_input_tokens") if isinstance(split, dict) else None
+    return (write_1h if isinstance(write_1h, int) and write_1h > 0 else 0), usage.get("speed") == "fast"
 
 
 # ---------------------------------------------------------------------------
@@ -1229,7 +1332,8 @@ def _record_cost(
             return float(logged), ts, dk, model
         except (TypeError, ValueError):
             pass
-    return calc_cost(*tokens, model, ts), ts, dk, model
+    write_1h, fast = usage_pricing_fields(usage)
+    return calc_cost(*tokens, model, ts, cache_create_1h=write_1h, fast=fast), ts, dk, model
 
 
 def _iter_jsonl_costs(
@@ -1978,7 +2082,10 @@ def _rec_cost_from_tokens(rec: dict) -> float:
             ts_dt = datetime.fromtimestamp(ts_epoch, tz=UTC)
         except (ValueError, OSError):
             pass
-    return calc_cost(t[0], t[1], t[2], t[3], rec.get("model", ""), ts_dt)
+    return calc_cost(
+        t[0], t[1], t[2], t[3], rec.get("model", ""), ts_dt,
+        cache_create_1h=rec.get("cache_create_1h", 0), fast=bool(rec.get("fast")),
+    )
 
 
 def _rec_cost(rec: dict) -> float:

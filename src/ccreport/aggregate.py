@@ -38,6 +38,9 @@ class TokenCounts:
     output: int = 0
     cache_create: int = 0
     cache_read: int = 0
+    cache_create_1h: int = 0
+    """How many of `cache_create` were 1-hour writes, which cost more than the
+    5-minute ones. A subset, so it is in no total."""
 
     @property
     def total(self) -> int:
@@ -48,6 +51,7 @@ class TokenCounts:
         self.output += other.output
         self.cache_create += other.cache_create
         self.cache_read += other.cache_read
+        self.cache_create_1h += other.cache_create_1h
         return self
 
 
@@ -75,6 +79,10 @@ class UsageRecord:
     account_uuid: str | None = None
     thread_id: str | None = None
     reasoning_output_tokens: int = 0
+    fast: bool = False
+    """Whether the call ran in fast mode (`usage.speed`), which a model's
+    pricing.FAST_KEY multiplies. Not `speed`: that name is the archive's
+    timing sums below."""
     count: int = 1
     """How many API calls this stands for. One, except for the records a rollup
     row deserializes to, which stand for a whole day of a session's calls — the
@@ -122,6 +130,7 @@ class UsageRecord:
                 self.tokens.input, self.tokens.output,
                 self.tokens.cache_create, self.tokens.cache_read,
                 self.model, self.timestamp,
+                cache_create_1h=self.tokens.cache_create_1h, fast=self.fast,
             )
         return self._cost
 

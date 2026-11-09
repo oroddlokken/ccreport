@@ -1229,13 +1229,16 @@ class TestExcludeInThePolicyHash:
     def test_an_empty_list_leaves_an_existing_digest_where_it_was(self):
         """The key arriving must not charge every configured machine a corpus.
 
-        The digest is pinned against the shipped REDACTION_SHAPE on purpose: a
-        bump there re-pushes every machine's whole corpus, so it has to be a
-        deliberate edit here as well. The thread_id null-out did not need one --
-        no server held a record carrying the field under the old shape.
+        The digest is pinned against the shipped REDACTION_SHAPE and
+        RECORD_SHAPE on purpose: a bump to either re-pushes every machine's
+        whole corpus, so it has to be a deliberate edit here as well. The
+        thread_id null-out did not need one -- no server held a record carrying
+        the field under the old shape. RECORD_SHAPE's arrival did, to re-price
+        stored rows with fast mode and 1-hour writes.
         """
         assert push.REDACTION_SHAPE == "null-identity"
-        assert push.policy_hash(_server(exclude=())) == "23ba203fcb6c1e97"
+        assert push.RECORD_SHAPE == "fast-1h-writes"
+        assert push.policy_hash(_server(exclude=())) == "3cd1f39437ddf1d2"
 
 
 class TestAnExcludeEditReoffersOnlyWhatItMoved:

@@ -76,7 +76,7 @@ class TestFactory:
         )
         conn = create_app(config).state.db.connect()
         assert [row[1] for row in conn.execute("PRAGMA table_info(server_records)")] == [
-            "id", *db.REC_COLS[:-7], "dup", *db.REC_COLS[-7:],
+            "id", *db.REC_COLS[:-9], "dup", *db.REC_COLS[-9:],
         ]
         conn.close()
 

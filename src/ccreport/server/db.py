@@ -122,7 +122,12 @@ CREATE TABLE IF NOT EXISTS server_records (
     thread_id     TEXT,
     reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
     provider      TEXT,
-    reported_cost_usd REAL
+    reported_cost_usd REAL,
+    -- What `cost` was priced from beyond the four counts: the 1-hour share of
+    -- cache_create and fast mode. Zero from a client before protocol 6, and on
+    -- every row stored before the columns arrived until its file is re-pushed.
+    cache_create_1h INTEGER NOT NULL DEFAULT 0,
+    fast          INTEGER NOT NULL DEFAULT 0
 );
 
 -- Read-time dedup groups by (account, dedup key): the same call pushed from
@@ -303,8 +308,9 @@ REC_TIMING_COLS = ("req_start", "req_end")
 """The request span. Behind dup in the physical table."""
 _REC_CODEX_COLS = ("source", "thread_id", "reasoning_output_tokens")
 _REC_PROVIDER_COLS = ("provider", "reported_cost_usd")
+_REC_PRICING_COLS = ("cache_create_1h", "fast")
 REC_COLS = (*_REC_SOURCE_COLS, *_REC_FIELD_COLS, *_REC_TOKEN_COLS, *REC_TIMING_COLS,
-            *_REC_CODEX_COLS, *_REC_PROVIDER_COLS)
+            *_REC_CODEX_COLS, *_REC_PROVIDER_COLS, *_REC_PRICING_COLS)
 """Every transmitted record column, preserving existing tuple positions.
 
 The derived dup flag sits before appended source metadata in the physical
@@ -330,6 +336,7 @@ def record_to_row(rec: dict) -> tuple:
         *(rec.get(name) for name in REC_TIMING_COLS),
         rec.get("source", "claude"), rec.get("thread_id"), rec.get("reasoning_output_tokens", 0),
         *(rec.get(name) for name in _REC_PROVIDER_COLS),
+        *(int(rec.get(name) or 0) for name in _REC_PRICING_COLS),
     )
 
 
@@ -341,7 +348,9 @@ def row_to_record(row: tuple) -> dict:
     rec.update(zip(REC_TIMING_COLS, row[_TIMING_BASE:codex_base], strict=True))
     provider_base = codex_base + len(_REC_CODEX_COLS)
     rec.update(zip(_REC_CODEX_COLS, row[codex_base:provider_base], strict=True))
-    rec.update(zip(_REC_PROVIDER_COLS, row[provider_base:], strict=True))
+    pricing_base = provider_base + len(_REC_PROVIDER_COLS)
+    rec.update(zip(_REC_PROVIDER_COLS, row[provider_base:pricing_base], strict=True))
+    rec.update(zip(_REC_PRICING_COLS, row[pricing_base:], strict=True))
     return rec
 
 
@@ -573,6 +582,14 @@ def _add_opencode_records(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _add_fast_and_1h_writes(conn: sqlite3.Connection) -> None:
+    """The two pricing inputs protocol 6 sends, appended to server_records."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(server_records)")}
+    for name in ("cache_create_1h", "fast"):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE server_records ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
+
+
 MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(4, "machines.label_updated_at", _add_label_updated_at),
     migrations.Step(5, "project_aliases"),
@@ -584,6 +601,7 @@ MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(11, "server_records.req_start/req_end, server_turns", _add_request_timing),
     migrations.Step(12, "server_records.codex", _add_codex_records),
     migrations.Step(13, "server_records.opencode", _add_opencode_records),
+    migrations.Step(14, "server_records.fast/cache_create_1h", _add_fast_and_1h_writes),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 

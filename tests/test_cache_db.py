@@ -1021,6 +1021,10 @@ class TestCcreportRows:
         expected.update({
             name: provider_at + i for i, name in enumerate(cache_db._CCR_PROVIDER_COLS)
         })
+        pricing_at = provider_at + len(cache_db._CCR_PROVIDER_COLS)
+        expected.update({
+            name: pricing_at + i for i, name in enumerate(cache_db._CCR_PRICING_COLS)
+        })
         assert record == expected
 
 
@@ -3451,7 +3455,7 @@ class TestOpenCodeCache:
         db.commit()
         cache_db.close_connection()
         upgraded = cache_db.get_connection()
-        assert upgraded.execute("PRAGMA user_version").fetchone() == (18,)
+        assert upgraded.execute("PRAGMA user_version").fetchone() == (19,)
         assert upgraded.execute(
             "SELECT mid,source,thread_id,req_start,req_end,provider,reported_cost_usd "
             "FROM ccreport_records ORDER BY id"

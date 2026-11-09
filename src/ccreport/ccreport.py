@@ -590,12 +590,14 @@ def _archive_records(
     """
     pairs: list[tuple[float, UsageRecord]] = []
     for (_day, oslo_date, sid, project, model, cwd, repo, _prefix,
-         min_ts, max_ts, tin, tout, tcc, tcr, cost, n, *timing) in rows:
+         min_ts, max_ts, tin, tout, tcc, tcr, cost, n,
+         timed_n, latency_s, rate_output, rate_s, tcc_1h, fast) in rows:
         rec = UsageRecord(
             message_id="",
             model=model,
             tokens=TokenCounts(input=tin, output=tout,
-                               cache_create=tcc, cache_read=tcr),
+                               cache_create=tcc, cache_read=tcr, cache_create_1h=tcc_1h),
+            fast=bool(fast),
             timestamp=datetime.fromtimestamp(max_ts, tz=UTC),
             session_id=sid,
             project=project,
@@ -605,7 +607,7 @@ def _archive_records(
             cost_usd=cost,
             count=n,
             oslo_date=date.fromisoformat(oslo_date),
-            speed=SpeedSums(*timing),
+            speed=SpeedSums(timed_n, latency_s, rate_output, rate_s),
         )
         if override:
             rec.project = override(rec.repo, rec.cwd, rec.project)
@@ -2891,7 +2893,7 @@ def _plan_archive(min_age_days: int) -> tuple[ArchivePlan, float]:
         for rec in kept:
             _fold_archive_row(rows, rec, prefix)
     plan = ArchivePlan(
-        rows=[(*key, *row[:8], *row[8].as_tuple()) for key, row in rows.items()],
+        rows=[(*key[:8], *row[:8], *row[8].as_tuple(), row[9], key[8]) for key, row in rows.items()],
         paths=set(kept_by_path),
         records=n_records,
         held_back=held_back,
@@ -2918,13 +2920,13 @@ def _fold_archive_row(rows: dict[tuple, list], rec: UsageRecord, prefix: str) ->
     """Add one record to its archive bucket, creating the bucket if new."""
     key = (
         rec.day_key(), rec.fx_date().isoformat(), rec.session_id,
-        rec.project, rec.model, rec.cwd or "", rec.repo or "", prefix,
+        rec.project, rec.model, rec.cwd or "", rec.repo or "", prefix, int(rec.fast),
     )
     ts = rec.timestamp.timestamp()
     t = rec.tokens
     row = rows.get(key)
     if row is None:
-        row = rows[key] = [ts, ts, 0, 0, 0, 0, 0.0, 0, SpeedSums()]
+        row = rows[key] = [ts, ts, 0, 0, 0, 0, 0.0, 0, SpeedSums(), 0]
     row[0] = min(row[0], ts)
     row[1] = max(row[1], ts)
     row[2] += t.input
@@ -2933,6 +2935,7 @@ def _fold_archive_row(rows: dict[tuple, list], rec: UsageRecord, prefix: str) ->
     row[5] += t.cache_read
     row[6] += rec.cost()
     row[7] += rec.count
+    row[9] += t.cache_create_1h
     # The live records the archive folds are one call each, deduped already;
     # an archived synthetic record never comes back through here.
     if timed_model(rec.model):

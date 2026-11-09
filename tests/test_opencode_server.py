@@ -86,10 +86,12 @@ def test_unknown_models_do_not_borrow_a_provider_price(model):
 def test_schema_12_migrates_without_inventing_reported_cost(tmp_path, monkeypatch):
     path = tmp_path / "old.db"
     with monkeypatch.context() as old:
-        old.setattr(db, "MIGRATION_CHAIN", db.MIGRATION_CHAIN[:-1])
+        old.setattr(db, "MIGRATION_CHAIN", db.MIGRATION_CHAIN[:-2])
         old.setattr(db, "SCHEMA_VERSION", 12)
-        old.setattr(db, "_SCHEMA_SQL", db._SCHEMA_SQL.replace(
-            ",\n    provider      TEXT,\n    reported_cost_usd REAL", ""))
+        start = db._SCHEMA_SQL.index(",\n    provider      TEXT,")
+        end = db._SCHEMA_SQL.index("fast          INTEGER NOT NULL DEFAULT 0") + len(
+            "fast          INTEGER NOT NULL DEFAULT 0")
+        old.setattr(db, "_SCHEMA_SQL", db._SCHEMA_SQL[:start] + db._SCHEMA_SQL[end:])
         conn = db.connect(path)
         conn.execute("INSERT INTO machines VALUES ('m', 'M', 1, 1, NULL)")
         conn.execute(
@@ -100,9 +102,9 @@ def test_schema_12_migrates_without_inventing_reported_cost(tmp_path, monkeypatc
         conn.commit()
         conn.close()
     conn = db.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 13
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 14
     assert conn.execute("SELECT provider,reported_cost_usd FROM server_records").fetchone() == (None, None)
-    assert protocol.PROTOCOL_VERSION == 5
+    assert protocol.PROTOCOL_VERSION == 6
     conn.close()
 
 

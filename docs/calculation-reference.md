@@ -116,11 +116,39 @@ threshold; counting them follows its earlier long-context pricing.
 ### Total Message Cost (per-type models)
 
 ```
-message_cost = _tiered_cost(input_tokens,                 prices.input,        prices.input_200k)
-             + _tiered_cost(output_tokens,                prices.output,       prices.output_200k)
-             + _tiered_cost(cache_creation_input_tokens,  prices.cache_create, prices.cache_create_200k)
-             + _tiered_cost(cache_read_input_tokens,      prices.cache_read,   prices.cache_read_200k)
+write_1h     = usage.cache_creation.ephemeral_1h_input_tokens   # 0 if absent
+write_5m     = cache_creation_input_tokens - write_1h
+message_cost = _tiered_cost(input_tokens,             prices.input,        prices.input_200k)
+             + _tiered_cost(output_tokens,            prices.output,       prices.output_200k)
+             + _tiered_cost(write_5m,                 prices.cache_create, prices.cache_create_200k)
+             + _tiered_cost(write_1h,                 2 * prices.input,    2 * prices.input_200k)
+             + _tiered_cost(cache_read_input_tokens,  prices.cache_read,   prices.cache_read_200k)
 ```
+
+### 1-Hour Cache Writes
+
+`cache_create` is the 5-minute write rate (1.25x input). A 1-hour write costs
+`CACHE_WRITE_1H_INPUT_MULTIPLE` (2x) the input rate of the same tier, which held
+for every Claude model on Anthropic's pricing page on 2026-11-09, so it is one
+ratio in `pricing.py` rather than a key per model. Under the whole-prompt tier
+it is 2x `input_long` once the prompt is over `long_prompt`. The 1-hour count is
+a share of `cache_creation_input_tokens`, never added to it, and is stored as
+`cache_create_1h` beside the four counts on `ccreport_records`,
+`ccreport_archive` and `server_records`.
+
+### Fast Mode
+
+`usage.speed == "fast"` multiplies the whole message cost, cache writes and reads
+included, by the model's `fast` key (`pricing.FAST_KEY`). Only models with a
+documented fast price carry one: Opus 4.8, Opus 5, Opus 5.5, Fable 5.2 and
+Mythos 5.2, all at 2.0. A fast call to a model without the key prices as
+standard. The flag is stored as `fast` beside `cache_create_1h`, and is part of
+the archive's key so a folded day keeps its fast and standard calls apart.
+
+Both fields reach the server in protocol 6, which prices at ingest from them.
+Rows the server already held were priced without them, so `push.RECORD_SHAPE`
+moves every machine's policy digest and the next push re-sends each file once
+with `replace` set.
 
 ### Input Data (from JSONL records)
 

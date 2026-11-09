@@ -239,7 +239,7 @@ class TestArchive:
 
         (row,) = cache_db.load_ccreport_archive()
         # m1: 4s and 400 tokens, above the floor; m2: 4s and 50 tokens, below it.
-        assert row[16:] == (2, 8.0, 400, 4.0)
+        assert row[16:20] == (2, 8.0, 400, 4.0)
 
         records = ccr.load_all_records()
         (rec,) = records
@@ -354,7 +354,7 @@ class TestMigration:
             assert {"ccreport_turns", "idx_ccturn_file"} <= tables
             cache_db.init_ccreport_meta(1, "h")
             (row,) = cache_db.load_ccreport_archive()
-            assert row[14:] == (7.5, 8, 0, 0.0, 0, 0.0)
+            assert row[14:] == (7.5, 8, 0, 0.0, 0, 0.0, 0, 0)
         finally:
             conn.close()
             cache_db._conn = None

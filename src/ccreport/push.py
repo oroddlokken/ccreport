@@ -476,6 +476,16 @@ def pseudo_session(salt: str, session_id: str) -> str:
 
 
 REDACTION_SHAPE = "null-identity"
+
+RECORD_SHAPE = "fast-1h-writes"
+"""What a pushed record carries beyond its counts, as a value policy_hash moves on.
+
+The server prices a record when it lands and never again, so a field that
+changes the price — fast mode and the 1-hour cache-write count, protocol 6 —
+reaches rows already stored only through a re-push of the files that hold
+them, and those files are closed. Changing this re-sends every file once with
+`replace` set, the way a redaction change does.
+"""
 """What redact() leaves of an unallowed record, as a value policy_hash moves on.
 
 The salt no longer changes when the redaction does — nothing derives from it
@@ -529,6 +539,8 @@ def policy_hash(server: ServerConfig, override_rules: object = "") -> str:
     REDACTION_SHAPE covers the third: what redact() leaves behind. A code edit
     moves nothing else here, so without it the rows a previous shape wrote would
     stand on the server until their files changed, which they never will.
+    RECORD_SHAPE is the same argument for a field that changes what the server
+    prices a record at.
 
     *exclude* is in it on the same terms as *allow*, behind a separator rather
     than concatenated: a project moved from one list to the other changes what
@@ -540,7 +552,7 @@ def policy_hash(server: ServerConfig, override_rules: object = "") -> str:
     parts = ["1" if server.restricted else "0", *sorted(server.allow)]
     if server.exclude:
         parts += [_EXCLUDE_MARK, *sorted(server.exclude)]
-    parts += [server.salt, REDACTION_SHAPE, repr(override_rules)]
+    parts += [server.salt, REDACTION_SHAPE, RECORD_SHAPE, repr(override_rules)]
     return hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:16]
 
 
@@ -776,6 +788,10 @@ def _payload_record(rec: dict, timeline, override) -> dict | None:
         "output_tokens": rec["output_tokens"],
         "cache_create": rec["cache_create"],
         "cache_read": rec["cache_read"],
+        # The two inputs calc_cost needs beyond the counts, which only the log
+        # carries; the server prices the record from them (protocol 6).
+        "cache_create_1h": rec.get("cache_create_1h") or 0,
+        "fast": bool(rec.get("fast")),
         # The span is read off the log's line order, which the server never
         # sees, so it travels as this machine derived it.
         "req_start": rec["req_start"],

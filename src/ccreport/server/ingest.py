@@ -57,6 +57,11 @@ class IngestRecord(BaseModel):
     output_tokens: int = Field(default=0, ge=0)
     cache_create: int = Field(default=0, ge=0)
     cache_read: int = Field(default=0, ge=0)
+    cache_create_1h: int = Field(default=0, ge=0)
+    """How many of cache_create were 1-hour writes. Absent before protocol 6,
+    which prices every write at the 5-minute rate."""
+    fast: bool = False
+    """Whether the call ran in fast mode. Absent before protocol 6."""
     source: Literal["claude", "codex", "opencode"] = "claude"
     provider: str | None = None
     reported_cost_usd: float | None = None
@@ -80,6 +85,8 @@ class IngestRecord(BaseModel):
                 raise ValueError("reasoning_output_tokens must not exceed output_tokens")
             if self.cache_create:
                 raise ValueError("Codex cache_create is unsupported")
+        if self.cache_create_1h > self.cache_create:
+            raise ValueError("cache_create_1h must not exceed cache_create")
         return self
 
 class IngestTurn(BaseModel):
@@ -343,7 +350,7 @@ def _priced(rec: IngestRecord) -> float:
         raise LookupError(rec.model)
     return pricing.calc_cost(
         rec.input_tokens, rec.output_tokens, rec.cache_create, rec.cache_read,
-        rec.model, when,
+        rec.model, when, cache_create_1h=rec.cache_create_1h, fast=rec.fast,
     )
 
 
@@ -388,6 +395,8 @@ def _row(machine_id: str, path: str, rec: IngestRecord) -> tuple:
         "t": [rec.input_tokens, rec.output_tokens, rec.cache_create, rec.cache_read],
         "req_start": rec.req_start,
         "req_end": rec.req_end,
+        "cache_create_1h": rec.cache_create_1h,
+        "fast": int(rec.fast),
     })
 
 

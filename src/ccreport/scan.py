@@ -27,7 +27,7 @@ from ccreport.cache_db import (
     load_ccreport_file_meta,
     save_ccreport_files,
 )
-from ccreport.pricing import extract_assistant_fields
+from ccreport.pricing import extract_assistant_fields, usage_pricing_fields
 from ccreport.speed import RequestClock, timed_model
 
 _CONFIG_PATH = project_identity.CONFIG_PATH
@@ -170,6 +170,8 @@ def _serialize_records(records: list) -> list[dict]:
             "t": [r.tokens.input, r.tokens.output, r.tokens.cache_create, r.tokens.cache_read],
             "req_start": r.req_start,
             "req_end": r.req_end,
+            "cache_create_1h": r.tokens.cache_create_1h,
+            "fast": int(r.fast),
         }
         for r in records
     ]
@@ -197,7 +199,9 @@ def _deserialize_records(raw: list[dict]) -> list:
             tokens=TokenCounts(
                 input=r["t"][0], output=r["t"][1],
                 cache_create=r["t"][2], cache_read=r["t"][3],
+                cache_create_1h=r.get("cache_create_1h", 0),
             ),
+            fast=bool(r.get("fast")),
             req_start=r.get("req_start"),
             req_end=r.get("req_end"),
         )
@@ -391,6 +395,8 @@ def parse_jsonl(path: Path) -> ParsedLog:
                 cache_create=usage.get("cache_creation_input_tokens") or 0,
                 cache_read=usage.get("cache_read_input_tokens") or 0,
             )
+            tokens.cache_create_1h, fast = usage_pricing_fields(usage)
+            tokens.cache_create_1h = min(tokens.cache_create_1h, tokens.cache_create)
 
             cost_usd = rec.get("costUSD")
             if cost_usd is not None:
@@ -415,6 +421,7 @@ def parse_jsonl(path: Path) -> ParsedLog:
                 project="",
                 cost_usd=cost_usd,
                 dedup_key=dedup_key,
+                fast=fast,
             ))
 
     repo = _resolve_remote(cwd_from_records) if cwd_from_records else None

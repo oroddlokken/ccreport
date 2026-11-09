@@ -9,6 +9,10 @@
 ### Fixed
 
 - **The "Cached report" heading prints in plain bold.** The date and time in it were coloured like numbers in a table.
+- **Claude Fable 5.2 and Mythos 5.2 are priced at $8/$40 per MTok.** They were priced as Fable 5, at $10/$50. Cache write is $10 and cache read $0.20.
+- **Claude Fable 5.1 and Mythos 5.1 cache reads are priced at $0.25 per MTok.** They were priced as Fable 5's, at $1.00, which put 5.1 cache-read spend at four times what it cost.
+- **Claude Sonnet 5.5 cache reads are priced at $0.10 per MTok, and Opus 4 and 4.1 at $15/$75.** Sonnet 5.5 was priced as Sonnet 5, whose cache reads are $0.20. Opus 4 and 4.1 had no price, so their calls counted as zero with a warning.
+- **1-hour cache writes are priced at 2x the input rate, and fast-mode calls at their fast price.** Every cache write was priced at the 5-minute rate (1.25x input), which put 1-hour writes 37.5% low; the split comes from the log's `cache_creation` counts. A call whose log says `speed: fast` is multiplied by its model's documented fast rate, 2x on Opus 4.8, Opus 5, Opus 5.5, Fable 5.2 and Mythos 5.2, cache tokens included. The push protocol moves to 6 to carry both, so **deploy the server before upgrading any machine**: a machine on 6 pushing to a server on 5 is refused and stops pushing until `ccreport server push` is run by hand. Each machine then re-sends its whole corpus once, so the server re-prices what it already holds.
 
 ### Development
 

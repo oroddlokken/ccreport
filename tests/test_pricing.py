@@ -108,6 +108,46 @@ class TestFindPricing:
         prices = present(find_pricing("claude-opus-5-5-20260922", datetime(2026, 9, 23, tzinfo=UTC)))
         assert prices["input"] == 4e-06
 
+    @pytest.mark.parametrize("model", ["claude-fable-5-2", "claude-mythos-5-2"])
+    def test_5_2_has_its_own_price(self, model):
+        prices = present(find_pricing(model, datetime(2026, 11, 9, 12, tzinfo=UTC)))
+        assert (prices["input"], prices["output"]) == (8e-06, 40e-06)
+        assert (prices["cache_create"], prices["cache_read"]) == (10e-06, 0.2e-06)
+
+    def test_sonnet_5_5_has_its_own_cache_read(self):
+        prices = present(find_pricing("claude-sonnet-5-5", datetime(2026, 10, 1, tzinfo=UTC)))
+        assert (prices["input"], prices["output"]) == (2e-06, 10e-06)
+        assert (prices["cache_create"], prices["cache_read"]) == (2.5e-06, 0.1e-06)
+
+    def test_sonnet_5_keeps_its_cache_read_after_sonnet_5_5_ships(self):
+        prices = present(find_pricing("claude-sonnet-5", datetime(2026, 10, 1, tzinfo=UTC)))
+        assert prices["cache_read"] == 0.2e-06
+
+    @pytest.mark.parametrize("model", [
+        "claude-opus-4-20250514", "claude-opus-4-1-20250805", "claude-opus-4-0", "claude-opus-4-1",
+    ])
+    def test_opus_4_and_4_1_are_priced(self, model):
+        prices = present(find_pricing(model, datetime(2025, 9, 1, tzinfo=UTC)))
+        assert (prices["input"], prices["output"]) == (15e-06, 75e-06)
+        assert (prices["cache_create"], prices["cache_read"]) == (18.75e-06, 1.5e-06)
+
+    @pytest.mark.parametrize("model", ["claude-fable-5-1", "claude-mythos-5-1"])
+    def test_5_1_has_its_own_cache_read(self, model):
+        prices = present(find_pricing(model, datetime(2026, 9, 4, tzinfo=UTC)))
+        assert (prices["input"], prices["output"]) == (10e-06, 50e-06)
+        assert (prices["cache_create"], prices["cache_read"]) == (12.5e-06, 0.25e-06)
+
+    def test_5_1_keeps_its_price_after_5_2_ships(self):
+        prices = present(find_pricing("claude-fable-5-1", datetime(2026, 11, 10, tzinfo=UTC)))
+        assert prices["input"] == 10e-06
+
+    @pytest.mark.parametrize("model", ["claude-fable-5", "claude-mythos-5"])
+    def test_5_keeps_its_price_after_5_2_ships(self, model):
+        """claude-fable-5 is a substring of claude-fable-5-2; the exact key must win."""
+        prices = present(find_pricing(model, datetime(2026, 11, 10, tzinfo=UTC)))
+        assert (prices["input"], prices["output"]) == (10e-06, 50e-06)
+        assert prices["cache_read"] == 1e-06
+
 
 class TestTieredCost:
     def test_below_threshold_no_tier(self):
