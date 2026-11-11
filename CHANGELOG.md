@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.2.2 (2026-11-11)
+
 ### Added
 
 - **Local reports show progress while updating logs and a dated saved report after a day without indexing.** Warm runs keep a single report; JSON and pipes stay clean. Startup timings are saved beside the cache, and `--debug` prints them to stderr.
