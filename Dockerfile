@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 FROM ghcr.io/astral-sh/uv:0.13.5-python3.13-alpine@sha256:1fd17509ae6051e6cad9dc1b83705483c0b24a15740b3c4d230b6b6f2e2a0241 AS builder
 
 RUN --mount=type=cache,sharing=locked,target=/var/cache/apk apk update && apk add git
