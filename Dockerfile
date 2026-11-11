@@ -8,12 +8,12 @@ WORKDIR /app
 # --no-install-project keeps this layer cacheable: only pyproject.toml and
 # uv.lock invalidate it, not a source change.
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/root/.cache uv sync --no-dev --no-install-project --frozen \
-    && find /app/.venv -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; true
+RUN --mount=type=cache,target=/root/.cache uv sync --no-dev --no-install-project --frozen --compile-bytecode
 
 FROM ghcr.io/astral-sh/uv:0.13.5-python3.13-alpine@sha256:1fd17509ae6051e6cad9dc1b83705483c0b24a15740b3c4d230b6b6f2e2a0241
 
-RUN apk add --no-cache sqlite bash
+RUN apk add --no-cache sqlite bash \
+    && python3 -m compileall -q -j0 /usr/local/lib/python3.13
 
 # The account exists before the copies so each COPY stamps its own ownership.
 # A `chown -R app:app /app` after them instead sits below the source COPY, and
@@ -29,6 +29,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --chown=app:app ./src /app/src
+RUN python3 -m compileall -q /app/src
 
 WORKDIR /app
 
