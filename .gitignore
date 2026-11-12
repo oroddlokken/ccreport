@@ -22,3 +22,5 @@ export/
 .playwright-mcp
 dist/
 src/ccreport/_version.py
+# The compose stack's bind mount: server.db and its -wal/-shm.
+/data/

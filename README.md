@@ -368,7 +368,7 @@ A `vX.Y.Z` tag is what builds `ghcr.io/oroddlokken/ccreport:X.Y.Z` and
 `:latest`, for `linux/amd64`. The image runs one worker and no reloader:
 
 ```bash
-docker run -p 8787:8787 -v ccreport-data:/data \
+docker run -p 8787:8787 -v "$PWD/data":/data \
   -e CCREPORT_SERVER_DB=/data/server.db \
   -e CCREPORT_SERVER_NETWORKS='127.0.0.1/32 192.168.0.0/16' \
   ghcr.io/oroddlokken/ccreport:latest

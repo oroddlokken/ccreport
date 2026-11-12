@@ -47,11 +47,26 @@ serve:
 
 # Rebuilds first: the image carries the venv, and a uv.lock change is invisible
 # to `up` on its own. The source is bind-mounted, so an edit needs no rebuild.
+#
+# The database lives in ./data, bind-mounted at /data. It used to live in the
+# named volume ccreport_ccreport-data. A machine that still has that volume and
+# an empty ./data would start on an empty database, so the recipe refuses and
+# says how to copy the old data across first.
 # start the server in docker on http://127.0.0.1:8787
 docker-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if docker volume inspect ccreport_ccreport-data >/dev/null 2>&1 && [[ -z "$(ls -A data 2>/dev/null)" ]]; then
+        echo "The old named volume ccreport_ccreport-data still holds this stack's data, and ./data is empty." >&2
+        echo "Copy it across with the stack stopped, check ./data, then remove the volume:" >&2
+        echo '  mkdir -p data && docker run --rm -v ccreport_ccreport-data:/from -v "$PWD/data":/to alpine cp -a /from/. /to/' >&2
+        echo '  docker volume rm ccreport_ccreport-data' >&2
+        exit 1
+    fi
+    mkdir -p data
     docker compose -f ./docker-compose.yml -p ccreport up -d --build --wait
 
-# stop the server and remove its container; the database volume survives
+# stop the server and remove its container; ./data survives
 docker-down:
     docker compose -f ./docker-compose.yml -p ccreport down
 
@@ -60,10 +75,11 @@ docker-restart:
     just docker-down
     just docker-up
 
-# Every machine, token and pushed record in the local server database goes with
-# it. Each machine then needs a token minted again, and `ccreport push --full`
-# to resend what its watermark now considers already sent.
-# stop the server and delete its database volume
+# The database stays in ./data. Delete that directory by hand to start over:
+# every machine, token and pushed record goes with it, each machine then needs
+# a token minted again, and `ccreport push --full` to resend what its watermark
+# now considers already sent.
+# stop the server and remove its container and any anonymous volumes
 docker-remove:
     docker compose -f ./docker-compose.yml -p ccreport down -v --remove-orphans
 

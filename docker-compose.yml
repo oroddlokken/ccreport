@@ -1,5 +1,5 @@
-# The ccreport server for local development: one container, one SQLite file on
-# a named volume, the dashboard on http://127.0.0.1:8787/. Point a machine at
+# The ccreport server for local development: one container, one SQLite file in
+# ./data (bind-mounted at /data), the dashboard on http://127.0.0.1:8787/. Point a machine at
 # it with `ccreport server connect http://127.0.0.1:8787`, after minting a
 # token at /machines.
 
@@ -27,10 +27,8 @@ services:
       # Every interface, so another machine on the LAN can push and read.
       - "8787:8787"
     volumes:
-      - ccreport-data:/data
+      - ./data:/data
       # An edit on the host restarts the server; read-only so the container
       # cannot write back into the checkout.
       - ./src:/app/src:ro
 
-volumes:
-  ccreport-data:
