@@ -174,14 +174,14 @@ def _thread(session_id: str, sessions: dict) -> str:
 
 
 def _project(session: dict) -> tuple[str, str | None, str | None]:
-    from ccreport import project_identity, scan
+    from ccreport import scan
 
     cwd = session.get("directory") or session.get("worktree")
     if cwd is not None:
         cwd = _text(cwd, "project directory")
-    repo = scan._resolve_remote(cwd) if cwd else None  # noqa: SLF001 - shared project rules
-    name = (repo.rsplit("/", 1)[-1] if repo else
-            (project_identity.repo_from_path(cwd) or Path(cwd).name) if cwd else "unknown")
+    if not cwd:
+        return "unknown", cwd, None
+    name, repo = scan.project_for_cwd(cwd)
     return name, cwd, repo
 
 

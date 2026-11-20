@@ -75,20 +75,17 @@ def _tokens(usage: dict) -> tuple[TokenCounts, int] | None:
 
 def _project(identity: dict) -> tuple[str, str | None, str | None]:
     # Lazy to avoid a cycle: scan dispatches here and owns these shared rules.
-    from ccreport import project_identity, scan
+    from ccreport import scan
 
     cwd = identity.get("cwd")
     remote = identity.get("repo")
     repo = scan._normalize_remote(remote) if remote else None  # noqa: SLF001 - shared identity rules
-    if not repo and cwd:
-        repo = scan._resolve_remote(cwd)  # noqa: SLF001 - shared identity rules
     if repo:
-        name = repo.rsplit("/", 1)[-1]
-    elif cwd:
-        name = project_identity.repo_from_path(cwd) or Path(cwd).name
-    else:
-        name = "unknown"
-    return name, cwd, repo
+        return repo.rsplit("/", 1)[-1], cwd, repo
+    if cwd:
+        name, repo = scan.project_for_cwd(cwd)
+        return name, cwd, repo
+    return "unknown", cwd, None
 
 
 def _record(payload: dict, timestamp, model: str, identity: dict, owner: dict) -> UsageRecord | None:
