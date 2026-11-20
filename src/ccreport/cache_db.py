@@ -352,7 +352,7 @@ CREATE TABLE IF NOT EXISTS ccreport_archive (
 -- committed: merges and renames live here, not in code.
 CREATE TABLE IF NOT EXISTS project_overrides (
     id          INTEGER PRIMARY KEY,
-    match_kind  TEXT NOT NULL,   -- 'name' | 'remote' | 'cwd_prefix'
+    match_kind  TEXT NOT NULL,   -- project_identity.OVERRIDE_KINDS
     match_value TEXT NOT NULL,
     target      TEXT NOT NULL,
     UNIQUE (match_kind, match_value)
@@ -3539,6 +3539,99 @@ def count_ccreport_records_without_signals() -> int:
     return conn.execute(
         "SELECT COUNT(*) FROM ccreport_records WHERE cwd IS NULL AND repo IS NULL"
     ).fetchone()[0]
+
+
+def load_known_cwds() -> set[str]:
+    """Every working directory a cached or archived record was logged from.
+
+    What a scratchpad whose directory has since gone is matched against: the
+    cwd its own session carried is in here even when nothing on disk is.
+
+    Not gated on _ccreport_readable: restamp_orphan_identities asks for it in
+    the window where invalidate_ccreport has cleared the salt, and a cwd column
+    means the same thing in every format that has one.
+    """
+    conn = get_connection()
+    cwds = {
+        row[0] for row in conn.execute(
+            "SELECT DISTINCT cwd FROM ccreport_records WHERE cwd IS NOT NULL"
+        )
+    }
+    cwds.update(
+        row[0] for row in conn.execute(
+            "SELECT DISTINCT cwd FROM ccreport_archive WHERE cwd != ''"
+        )
+    )
+    return cwds
+
+
+def restamp_orphan_identities(
+    live_paths: set[str], derive: Callable[[str], tuple[str, str | None]],
+) -> int:
+    """Re-derive the project of purged-log records from the cwd they kept.
+
+    A re-parse renames a live file's records, but an orphan's name stays
+    whatever its last parse froze — so a change to how names are derived
+    split every project in two, the live half under the new name and the
+    purged half under the old. The cwd is the input that derivation reads, and
+    it is stored, so *derive* (scan.project_for_cwd) is asked again for each.
+
+    Only rows with a cwd and no repo: a repo was the remote found at parse
+    time and is the stronger witness, and a row with neither has nothing to
+    derive from. Costs are untouched — only the name and the repo the new
+    derivation found. The archive is left alone; it is a store keyed on the
+    raw identity, and merge rules still reach it.
+
+    Returns how many records moved. When any did, the stored orphan all-time
+    totals and the project scopes are dropped, since both froze a name.
+
+    A writer's step like invalidate_ccreport, run between that and the meta
+    stamp, so it does not ask _ccreport_readable: the salt is cleared there.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT f.path, r.file_id, r.cwd, r.project "
+        "FROM ccreport_records r JOIN ccreport_files f ON f.id = r.file_id "
+        "WHERE r.cwd IS NOT NULL AND r.repo IS NULL "
+        "GROUP BY r.file_id, r.cwd, r.project"
+    ).fetchall()
+    derived: dict[str, tuple[str, str | None]] = {}
+    updates: list[tuple[str, str | None, int, str]] = []
+    for path, file_id, cwd, project in rows:
+        if path in live_paths:
+            continue
+        if cwd not in derived:
+            derived[cwd] = derive(cwd)
+        name, repo = derived[cwd]
+        if name != project or repo is not None:
+            updates.append((name, repo, file_id, cwd))
+    moved = 0
+    # Batched for invalidate_ccreport's reason: a render waiting on the lock
+    # gives up after 0.25 s. Each batch is whole files, so an interrupted run
+    # leaves files renamed or not, and the next invalidation finishes the rest.
+    for start in range(0, len(updates), _INVALIDATE_CHUNK):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for update in updates[start:start + _INVALIDATE_CHUNK]:
+                moved += conn.execute(
+                    "UPDATE ccreport_records SET project = ?, repo = ? "
+                    "WHERE file_id = ? AND cwd = ? AND repo IS NULL",
+                    update,
+                ).rowcount
+            conn.execute("COMMIT")
+        except Exception:
+            _rollback_if_open(conn)
+            raise
+    if moved:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DELETE FROM meta WHERE key IN (?, ?)", (_ORPHAN_FP_KEY, _ROLLUP_FP_KEY))
+            _clear_project_scopes(conn)
+            conn.execute("COMMIT")
+        except Exception:
+            _rollback_if_open(conn)
+            raise
+    return moved
 
 
 # ---------------------------------------------------------------------------

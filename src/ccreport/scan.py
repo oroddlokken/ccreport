@@ -25,13 +25,14 @@ from ccreport.cache_db import (
     init_ccreport_meta,
     invalidate_ccreport,
     load_ccreport_file_meta,
+    load_known_cwds,
+    restamp_orphan_identities,
     save_ccreport_files,
 )
 from ccreport.pricing import extract_assistant_fields, usage_pricing_fields
 from ccreport.speed import RequestClock, timed_model
 
 _CONFIG_PATH = project_identity.CONFIG_PATH
-_repo_from_path = project_identity.repo_from_path
 
 _PROJECT_ROOTS = (
     Path.home() / ".claude" / "projects",
@@ -42,6 +43,8 @@ _PROJECT_ROOTS = (
 # or deleted, where a path does not. Resolved lazily at parse time (only while
 # the working dir still exists) and cached per cwd within a run.
 _remote_cache: dict[str, str | None] = {}
+# The main checkout of a linked worktree, per cwd, for the same run.
+_checkout_cache: dict[str, str | None] = {}
 
 
 def _normalize_remote(url: str) -> str:
@@ -82,6 +85,81 @@ def _resolve_remote(cwd: str) -> str | None:
             result = None
     _remote_cache[cwd] = result
     return result
+
+
+def _linked_checkout(cwd: str) -> str | None:
+    """The main checkout of the linked git worktree *cwd* sits in, or None.
+
+    Asked of git rather than read off the path, so it holds wherever the
+    worktree was made — a sibling ~/dev/<repo>-<branch> as much as one under
+    <repo>/.worktrees/. A deleted worktree has no answer, and its name alone
+    is not evidence of whose it was. Only consulted when the cwd has no remote
+    of its own: with one, the remote already names the repo.
+    """
+    if cwd in _checkout_cache:
+        return _checkout_cache[cwd]
+    result: str | None = None
+    if Path(cwd).is_dir():
+        try:
+            out = subprocess.run(
+                ["git", "-C", cwd, "rev-parse", "--path-format=absolute",
+                 "--git-common-dir", "--show-toplevel"],
+                capture_output=True, text=True, timeout=5,
+            )
+            lines = out.stdout.splitlines() if out.returncode == 0 else []
+            if len(lines) == 2:
+                common, top = Path(lines[0]), Path(lines[1])
+                # A submodule's common dir is .git/modules/<name> and a bare
+                # repo's is the repo: neither is a worktree of a checkout.
+                if common.name == ".git" and common.parent != top:
+                    result = str(common.parent)
+        except (OSError, subprocess.SubprocessError):
+            result = None
+    _checkout_cache[cwd] = result
+    return result
+
+
+# claude_encode(cwd) -> the cwds cached records carry, for reading a scratchpad
+# whose directory is gone. Built on the first scratchpad that disk cannot
+# answer and dropped by each discovery, like _source_units: within one run the
+# set only grows by logs that are on disk, which the disk already answers for.
+_known_cwds: dict[str, set[str]] | None = None
+
+
+def _known_cwd_index() -> dict[str, set[str]]:
+    global _known_cwds
+    if _known_cwds is None:
+        index: dict[str, set[str]] = {}
+        for cwd in load_known_cwds():
+            index.setdefault(project_identity.claude_encode(cwd), set()).add(cwd)
+        _known_cwds = index
+    return _known_cwds
+
+
+def project_for_cwd(cwd: str) -> tuple[str, str | None]:
+    """The (project, repo) a record logged from *cwd* is filed under.
+
+    The one derivation every reader of a session log goes through — Claude
+    Code's, Codex's and OpenCode's. A scratchpad cwd is first read back to the
+    directory it was made for. Then the git remote names the project, looked
+    up at the cwd and, failing that, at the checkout a worktree hangs off;
+    without a remote the checkout's own directory name does, and only a cwd
+    outside every worktree falls through to project_identity.name_for_cwd's
+    path rules.
+    """
+    real = project_identity.scratchpad_origin(cwd, _known_cwd_index) or cwd
+    repo = _resolve_remote(real)
+    if repo:
+        # Group by the repo's own name, not the full remote, so a host/org move
+        # (e.g. GitLab -> GitHub) keeps history together. A true repo rename is
+        # a manual `ccreport merge` away.
+        return repo.rsplit("/", 1)[-1], repo
+    checkout = project_identity.worktree_checkout(real) or _linked_checkout(real)
+    if checkout is not None:
+        repo = _resolve_remote(checkout)
+        return (repo.rsplit("/", 1)[-1], repo) if repo else (Path(checkout).name, None)
+    return project_identity.name_for_cwd(real), None
+
 
 # --- File-level cache ---
 # BUMP THIS when the dicts _serialize_records writes change shape:
@@ -141,11 +219,15 @@ def _ensure_cache_valid(live_paths: set[str]) -> None:
     """Ensure ccreport cache is valid; invalidate and reinitialize if stale.
 
     *live_paths* bounds the invalidation to files still on disk — records from
-    purged files can't be re-parsed, so their costs must survive.
+    purged files can't be re-parsed, so their costs must survive. Their names
+    are re-derived from the cwd they kept instead, since a hash change may be a
+    change to how a name is derived; before the meta is written, so a run
+    interrupted there invalidates again from the top.
     """
     sh = _script_hash()
     if not check_ccreport_valid(CACHE_VERSION, sh):
         invalidate_ccreport(live_paths)
+        restamp_orphan_identities(live_paths, project_for_cwd)
         init_ccreport_meta(CACHE_VERSION, sh)
 
 
@@ -226,6 +308,8 @@ def discover_jsonl_files() -> list[Path]:
     """
     from ccreport import opencode_scan
 
+    global _known_cwds
+    _known_cwds = None
     _source_units.clear()
     enabled = sources.enabled_sources()
     files = []
@@ -424,16 +508,10 @@ def parse_jsonl(path: Path) -> ParsedLog:
                 fast=fast,
             ))
 
-    repo = _resolve_remote(cwd_from_records) if cwd_from_records else None
-    if repo:
-        # Group by the repo's own name, not the full remote, so a host/org move
-        # (e.g. GitLab -> GitHub) keeps history together. A true repo rename is
-        # a manual `ccreport merge` away.
-        project = repo.rsplit("/", 1)[-1]
-    elif cwd_from_records:
-        project = _repo_from_path(cwd_from_records) or Path(cwd_from_records).name
+    if cwd_from_records:
+        project, repo = project_for_cwd(cwd_from_records)
     else:
-        project = _derive_project(path)
+        project, repo = _derive_project(path), None
     for r in records:
         r.project = project
         r.cwd = cwd_from_records
