@@ -2068,14 +2068,15 @@ def parse_date(s: str) -> datetime:
 
 
 def _warn_unreachable_history(kind: str, value: str, target: str) -> None:
-    """Warn that a remote/cwd_prefix rule reaches purged history by name only."""
+    """Warn that a remote/cwd rule reaches purged history by name only, if at all."""
     n = count_ccreport_records_without_signals()
     if not n:
         return
     implied = _implied_name(kind, value)
     reach = f"only those stored as {implied!r}" if implied else "none of them"
+    signal = "remote" if kind == "remote" else "cwd"
     print(
-        f"note: {n} cached record(s) from purged logs carry no {kind} to match "
+        f"note: {n} cached record(s) from purged logs carry no {signal} to match "
         f"on, so this rule reaches {reach}.\n"
         f"      Any older usage still grouped elsewhere: "
         f"ccreport merge <that-name> {target}",
@@ -2165,7 +2166,7 @@ def cmd_overrides(args) -> None:
         add_project_override(args.kind, args.source, args.target)
         label = args.source if args.kind == "name" else f"{args.kind}:{args.source}"
         print(f"Grouping {label} -> {args.target}")
-        if args.kind in ("remote", "cwd_prefix"):
+        if args.kind != "name":
             _warn_unreachable_history(args.kind, args.source, args.target)
         return
     if args.command == "unmerge":
@@ -3252,13 +3253,14 @@ def main() -> None:
     # Project-grouping overrides (manual merges/renames, stored locally)
     sub.add_parser("overrides", help="List manual project-grouping rules")
     pm = sub.add_parser("merge", help="Group one project name into another")
-    pm.add_argument("source", help="Name to remap (or remote/cwd-prefix with --kind)")
+    pm.add_argument("source", help="Name to remap (or remote/cwd prefix/cwd glob with --kind)")
     pm.add_argument("target", help="Project name to group it under")
-    pm.add_argument("--kind", choices=["name", "remote", "cwd_prefix"], default="name",
-                    help="What 'source' matches against (default: name)")
+    pm.add_argument("--kind", choices=project_identity.OVERRIDE_KINDS, default="name",
+                    help="What 'source' matches against (default: name). cwd_glob is an "
+                         "fnmatch pattern over the whole cwd, where * also crosses /")
     pu = sub.add_parser("unmerge", help="Remove a grouping rule")
     pu.add_argument("source", help="The rule's match value to remove")
-    pu.add_argument("--kind", choices=["name", "remote", "cwd_prefix"],
+    pu.add_argument("--kind", choices=project_identity.OVERRIDE_KINDS,
                     help="Restrict removal to this match kind")
 
     # Claim the history that predates account capture (stored locally, like the

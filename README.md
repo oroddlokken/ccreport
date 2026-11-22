@@ -227,14 +227,23 @@ for details.
 
 Costs are priced per record from a pricing table in `src/ccreport/pricing.py`,
 deduplicated by the log's own `message.id`/`requestId`, and grouped into
-projects by git remote, then repo-root path, then directory name. A rename the
-rules cannot see needs a manual rule:
+projects by git remote, then repo-root path, then directory name. A worktree
+under `<repo>/.worktrees/` or `<repo>/.claude/worktrees/` counts as `<repo>`
+even after it is deleted, and a Claude Code scratchpad
+(`/tmp/claude-<uid>/<encoded cwd>/...`) counts as the directory it was made
+for. A rename the rules cannot see needs a manual rule:
 
 ```bash
 ccreport overrides
 ccreport merge company company-platform  # company's records report as company-platform
+ccreport merge --kind cwd_prefix ~/work/old-checkout company
+ccreport merge --kind cwd_glob '/private/var/folders/*/T/batch-*' company  # every mkdtemp(prefix="batch-")
 ccreport unmerge company
 ```
+
+Rules apply in the order they were added and the first match wins. A
+`cwd_glob` pattern matches the whole working directory, and its `*` also
+crosses `/`, so it takes the directories it names and everything under them.
 
 Codex calls appear in the same reports as Claude Code. The reader counts each
 `token_usage_record` once by response ID, including subagents and automatic

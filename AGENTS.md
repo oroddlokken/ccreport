@@ -617,9 +617,12 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   cwd→projects-dir name. Do not re-derive any of the three inline
 - Which project a record belongs to is `project_identity.py` plus
   `pricing.project_scope()` — `ccreport merge` rules apply to reports and status
-  line alike. `scan._script_hash()` covers `scan.py` and `project_identity.py`,
-  so changing how a name is derived re-parses the corpus and editing a report
-  renderer no longer does
+  line alike. `scan.project_for_cwd` is the one derivation behind the name a
+  parse freezes, for every source. `scan._script_hash()` covers `scan.py` and
+  `project_identity.py`, so changing how a name is derived re-parses the corpus
+  and editing a report renderer no longer does; the purged logs no re-parse
+  reaches are re-derived from their stored cwd by
+  `cache_db.restamp_orphan_identities` in the same invalidation
 - A bare `ccreport` serves days older than `ccreport.ROLLUP_WINDOW_DAYS` from the
   `ccreport_rollups` table — per-day aggregates built from the post-dedup,
   post-override, post-attribution record stream, never from a `GROUP BY` over

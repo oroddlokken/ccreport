@@ -444,7 +444,7 @@ new `CREATE TABLE` there gets a row here.
 | `ccreport_records` | Parsed assistant message records | scan.py |
 | `ccreport_rollups` | Per-day aggregates of the post-dedup record stream, keyed `(day, oslo_date, sid, project, model, account, source, account_uuid, thread_id)`; what a bare `ccreport` serves for days past `ROLLUP_WINDOW_DAYS`. Valid only against `meta.ccreport_rollup_fp`, and derivable from `ccreport_records` | ccreport.py |
 | `ccreport_orphan_costs` | All-time cost of records whose JSONL is gone, pre-summed per `(dir_prefix, project, cwd, repo)`. Orphans are most of `ccreport_records` and none can ever change, but `all_time` has no window to bound the walk. Override rules are resolved at read time, so a `ccreport merge` re-groups with no rebuild. Valid only against `meta.ccreport_orphan_fp` | pricing.py |
-| `project_overrides` | Manual project-grouping rules (`name` / `remote` / `cwd_prefix` → target), applied by every reader | ccreport.py (write), project_identity.py (read) |
+| `project_overrides` | Manual project-grouping rules (`name` / `remote` / `cwd_prefix` / `cwd_glob` → target), applied by every reader | ccreport.py (write), project_identity.py (read) |
 | `project_scopes` | The resolved `(name, prefixes)` scope per cwd (§5.6). No fingerprint of its own — every writer of its two inputs clears it in the same transaction | pricing.py |
 | `extra_usage_snapshots` | `(ts, spent)` history of Extra usage spend, pruned at 31 days | usage_api.py (write), statusline.py (read), ccreport.py (read, §9.7) |
 | `exchange_rates` | Norges Bank USD→NOK daily spot rates, keyed by Oslo date | exchange.py |
@@ -1166,9 +1166,33 @@ else:           "{n}"
 <  $1.00:  "${c:.4f}"
 ```
 
-**Project name derivation:** Directory names like `-Users-ove-git-foo` ->
-strip leading dash, split on `-`, take last segment (-> `foo`). Subagent
-files use grandparent's parent directory name.
+**Project name derivation:** `scan.project_for_cwd` names every record from
+the cwd its log carries, for Claude Code, Codex and OpenCode alike, once when
+the log is parsed:
+
+1. A cwd under Claude Code's scratchpad, `/tmp/claude-<uid>/<encoded>/...`
+   (also `/private/tmp` and `$TMPDIR`), is replaced by the directory it was
+   made for. The encoding turns every character but an ASCII letter or digit
+   into `-`, so it cannot be reversed; the decoding walks the disk and takes a
+   single existing match, then tries the cwds already cached, and leaves the
+   cwd as it was when either gives two answers or none.
+2. The git remote at that directory names the project by its basename.
+3. Failing that, a cwd under `<repo>/.worktrees/` or `<repo>/.claude/worktrees/`
+   is named for `<repo>`: its remote if it has one, else its directory name.
+   A linked worktree elsewhere (a sibling `~/dev/<repo>-<branch>`) is named
+   for its main checkout while git can still say which that is. A deleted
+   sibling keeps its own name, since a shared prefix is not evidence.
+4. Otherwise the segment under the deepest repo root, else the basename.
+
+A log with no cwd at all is named off its projects-dir name: `-Users-ove-git-foo`
+-> strip leading dash, split on `-`, take last segment (-> `foo`).
+
+The name is frozen into the cached record, and `_script_hash` covers the code
+that derives it, so a change re-parses every live log. A purged log cannot be
+re-parsed, so `cache_db.restamp_orphan_identities` re-derives its records from
+the cwd they kept in the same invalidation. Rows that stored a remote keep it,
+rows with no cwd keep their name, and `ccreport_archive` is not touched; a
+`ccreport merge` rule still reaches all three.
 
 **Averages:** Reports with multiple buckets show average per displayed set
 and average per all buckets.
